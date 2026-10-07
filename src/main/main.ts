@@ -10,6 +10,7 @@ import { registerOpenerIpc } from './openers';
 import './mic';
 import { registerPrefsIpc } from './prefs';
 import { STATE_DIR } from './store';
+import { registerEmployeesIpc, stopAllTurns } from './employees';
 
 // One MyIDE at a time. The lock lives in userData, so a dev or test run with its own MYIDE_HOME
 // gets its own userData and runs beside the installed app.
@@ -84,7 +85,9 @@ app.whenReady().then(() => {
   registerMenu((command) => mainWindow?.webContents.send('command', command));
   registerOpenerIpc();
   registerPrefsIpc();
+  registerEmployeesIpc(() => mainWindow);
   createMainWindow();
 });
 
 app.on('before-quit', killAllPtys);
+app.on('before-quit', stopAllTurns);

@@ -6,6 +6,8 @@ import type { MenuState } from '../main/menu';
 import type { LayoutsFile } from '../main/layouts';
 import type { Project } from '../main/projects';
 import type { Prefs } from '../main/prefs';
+import type { Employee, Role } from '../main/employees';
+import type { Approval } from '../main/mcp';
 
 /** Subscribes to a main-to-renderer channel; returns the unsubscribe function. */
 function on<A extends unknown[]>(channel: string, cb: (...args: A) => void): () => void {
@@ -36,6 +38,9 @@ const api = {
     copy: (text: string): void => ipcRenderer.send('clipboard:write', text),
     paste: (): Promise<string> => ipcRenderer.invoke('clipboard:read'),
     openUrl: (url: string): Promise<void> => ipcRenderer.invoke('open:url', url),
+    /** Installed "Open in" apps, and opening a folder in one of them. */
+    apps: (): Promise<string[]> => ipcRenderer.invoke('open:apps'),
+    openIn: (app: string, dir: string): Promise<void> => ipcRenderer.invoke('open:in', app, dir),
   },
   // Projects, per-project and named layouts, the files panel and the app menu.
   projects: {
@@ -71,6 +76,39 @@ const api = {
     exportSettings: (): Promise<string | null> => ipcRenderer.invoke('settings:export'),
     /** Resolves to null (cancelled) or an error message; on success the app restarts. */
     importSettings: (): Promise<string | null> => ipcRenderer.invoke('settings:import'),
+  },
+  // Employees: hire, status, model, talk, fire, transcript.
+  employees: {
+    list: (projectId?: string): Promise<Employee[]> => ipcRenderer.invoke('employees:list', projectId),
+    roles: (projectId: string): Promise<Role[]> => ipcRenderer.invoke('employees:roles', projectId),
+    hire: (o: { projectId: string; role: string; task: string; model?: string; effort?: string }): Promise<Employee> => ipcRenderer.invoke('employees:hire', o),
+    /** Next turn; queued if busy, talking or over the caps. */
+    send: (id: string, text: string): Promise<void> => ipcRenderer.invoke('employees:send', id, text),
+    /** Applies on the next turn; now: interrupt and resume with the new model/effort. */
+    setModel: (id: string, o: { model?: string; effort?: string; now?: boolean }): Promise<void> => ipcRenderer.invoke('employees:set-model', id, o),
+    interrupt: (id: string): Promise<void> => ipcRenderer.invoke('employees:interrupt', id),
+    /** Pauses the employee; open a terminal in cwd running command. Call talkDone when it closes. */
+    talk: (id: string): Promise<{ cwd: string; command: string }> => ipcRenderer.invoke('employees:talk', id),
+    talkDone: (id: string): Promise<void> => ipcRenderer.invoke('employees:talk-done', id),
+    fire: (id: string, o: { removeWorktree: boolean }): Promise<void> => ipcRenderer.invoke('employees:fire', id, o),
+    transcript: (id: string): Promise<{ role: 'user' | 'assistant' | 'tool'; text: string; at?: string }[]> => ipcRenderer.invoke('employees:transcript', id),
+    onChange: (cb: (e: Employee) => void) => on('employees:change', cb),
+    onRemoved: (cb: (id: string) => void) => on('employees:removed', cb),
+    /** A notification was clicked: show this employee. */
+    onOpen: (cb: (id: string) => void) => on('employees:open', cb),
+  },
+  approvals: {
+    list: (): Promise<Approval[]> => ipcRenderer.invoke('approvals:list'),
+    resolve: (id: string, allow: boolean, message?: string): Promise<void> => ipcRenderer.invoke('approvals:resolve', id, allow, message),
+    /** Called with the full pending list whenever it changes. */
+    onChange: (cb: (pending: Approval[]) => void) => on('approvals:change', cb),
+  },
+  claude: {
+    info: (): Promise<{ version: string | null; tested: boolean; testedVersion: string }> => ipcRenderer.invoke('claude:info'),
+    /** One tiny haiku turn in a temp folder. */
+    test: (): Promise<{ ok: boolean; detail: string }> => ipcRenderer.invoke('claude:test'),
+    /** Open a terminal in cwd running command; the CLI does its own login. */
+    login: (): Promise<{ cwd: string; command: string }> => ipcRenderer.invoke('claude:login'),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

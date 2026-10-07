@@ -25,6 +25,11 @@ const loginPath = new Promise<string>((resolve) => {
   child.stdin?.end(); // an rc file that reads stdin gets EOF instead of hanging until the timeout
 });
 
+/** Env for a `claude` or `codex` child process: no inherited CLAUDE* vars, the login-shell PATH. */
+export async function spawnEnv(): Promise<Record<string, string>> {
+  return { ...baseEnv, PATH: await loginPath, LANG: baseEnv.LANG || 'en_US.UTF-8' };
+}
+
 // One PTY per panel id. PTYs live here, so a panel can move between windows (or the renderer reload)
 // and reattach by id without losing the shell.
 // Recent output, split wherever the size changed: replaying each piece at the size it was drawn for

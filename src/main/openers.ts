@@ -33,6 +33,8 @@ async function openIn(app: string, dir: unknown): Promise<void> {
 export type TerminalMenuAction = 'copy' | 'paste' | 'clear' | null;
 
 export function registerOpenerIpc(): void {
+  ipcMain.handle('open:apps', () => installed);
+  ipcMain.handle('open:in', (_e, app: string, dir: string) => openIn(app, dir));
   ipcMain.handle('open:url', (_e, url: string) => {
     if (typeof url === 'string' && /^https?:\/\//i.test(url)) return shell.openExternal(url);
   });

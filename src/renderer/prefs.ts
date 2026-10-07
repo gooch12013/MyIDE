@@ -2,7 +2,8 @@ import type { Prefs } from '../main/prefs';
 import { h, key } from './dom';
 import { removeProject, resetLayout } from './layouts';
 import { activeProject, allProjects, loadProjects } from './projects';
-import { registerPanel } from './registry';
+import { openPanel, registerPanel } from './registry';
+import { api as staff, led } from './employees';
 import { reloadTerminalSettings } from './terminal';
 
 const api = window.myide;
@@ -32,7 +33,7 @@ function colourWarning(colour: string, id: string): string {
   return twin.colour.toLowerCase() === colour.toLowerCase() ? `Same colour as ${twin.name}.` : `Hard to tell apart from ${twin.name}.`;
 }
 
-const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['advanced', 'Advanced']] as const;
+const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['advanced', 'Advanced']] as const;
 type Section = (typeof SECTIONS)[number][0];
 
 registerPanel('preferences', {
@@ -172,6 +173,22 @@ registerPanel('preferences', {
           pref('Open at login', 'Start MyIDE when you log in to this Mac.', toggle('Open at login', openAtLogin, (on) => void api.prefs.setOpenAtLogin(on))),
           pref('Restore last session', 'Reopen the last project with its layout. Off: start on the first project with one terminal.',
             toggle('Restore last project and layout', prefs.restoreLast, (on) => void set({ restoreLast: on }))),
+        ];
+      },
+
+      async claude(_info, say) {
+        const i = await staff.claude.info();
+        const state = !i.version ? led('failed', 'Not found') : i.tested ? led('working', 'Tested') : led('interrupted', 'Untested');
+        return [
+          pref('Claude Code', i.version ? (i.tested ? 'The version MyIDE is tested with.' : `MyIDE is tested with ${i.testedVersion}.`) : 'Install Claude Code to use employees.',
+            h('span', { className: 'path', textContent: i.version ?? 'none' }), state),
+          pref('Log in', 'Opens Claude Code in a terminal, where it runs its own login.', key('Log in', async () => {
+            try { const { cwd, command } = await staff.claude.login(); openPanel('terminal', { cwd, command }); } catch (e) { say(errText(e)); }
+          })),
+          pref('Test', 'Runs one tiny Claude turn to check employees can work.', key('Test', async () => {
+            say('Testing…');
+            try { const r = await staff.claude.test(); say(`${r.ok ? 'Works' : 'Failed'}: ${r.detail}`); } catch (e) { say(errText(e)); }
+          })),
         ];
       },
 

@@ -4,6 +4,8 @@ import { openPanel, startDock } from './registry';
 import './terminal';
 import './files';
 import './prefs';
+import './employees';
+import './employee';
 import { startWorkspace } from './layouts';
 import { activeProject } from './projects';
 

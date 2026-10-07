@@ -114,6 +114,12 @@ registerPanel('terminal', {
     refit();
     void pty.spawn(id, { cwd: cwd || undefined, cols: term.cols, rows: term.rows }).then(async (info) => {
       onInfo(info);
+      // A panel opened to run a program (Talk, Log in) types it once; the saved layout forgets it.
+      if (typeof params.command === 'string' && !info.replay?.length) {
+        pty.write(id, `${params.command}\r`);
+        delete params.command;
+        api.updateParameters({ ...params, cwd });
+      }
       if (info.replay?.length) {
         // Reattached to a running shell: redraw its recent output at the sizes it was drawn for.
         state = 'replaying';

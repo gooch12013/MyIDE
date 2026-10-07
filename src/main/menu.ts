@@ -81,6 +81,8 @@ export function buildMenu(): void {
         ...(projects.length ? [{ type: 'separator' as const }] : []),
         { label: 'Add Project…', click: cmd('add-project') },
         { label: 'Remove Current Project…', enabled: !!state.active, click: cmd('remove-project') },
+        { type: 'separator' },
+        { label: 'Hire Employee…', enabled: !!state.active, click: cmd('hire-employee') },
       ],
     },
     // macOS lists every open window (pop-outs included) at the bottom of this menu.
