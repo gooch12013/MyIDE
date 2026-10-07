@@ -170,6 +170,8 @@ const api = {
     /** Drops the write that stopped the outbox (shown as blocked) and sends the rest. */
     dropOp: (projectId: string, opId: string): Promise<void> => ipcRenderer.invoke('forge:drop-op', projectId, opId),
     /** A project's issues, drafts or outbox changed. */
+    view: (scope: string): Promise<unknown> => ipcRenderer.invoke('forge:view', scope),
+    setView: (scope: string, view: unknown): Promise<void> => ipcRenderer.invoke('forge:set-view', scope, view),
     onChange: (cb: (projectId: string) => void) => on('forge:change', cb),
   },
   // Code: the editor's files (inside a project or a MyIDE worktree only), the git tree, review and merge.

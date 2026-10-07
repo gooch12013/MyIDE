@@ -64,6 +64,7 @@ export function buildMenu(): void {
           ],
         },
         { label: 'Employees', accelerator: 'CmdOrCtrl+Shift+Y', click: cmd('panel:employees') },
+        { label: 'Issues: All Projects', click: cmd('issues-all') },
         { type: 'separator' },
         { role: 'reload' },
         ...(app.isPackaged ? [] : [{ role: 'toggleDevTools' as const }]),

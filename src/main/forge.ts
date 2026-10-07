@@ -20,7 +20,7 @@ import { handle, readJSON, STATE_DIR, writeJSON } from './store';
 export type Provider = 'github' | 'forgejo';
 export interface ForgeLink { provider: Provider; repo: string; urls: string[] }
 export interface IssueRef { provider: Provider; repo: string; number: number; title: string; url: string }
-export interface Issue { number: number; title: string; body: string; url: string; state: string; labels: string[]; assignees: string[]; author: string; updatedAt: string }
+export interface Issue { number: number; title: string; body: string; url: string; state: string; labels: string[]; assignees: string[]; author: string; updatedAt: string; createdAt: string; comments: number }
 export interface PrLink { number: number; url: string; state: string; merged: boolean }
 export interface Draft { id: string; employeeId: string; employeeName: string; title: string; body: string; labels: string[]; at: number }
 type OpKind = 'comment' | 'labels' | 'add_labels' | 'assign_self' | 'open_pr' | 'create_issue';
@@ -199,7 +199,7 @@ export function ghPace(times: number[], now: number): number {
 
 const norm = (x: any): Issue => ({
   number: x.number, title: x.title ?? '', body: x.body ?? '', url: x.html_url ?? '', state: x.state ?? 'open',
-  labels: (x.labels ?? []).map((l: any) => l.name), author: x.user?.login ?? '', updatedAt: x.updated_at ?? '',
+  labels: (x.labels ?? []).map((l: any) => l.name), author: x.user?.login ?? '', updatedAt: x.updated_at ?? '', createdAt: x.created_at ?? '', comments: x.comments ?? 0,
   assignees: (x.assignees ?? (x.assignee ? [x.assignee] : [])).map((a: any) => a.login),
 });
 
@@ -596,6 +596,17 @@ export function registerForgeIpc(): void {
     update(projectId, (c) => { c.outbox = c.outbox.filter((o) => o.id !== opId); c.blocked = undefined; });
     changed(projectId);
     void drain(projectId);
+  });
+  // The Issues panel's filters, sort and custom order: per project, or one file for the all-projects view.
+  const viewFile = (scope: string) => {
+    if (scope === 'all') return 'issues-view.json';
+    if (!projects().some((p) => p.id === scope)) throw new Error('No such project');
+    return join('projects', scope, 'issues-view.json');
+  };
+  handle('forge:view', (scope: string) => readJSON<unknown>(viewFile(scope), null));
+  handle('forge:set-view', (scope: string, view: unknown) => {
+    if (!view || typeof view !== 'object' || JSON.stringify(view).length > 200_000) throw new Error('Bad view');
+    writeJSON(viewFile(scope), view);
   });
   handle('forge:discard-draft', (projectId: string, id: string) => {
     update(projectId, (c) => { c.drafts = c.drafts.filter((x) => x.id !== id); });

@@ -7,12 +7,14 @@ import type { Project } from '../main/projects';
 import { activeProject, allProjects } from './projects';
 import { openPanel, registerPanel } from './registry';
 import { micButton } from './speech';
+import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
 
 const api = window.myide;
 type Issue = ForgeSnapshot['issues'][number];
 type Linked = Employee & { issue?: { repo: string; number: number } };
 
 const FORGE = { github: 'GitHub', forgejo: 'Forgejo' } as const;
+const NO_FILTERS: Partial<View> = { q: '', state: 'all', labels: [], who: '', emp: '', pr: '' };
 const proj = (id: string) => allProjects().find((p) => p.id === id);
 const clock = (t?: number) => (t ? new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'never');
 function age(iso: string): string {
@@ -176,7 +178,7 @@ function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean): HTM
     h('div', { className: 'iss-line' },
       h('span', { className: 'iss-ref', textContent: `#${i.number}` }),
       h('button', { type: 'button', className: 'iss-title', textContent: i.title, title: `Open #${i.number} on ${FORGE[s.provider]}`, onclick: () => void api.terminal.openUrl(i.url) }),
-      h('span', { className: 'iss-age', textContent: [all && p ? p.name : '', i.state === 'closed' ? 'closed' : '', age(i.updatedAt)].filter(Boolean).join(' · ') })),
+      h('span', { className: 'iss-age', textContent: [all && p ? p.name : '', i.state === 'closed' ? 'closed' : '', i.comments ? `${i.comments} comment${i.comments === 1 ? '' : 's'}` : '', age(i.updatedAt)].filter(Boolean).join(' · ') })),
     h('div', { className: 'iss-line iss-line--meta' },
       emp ? h('button', { type: 'button', className: 'iss-emp', textContent: emp.name, title: `Open ${emp.name}`, onclick: () => openEmployee(emp.id) })
         : h('span', { className: 'iss-nobody', textContent: 'No employee' }),
@@ -267,32 +269,63 @@ registerPanel('issues', {
   title: 'Issues',
   create(el, params) {
     el.classList.add('issues');
-    let scope = typeof params.scope === 'string' ? params.scope : activeProject()?.id ?? 'all';
-    const filters = { open: true, mine: false, nobody: false, label: '' };
+    // In a project's layout the panel shows that project; only an explicit { scope: 'all' } (View > Issues: All Projects) shows every one.
+    const all = params.scope === 'all';
+    const scope = all ? 'all' : activeProject()?.id ?? '';
+    let v: View = { ...DEFAULT_VIEW };
+    let saveTimer: ReturnType<typeof setTimeout> | undefined;
+    const save = () => { clearTimeout(saveTimer); if (scope) saveTimer = setTimeout(() => void api.forge.setView(scope, v).catch(() => {}), 250); };
+    const set = (patch: Partial<View>) => { v = { ...v, ...patch }; save(); render(); };
+
     const head = h('div', { className: 'iss-head' });
-    const scopeKeys = h('div', { className: 'iss-scope', role: 'group' });
-    scopeKeys.setAttribute('aria-label', 'Project');
-    const toggle = (name: 'open' | 'mine' | 'nobody', label: string) => {
-      const b = key(label, () => { filters[name] = !filters[name]; b.setAttribute('aria-pressed', String(filters[name])); void draw(); });
-      b.setAttribute('aria-pressed', String(filters[name]));
-      return b;
+    const live = h('p', { className: 'sr-only' });
+    live.setAttribute('aria-live', 'polite');
+
+    // ---- filter bar ----
+    const sel = (label: string, opts: [string, string][], get: () => string, put: (x: string) => void) => {
+      const s = h('select', { className: 'input select iss-sel' }, ...opts.map(([val, t]) => new Option(t, val)));
+      s.setAttribute('aria-label', label);
+      s.onchange = () => put(s.value);
+      return Object.assign(s, { sync: () => { s.value = get(); } });
     };
-    const labelSel = h('select', { className: 'input select iss-label-sel' });
-    labelSel.setAttribute('aria-label', 'Label');
-    labelSel.onchange = () => { filters.label = labelSel.value; void draw(); };
-    const controls = h('div', { className: 'iss-controls' }, scopeKeys,
-      h('div', { className: 'iss-filters', role: 'group' }, h('span', { className: 'legend', textContent: 'Show' }),
-        toggle('open', 'Open'), toggle('mine', 'Mine'), toggle('nobody', 'No employee'), labelSel));
+    const search = h('input', { type: 'search', className: 'input iss-search', placeholder: 'Search title, #, label, body', autocomplete: 'off', spellcheck: false });
+    search.setAttribute('aria-label', 'Search issues');
+    search.oninput = () => set({ q: search.value });
+    const stateKeys = (['open', 'closed', 'all'] as const).map((s) => {
+      const b = key(s[0].toUpperCase() + s.slice(1), () => set({ state: s }));
+      b.dataset.state = s;
+      return b;
+    });
+    const stateBox = h('div', { className: 'iss-seg', role: 'group' }, ...stateKeys);
+    stateBox.setAttribute('aria-label', 'State');
+    const who = h('select', { className: 'input select iss-sel' });
+    who.setAttribute('aria-label', 'Assignee');
+    who.onchange = () => set({ who: who.value });
+    const emp = sel('Employee', [['', 'Any employee'], ['yes', 'Given to an employee'], ['no', 'No employee']], () => v.emp, (x) => set({ emp: x as View['emp'] }));
+    const pr = sel('Pull request', [['', 'Any PR'], ['yes', 'Has PR'], ['no', 'No PR']], () => v.pr, (x) => set({ pr: x as View['pr'] }));
+    const labelBox = h('div', { className: 'iss-labelpick', role: 'group' });
+    labelBox.setAttribute('aria-label', 'Labels (all selected must match)');
+    const SORT_NAMES: Record<Sort, string> = { updated: 'Updated', created: 'Created', number: 'Number', title: 'Title', comments: 'Comments', custom: 'Custom order' };
+    const sort = sel('Sort by', SORTS.map((s) => [s, SORT_NAMES[s]]), () => v.sort, (x) => set({ sort: x as Sort }));
+    const dir = key('', () => set({ desc: !v.desc }), { className: 'key key--sm iss-dir' });
+    const group = sel('Group by', GROUPS.map((g) => [g, g === 'none' ? 'No groups' : `By ${g}`]), () => v.group, (x) => set({ group: x as Group }));
+    const clear = key('Clear', () => set({ q: '', state: 'open', labels: [], who: '', emp: '', pr: '' }), { title: 'Clear the filters (keeps sort and order)' });
+    const bar = h('div', { className: 'iss-bar' },
+      h('div', { className: 'iss-bar-row' }, search, stateBox, who, emp, pr, clear),
+      labelBox,
+      h('div', { className: 'iss-bar-row' }, h('span', { className: 'legend', textContent: 'Arrange' }), sort, dir, group,
+        h('span', { className: 'pref-hint iss-hint', textContent: 'Drag a row, or Alt+Up / Alt+Down, to set a custom order.' })));
+
     const drafts = h('section', { className: 'needs' });
     drafts.setAttribute('aria-label', 'Drafted issues');
-    const list = h('ul', { className: 'iss-list' });
+    const list = h('div', { className: 'iss-groups' });
     const empty = h('p', { className: 'iss-empty' });
     const found = h('section', { className: 'iss-found' });
     found.setAttribute('aria-label', 'Forges found in git remotes');
-    el.append(head, found, controls, drafts, list, empty);
+    el.append(head, found, bar, drafts, list, empty, live);
 
-    // Projects with no forge: what their git remotes point at, one confirm line each. The active project also shows
-    // why nothing was found; the rest stay quiet unless a remote turned up.
+    // Projects with no forge: what their git remotes point at, one confirm line each. The panel's own project also shows
+    // why nothing was found; in the all-projects view the rest stay quiet unless a remote turned up.
     let foundSeq = 0;
     const kept = new Map<string, { k: string; row: HTMLElement }>();
     const status = h('p', { className: 'pref-warn' });
@@ -300,7 +333,7 @@ registerPanel('issues', {
     const say = (t: string) => { status.textContent = t; };
     async function drawFound(snaps: ForgeSnapshot[]): Promise<void> {
       const n = ++foundSeq;
-      const bare = allProjects().filter((p) => !snaps.some((s) => s.projectId === p.id));
+      const bare = allProjects().filter((p) => (all || p.id === scope) && !snaps.some((s) => s.projectId === p.id));
       const ds = await Promise.all(bare.map((p) => api.forge.detect(p.id).catch((e) => ({ found: [], reason: errText(e) }) as Detected)));
       if (n !== foundSeq) return;
       const edit = (p: Project) => (link: ForgeLink) => {
@@ -322,24 +355,107 @@ registerPanel('issues', {
       found.replaceChildren(h('dl', { className: 'forges' }, ...lines), status);
     }
 
-    let seq = 0;
-    async function draw(): Promise<void> {
-      const n = ++seq;
-      const [snaps, emps] = await Promise.all([api.forge.issues(), api.employees.list() as Promise<Linked[]>]);
-      if (n !== seq) return;
-      void drawFound(snaps);
-      if (scope !== 'all' && !snaps.some((s) => s.projectId === scope)) scope = 'all';
-      const shown = snaps.filter((s) => scope === 'all' || s.projectId === scope);
+    let snaps: ForgeSnapshot[] = [];
+    let emps: Linked[] = [];
+    let rows: (Row & { s: ForgeSnapshot; i: Issue })[] = [];
+    let focusKey = '';
+    let dragKey = '';
 
-      scopeKeys.replaceChildren(...[{ id: 'all', name: 'All' }, ...snaps.map((s) => ({ id: s.projectId, name: proj(s.projectId)?.name ?? s.projectId }))].map((x) => {
-        const b = key(x.name, () => { scope = x.id; void api.forge.refresh(x.id === 'all' ? undefined : x.id); void draw(); });
-        b.setAttribute('aria-pressed', String(scope === x.id));
-        const c = proj(x.id)?.colour;
-        if (c) b.style.setProperty('--proj', c);
+    /** Rows in a custom order. Moving from another sort starts the custom order from what is on screen now. */
+    const reorder = (k: string, target: string, after: boolean, said: string) => {
+      const base = v.sort === 'custom' ? fullOrder(v.order, rows) : arrange({ ...v, ...NO_FILTERS }, rows).map((r) => r.key);
+      focusKey = k;
+      live.textContent = said;
+      set({ sort: 'custom', order: move(base, k, target, after) });
+    };
+
+    function rowEl(r: (typeof rows)[number]): HTMLElement {
+      const li = issueRow(r.s, r.i, emps, all);
+      li.dataset.key = r.key;
+      li.tabIndex = 0;
+      li.draggable = true;
+      li.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown');
+      li.setAttribute('aria-label', `#${r.number} ${r.title}`);
+      li.onkeydown = (e) => {
+        if (e.target !== li || !e.altKey || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+        e.preventDefault();
+        const up = e.key === 'ArrowUp';
+        const n = (up ? li.previousElementSibling : li.nextElementSibling) as HTMLElement | null;
+        if (n?.dataset.key) reorder(r.key, n.dataset.key, !up, `Moved #${r.number} ${up ? 'above' : 'below'} ${n.querySelector('.iss-ref')?.textContent}`);
+      };
+      li.ondragstart = (e) => { dragKey = r.key; e.dataTransfer!.effectAllowed = 'move'; e.dataTransfer!.setData('text/plain', `#${r.number}`); li.classList.add('is-dragging'); };
+      li.ondragend = () => { dragKey = ''; li.classList.remove('is-dragging'); list.querySelectorAll('.is-drop-before, .is-drop-after').forEach((x) => x.classList.remove('is-drop-before', 'is-drop-after')); };
+      const below = (e: DragEvent) => e.clientY > li.getBoundingClientRect().top + li.offsetHeight / 2;
+      li.ondragover = (e) => {
+        if (!dragKey || dragKey === r.key) return;
+        e.preventDefault();
+        li.classList.toggle('is-drop-after', below(e));
+        li.classList.toggle('is-drop-before', !below(e));
+      };
+      li.ondragleave = () => li.classList.remove('is-drop-before', 'is-drop-after');
+      li.ondrop = (e) => {
+        e.preventDefault();
+        if (dragKey && dragKey !== r.key) reorder(dragKey, r.key, below(e), `Moved ${dragKey.replace(/^.*#/, '#')} ${below(e) ? 'below' : 'above'} #${r.number}`);
+      };
+      return li;
+    }
+
+    /** Filter bar and list from the last fetch; no IPC, so typing in the search box stays quick. */
+    function render(): void {
+      const was = el.ownerDocument.activeElement as HTMLElement | null;
+      if (search.value !== v.q) search.value = v.q;
+      stateKeys.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.state === v.state)));
+      const logins = [...new Set([...snaps.flatMap((s) => s.issues.flatMap((i) => i.assignees)), ...(['', 'me', 'none'].includes(v.who) ? [] : [v.who])])].sort();
+      who.replaceChildren(new Option('Anyone', ''), new Option('Assigned to me', 'me'), new Option('Unassigned', 'none'), ...logins.map((l) => new Option(l, l)));
+      who.value = v.who;
+      emp.sync(); pr.sync(); sort.sync(); group.sync();
+      dir.textContent = v.desc ? 'Desc' : 'Asc';
+      dir.title = v.desc ? 'Descending: click for ascending' : 'Ascending: click for descending';
+      dir.setAttribute('aria-label', `Sort direction: ${v.desc ? 'descending' : 'ascending'}`);
+      dir.disabled = v.sort === 'custom';
+
+      const labels = [...new Set([...snaps.flatMap((s) => s.issues.flatMap((i) => i.labels)), ...v.labels])].sort();
+      labelBox.hidden = !labels.length;
+      labelBox.replaceChildren(h('span', { className: 'legend', textContent: 'Labels' }), ...labels.map((l) => {
+        const on = v.labels.includes(l);
+        const b = key(l, () => set({ labels: on ? v.labels.filter((x) => x !== l) : [...v.labels, l] }), { className: 'key key--sm iss-chip' });
+        b.dataset.label = l;
+        b.setAttribute('aria-pressed', String(on));
         return b;
       }));
 
-      head.replaceChildren(h('dl', { className: 'forges' }, ...shown.map((s) => {
+      const groups = grouped(v, rows);
+      const ul = (rs: typeof rows) => h('ul', { className: 'iss-list' }, ...rs.map(rowEl));
+      list.replaceChildren(...(v.group === 'none' ? (groups[0] ? [ul(groups[0].rows as typeof rows)] : []) : groups.map((g) => {
+        const d = h('details', { className: 'iss-group', open: !v.collapsed.includes(g.name) },
+          h('summary', { className: 'iss-group-head' }, h('span', { className: 'legend', textContent: g.name }), h('span', { className: 'iss-count', textContent: String(g.rows.length) })),
+          ul(g.rows as typeof rows));
+        d.dataset.group = g.name;
+        d.ontoggle = () => { v = { ...v, collapsed: d.open ? v.collapsed.filter((x) => x !== g.name) : [...new Set([...v.collapsed, g.name])] }; save(); };
+        return d;
+      })));
+      const count = groups.reduce((n, g) => n + g.rows.length, 0);
+      empty.hidden = !!count;
+      const p = proj(scope);
+      empty.textContent = !snaps.length ? (all ? 'No project links a forge yet. Link one in Preferences > Forges.' : `${p?.name ?? 'This project'} links no forge yet. Link one above or in Preferences > Forges.`)
+        : v.who === 'me' && snaps.some((s) => !s.me) ? 'No issues match. "Assigned to me" needs a token, so MyIDE knows who you are.'
+        : 'No issues match these filters.';
+      // A redraw replaces the rows and chips; keep focus where it was.
+      const again = focusKey ? list.querySelector<HTMLElement>(`[data-key="${CSS.escape(focusKey)}"]`)
+        : was?.dataset.label ? labelBox.querySelector<HTMLElement>(`[data-label="${CSS.escape(was.dataset.label)}"]`) : null;
+      again?.focus();
+      focusKey = '';
+    }
+
+    let seq = 0;
+    async function draw(): Promise<void> {
+      const n = ++seq;
+      const [s, e] = await Promise.all([api.forge.issues(all ? undefined : scope || '-'), api.employees.list() as Promise<Linked[]>]);
+      if (n !== seq) return;
+      snaps = s; emps = e;
+      void drawFound(snaps);
+
+      head.replaceChildren(h('dl', { className: 'forges' }, ...snaps.map((s) => {
         const p = proj(s.projectId);
         const note = s.offline
           ? `Stale, last synced ${clock(s.fetchedAt)} · ${s.error ?? 'unreachable'} · retrying on the next poll`
@@ -351,41 +467,35 @@ registerPanel('issues', {
             key('Drop it', () => void api.forge.dropOp(s.projectId, s.blockedOp!).catch(() => {}), { title: 'Drop the write at the front of the queue and send the rest' })] : []),
           ...(s.lastError ? [h('span', { className: 'forge-note forge-err', textContent: `Not sent: ${s.lastError}` })] : []),
           retry(s));
-        const row = h('div', { className: 'forge' }, h('dt', { textContent: `${p?.name ?? '?'} · ${FORGE[s.provider]}` }), dd);
+        const row = h('div', { className: 'forge' }, h('dt', { textContent: `${p?.name ?? '?'} · ${FORGE[s.provider]} ${s.repo}` }), dd);
         if (p) row.style.setProperty('--proj', p.colour);
         row.dataset.forgeState = s.offline ? 'stale' : 'ok';
         return row;
-      })), key('+ New issue', () => void openNewIssue(scope === 'all' ? undefined : scope), { className: 'key iss-new' }));
+      })), key('+ New issue', () => void openNewIssue(all ? undefined : scope), { className: 'key iss-new' }));
 
-      const allDrafts = shown.flatMap((s) => s.drafts.map((d) => draftCard(s, d)));
+      const allDrafts = snaps.flatMap((s) => s.drafts.map((d) => draftCard(s, d)));
       drafts.hidden = !allDrafts.length;
       drafts.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · drafted issues · ${allDrafts.length}` }), ...allDrafts);
 
-      const labels = [...new Set(shown.flatMap((s) => s.issues.flatMap((i) => i.labels)))].sort();
-      labelSel.replaceChildren(new Option('Any label', ''), ...labels.map((l) => new Option(l, l)));
-      labelSel.value = labels.includes(filters.label) ? filters.label : '';
-      const rows = shown.flatMap((s) => s.issues
-        .filter((i) => (!filters.open || i.state === 'open')
-          && (!filters.mine || (!!s.me && i.assignees.includes(s.me)))
-          && (!filters.nobody || !holder(emps, s, i.number))
-          && (!labelSel.value || i.labels.includes(labelSel.value)))
-        .map((i) => ({ s, i })))
-        .sort((a, b) => b.i.updatedAt.localeCompare(a.i.updatedAt));
-      list.replaceChildren(...rows.map(({ s, i }) => issueRow(s, i, emps, scope === 'all')));
-      empty.hidden = !!rows.length;
-      empty.textContent = !snaps.length ? 'No project links a forge yet. Link one in Preferences > Forges.'
-        : filters.mine && shown.some((s) => !s.me) ? 'No issues match. "Mine" needs a token, so MyIDE knows who you are.'
-        : 'No issues match these filters.';
+      rows = snaps.flatMap((s) => s.issues.map((i) => {
+        const e = holder(emps, s, i.number);
+        return { s, i, key: all ? `${s.projectId}#${i.number}` : String(i.number), number: i.number, title: i.title, body: i.body, labels: i.labels,
+          state: i.state, assignees: i.assignees, updatedAt: i.updatedAt, createdAt: i.createdAt ?? '', comments: i.comments ?? 0,
+          me: s.me, employee: e?.name, pr: !!s.prs[String(i.number)] };
+      }));
+      render();
     }
 
-    const refresh = () => void api.forge.refresh(scope === 'all' ? undefined : scope);
+    const refresh = () => void api.forge.refresh(all ? undefined : scope || '-');
     el.addEventListener('focusin', refresh);
     const offs = [api.forge.onChange(() => void draw()), api.employees.onChange(() => void draw())];
-    void draw();
+    void (scope ? api.forge.view(scope).catch(() => null) : Promise.resolve(null)).then((saved) => { v = viewOf(saved); void draw(); });
     refresh();
-    return { onShow: refresh, dispose: () => { offs.forEach((off) => off()); el.removeEventListener('focusin', refresh); } };
+    return { onShow: refresh, dispose: () => { clearTimeout(saveTimer); if (scope) void api.forge.setView(scope, v).catch(() => {}); offs.forEach((off) => off()); el.removeEventListener('focusin', refresh); } };
   },
 });
+
+api.onCommand((c) => { if (c === 'issues-all') openPanel('issues', { scope: 'all' }); });
 
 // ---- Preferences > Forges ----
 
