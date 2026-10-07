@@ -1,9 +1,11 @@
-import type { ForgeSnapshot } from '../main/forge';
+import type { ForgeLink, ForgeSnapshot } from '../main/forge';
+import type { Detected, Found } from '../main/remotes';
 import { attachBox } from './attach';
 import { ask, errText, h, key, sheet } from './dom';
 import { led, openEmployee, type Employee } from './employees';
+import type { Project } from '../main/projects';
 import { activeProject, allProjects } from './projects';
-import { registerPanel } from './registry';
+import { openPanel, registerPanel } from './registry';
 import { micButton } from './speech';
 
 const api = window.myide;
@@ -185,6 +187,82 @@ function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean): HTM
   return row;
 }
 
+type TokenRow = { provider: ForgeLink['provider']; host: string; has: boolean; projects: string[] };
+
+/** One forge host's token: paste and save to the Keychain, test, remove, import from gh. */
+function tokenRow(r: TokenRow, say: (t: string) => void, redraw: () => void, gh = false): HTMLElement {
+  const input = h('input', { type: 'password', autocomplete: 'off', placeholder: r.has ? '•••••••• saved in the Keychain' : 'Paste a token', className: 'input mono grow' });
+  input.setAttribute('aria-label', `Token for ${FORGE[r.provider]} ${r.host}`);
+  const act = (label: string, fn: () => Promise<string | void>) => key(label, async () => {
+    try { say((await fn()) || ''); } catch (e) { say(errText(e)); }
+  });
+  const keys = [
+    act('Save', async () => {
+      if (!input.value.trim()) return 'Paste a token first.';
+      await api.forge.setToken(r.provider, r.host, input.value);
+      redraw();
+      return r.projects.length ? `Saved. ${await api.forge.test(r.provider, r.host).catch((e) => errText(e))}` : 'Saved in the Keychain.';
+    }),
+    ...(r.has ? [act('Test connection', () => api.forge.test(r.provider, r.host)),
+      act('Remove', async () => { if (!(await ask('Remove token', `Remove the ${FORGE[r.provider]} token for ${r.host} from the Keychain?`, 'Remove', true))) return; await api.forge.removeToken(r.provider, r.host); redraw(); return 'Removed.'; })] : []),
+    ...(r.provider === 'github' && gh ? [act('Import from gh', async () => { await api.forge.importGh(); redraw(); return `Imported. ${await api.forge.test('github', 'github.com').catch((e) => errText(e))}`; })] : []),
+  ];
+  const hint = r.provider === 'github' ? 'Issues read anonymously; writing back needs a token with repo access.'
+    : r.projects.length ? `Used by ${r.projects.join(', ')}.` : 'This forge wants a sign-in, so MyIDE needs a token to read its issues.';
+  return h('div', { className: 'pref' },
+    h('div', { className: 'pref-label' }, h('span', { className: 'pref-name', textContent: `${FORGE[r.provider]} · ${r.host}` }), h('span', { className: 'pref-hint', textContent: hint })),
+    h('div', { className: 'pref-ctl' }, r.has ? led('working', 'Saved') : led('idle', 'No token'), input, ...keys));
+}
+
+const linkHost = (l: ForgeLink) => (l.urls[0] ? new URL(l.urls[0]).host : 'github.com');
+/** A detected forge, sent from the Issues panel's Edit to the Preferences form (filled in, not saved). */
+let editing: { projectId: string; link: ForgeLink } | undefined;
+/** The remote picked per project, so a redraw (a poll, a change elsewhere) keeps it. */
+const picks = new Map<string, number>();
+
+/** "Found GitHub owner/repo at host from remote origin. Use it?" Use saves the same link the form saves; Edit hands the
+ *  values to the form; a token step shows when the forge wants a sign-in and has no token. Nothing saves without a click. */
+function foundLine(p: Project, d: Detected, o: { edit: (l: ForgeLink) => void; done: () => void; say: (t: string) => void }): HTMLElement {
+  const box = h('div', { className: 'forge-found' });
+  box.style.setProperty('--proj', p.colour);
+  if (!d.found.length) { box.append(h('p', { className: 'pref-hint', textContent: `${d.reason ?? 'No remotes found.'} Fill in the forge by hand.` })); return box; }
+  const draw = async () => {
+    const pick = Math.min(picks.get(p.id) ?? 0, d.found.length - 1);
+    const f: Found = d.found[pick];
+    const what = f.provider
+      ? `Found ${f.signIn ? 'Forgejo (probably; sign-in required)' : f.note} ${f.repo} at ${f.host} from remote ${f.remote}. Use it?`
+      : `Remote ${f.remote} points at ${f.host} (${f.repo}): ${f.note}.`;
+    const keys: Node[] = [];
+    if (f.link) {
+      const link = f.link;
+      keys.push(key('Use', async () => {
+        try {
+          await api.forge.setLink(p.id, link);
+          o.say(`${p.name} linked to ${link.repo}.`);
+          void api.forge.refresh(p.id, true);
+          o.done();
+        } catch (e) { o.say(errText(e)); }
+      }, { className: 'key key--sm key--lit' }), key('Edit', () => o.edit(link)));
+    } else keys.push(key('Edit', () => o.edit({ provider: 'forgejo', repo: /^[\w.-]+\/[\w.-]+$/.test(f.repo) ? f.repo : '', urls: [`https://${f.host}`] })));
+    if (d.found.length > 1) {
+      const sel = h('select', { className: 'input select' }, ...d.found.map((x, i) => new Option(`${x.remote}: ${x.host}/${x.repo}`, String(i))));
+      sel.value = String(pick);
+      sel.setAttribute('aria-label', 'Pick another remote');
+      sel.title = 'Pick another remote';
+      sel.onchange = () => { picks.set(p.id, Number(sel.value)); void draw(); };
+      keys.push(sel);
+    }
+    let token: Node[] = [];
+    if (f.link && f.signIn) {
+      const host = linkHost(f.link);
+      if (!(await api.forge.hasToken(f.link.provider, host))) token = [tokenRow({ provider: f.link.provider, host, has: false, projects: [] }, o.say, () => void draw())];
+    }
+    box.replaceChildren(h('div', { className: 'forge-found-line' }, h('span', { className: 'forge-note', textContent: what }), ...keys), ...token);
+  };
+  void draw();
+  return box;
+}
+
 registerPanel('issues', {
   title: 'Issues',
   create(el, params) {
@@ -209,13 +287,47 @@ registerPanel('issues', {
     drafts.setAttribute('aria-label', 'Drafted issues');
     const list = h('ul', { className: 'iss-list' });
     const empty = h('p', { className: 'iss-empty' });
-    el.append(head, controls, drafts, list, empty);
+    const found = h('section', { className: 'iss-found' });
+    found.setAttribute('aria-label', 'Forges found in git remotes');
+    el.append(head, found, controls, drafts, list, empty);
+
+    // Projects with no forge: what their git remotes point at, one confirm line each. The active project also shows
+    // why nothing was found; the rest stay quiet unless a remote turned up.
+    let foundSeq = 0;
+    const kept = new Map<string, { k: string; row: HTMLElement }>();
+    const status = h('p', { className: 'pref-warn' });
+    status.setAttribute('aria-live', 'polite');
+    const say = (t: string) => { status.textContent = t; };
+    async function drawFound(snaps: ForgeSnapshot[]): Promise<void> {
+      const n = ++foundSeq;
+      const bare = allProjects().filter((p) => !snaps.some((s) => s.projectId === p.id));
+      const ds = await Promise.all(bare.map((p) => api.forge.detect(p.id).catch((e) => ({ found: [], reason: errText(e) }) as Detected)));
+      if (n !== foundSeq) return;
+      const edit = (p: Project) => (link: ForgeLink) => {
+        editing = { projectId: p.id, link };
+        if (window.dispatchEvent(new CustomEvent('myide:prefs-section', { detail: 'forges', cancelable: true }))) openPanel('preferences', { section: 'forges' });
+      };
+      const lines = bare.flatMap((p, i) => {
+        if (!ds[i].found.length && p.id !== activeProject()?.id) return [];
+        // The same answer keeps its line, so a poll's redraw never wipes a token being typed.
+        const k = JSON.stringify([p.name, p.colour, ds[i]]);
+        if (kept.get(p.id)?.k === k) return [kept.get(p.id)!.row];
+        const row = h('div', { className: 'forge' }, h('dt', { textContent: `${p.name} · no forge` }),
+          h('dd', {}, foundLine(p, ds[i], { edit: edit(p), done: () => void draw(), say })));
+        row.style.setProperty('--proj', p.colour);
+        kept.set(p.id, { k, row });
+        return [row];
+      });
+      found.hidden = !lines.length;
+      found.replaceChildren(h('dl', { className: 'forges' }, ...lines), status);
+    }
 
     let seq = 0;
     async function draw(): Promise<void> {
       const n = ++seq;
       const [snaps, emps] = await Promise.all([api.forge.issues(), api.employees.list() as Promise<Linked[]>]);
       if (n !== seq) return;
+      void drawFound(snaps);
       if (scope !== 'all' && !snaps.some((s) => s.projectId === scope)) scope = 'all';
       const shown = snaps.filter((s) => scope === 'all' || s.projectId === scope);
 
@@ -281,7 +393,6 @@ registerPanel('issues', {
 export function forgesSection(say: (t: string) => void): Node[] {
   const box = h('div', { className: 'forge-prefs' });
   const field = (props: Partial<HTMLInputElement>) => h('input', { className: 'input', ...props });
-
   async function draw(): Promise<void> {
     const [snaps, { rows, gh }] = await Promise.all([api.forge.issues(), api.forge.tokens()]);
     const links = allProjects().map((p) => {
@@ -296,7 +407,17 @@ export function forgesSection(say: (t: string) => void): Node[] {
       const urlBox = h('label', { className: 'field' }, h('span', { className: 'pref-hint', textContent: 'URLs, one per line, tried in this order (5 s each).' }), urls);
       const syncKind = () => { repo.disabled = !provider.value; urlBox.hidden = provider.value !== 'forgejo'; };
       provider.onchange = syncKind;
+      const fill = (l: ForgeLink) => { provider.value = l.provider; repo.value = l.repo; urls.value = l.urls.join('\n'); syncKind(); repo.focus(); };
+      if (editing?.projectId === p.id) { fill(editing.link); editing = undefined; }
       syncKind();
+      // No forge yet: what the git remotes say, above the form. Re-detect asks again (and may replace a link, on Use).
+      const foundBox = h('div', { className: 'forge-found-box' });
+      const detect = async (force: boolean) => {
+        const d = await api.forge.detect(p.id, force).catch((e) => ({ found: [], reason: errText(e) }) as Detected);
+        foundBox.replaceChildren(foundLine(p, d, { edit: fill, done: () => void draw(), say }));
+      };
+      if (!s) void detect(false);
+      const redetect = key('Re-detect', () => void detect(true), { title: `Look at ${p.name}'s git remotes again` });
       const save = key('Save', async () => {
         try {
           await api.forge.setLink(p.id, provider.value ? { provider: provider.value as 'github' | 'forgejo', repo: repo.value, urls: urls.value.split('\n') } : null);
@@ -306,33 +427,12 @@ export function forgesSection(say: (t: string) => void): Node[] {
         } catch (e) { say(errText(e)); }
       });
       const row = h('div', { className: 'proj-row forge-link' }, h('span', { className: 'pref-name', textContent: p.name }),
-        h('div', { className: 'pref-ctl' }, provider, repo, save), urlBox);
+        h('div', { className: 'pref-ctl' }, provider, repo, save, redetect), urlBox, foundBox);
       row.style.setProperty('--proj', p.colour);
       return row;
     });
 
-    const tokens = rows.map((r) => {
-      const input = field({ type: 'password', autocomplete: 'off', placeholder: r.has ? '•••••••• saved in the Keychain' : 'Paste a token', className: 'input mono grow' });
-      input.setAttribute('aria-label', `Token for ${FORGE[r.provider]} ${r.host}`);
-      const act = (label: string, fn: () => Promise<string | void>) => key(label, async () => {
-        try { say((await fn()) || ''); } catch (e) { say(errText(e)); }
-      });
-      const keys = [
-        act('Save', async () => {
-          if (!input.value.trim()) return 'Paste a token first.';
-          await api.forge.setToken(r.provider, r.host, input.value);
-          void draw();
-          return `Saved. ${await api.forge.test(r.provider, r.host).catch((e) => errText(e))}`;
-        }),
-        ...(r.has ? [act('Test connection', () => api.forge.test(r.provider, r.host)),
-          act('Remove', async () => { if (!(await ask('Remove token', `Remove the ${FORGE[r.provider]} token for ${r.host} from the Keychain?`, 'Remove', true))) return; await api.forge.removeToken(r.provider, r.host); void draw(); return 'Removed.'; })] : []),
-        ...(r.provider === 'github' && gh ? [act('Import from gh', async () => { await api.forge.importGh(); void draw(); return `Imported. ${await api.forge.test('github', 'github.com').catch((e) => errText(e))}`; })] : []),
-      ];
-      const hint = r.provider === 'github' ? 'Issues read anonymously; writing back needs a token with repo access.' : `Used by ${r.projects.join(', ')}.`;
-      return h('div', { className: 'pref' },
-        h('div', { className: 'pref-label' }, h('span', { className: 'pref-name', textContent: `${FORGE[r.provider]} · ${r.host}` }), h('span', { className: 'pref-hint', textContent: hint })),
-        h('div', { className: 'pref-ctl' }, r.has ? led('working', 'Saved') : led('idle', 'No token'), input, ...keys));
-    });
+    const tokens = rows.map((r) => tokenRow(r, say, () => void draw(), gh));
 
     box.replaceChildren(
       h('p', { className: 'psec-lede', textContent: 'Link each project to its repo. Everything posts as you; tokens stay in the macOS Keychain.' }),

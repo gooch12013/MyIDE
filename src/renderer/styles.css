@@ -771,3 +771,13 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .sp-path { overflow-wrap: anywhere; font-family: var(--font-mono); }
 .sp-sheet { width: min(32rem, 92vw); }
 .sp-sheet textarea { resize: vertical; }
+
+/* Forge found in git remotes: one confirm line, in the Issues panel and Preferences > Forges */
+.iss-found { padding-bottom: var(--sp-4); border-bottom: 1px solid var(--line); }
+.iss-found[hidden] { display: none; }
+.forge-found { display: grid; gap: var(--sp-3); min-width: 0; }
+.forge-found-line { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); }
+.forge-link > .forge-found-box { grid-column: 2; }
+.forge-found-box:empty { display: none; }
+.iss-found .forge { align-items: start; }
+.iss-found dt { margin-top: 6px; }

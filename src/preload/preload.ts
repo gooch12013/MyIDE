@@ -11,6 +11,7 @@ import type { Approval } from '../main/mcp';
 import type { Account, Provider, Usage } from '../main/accounts';
 import type { Providers } from '../main/transports';
 import type { ForgeLink, ForgeSnapshot } from '../main/forge';
+import type { Detected } from '../main/remotes';
 import type { Row as ComponentRow } from '../main/components';
 import type { Clip, Clone, SpeechOptions, SpeechPatch, SpeechStatus } from '../main/speech';
 import type { Button, PaletteItem, Schedule } from '../main/buttons';
@@ -151,12 +152,14 @@ const api = {
   // Forge issues: GitHub and Forgejo links, tokens (kept in the Keychain, never sent here), issues, drafts.
   forge: {
     issues: (projectId?: string): Promise<ForgeSnapshot[]> => ipcRenderer.invoke('forge:issues', projectId),
+    detect: (projectId: string, force?: boolean): Promise<Detected> => ipcRenderer.invoke('forge:detect', projectId, force),
     /** Re-fetches; without force a fetch in the last 30 s is reused. */
     refresh: (projectId?: string, force?: boolean): Promise<void> => ipcRenderer.invoke('forge:refresh', projectId, force),
     setLink: (projectId: string, link: ForgeLink | null): Promise<void> => ipcRenderer.invoke('forge:set-link', projectId, link),
     tokens: (): Promise<{ rows: { provider: ForgeLink['provider']; host: string; has: boolean; projects: string[] }[]; gh: boolean }> => ipcRenderer.invoke('forge:tokens'),
     setToken: (provider: ForgeLink['provider'], host: string, token: string): Promise<void> => ipcRenderer.invoke('forge:set-token', provider, host, token),
     removeToken: (provider: ForgeLink['provider'], host: string): Promise<void> => ipcRenderer.invoke('forge:remove-token', provider, host),
+    hasToken: (provider: ForgeLink['provider'], host: string): Promise<boolean> => ipcRenderer.invoke('forge:has-token', provider, host),
     importGh: (): Promise<void> => ipcRenderer.invoke('forge:import-gh'),
     test: (provider: ForgeLink['provider'], host: string): Promise<string> => ipcRenderer.invoke('forge:test', provider, host),
     create: (o: { projectId: string; title: string; body?: string; labels?: string; images?: { name: string; type: string; data: Uint8Array }[]; assign?: { employeeId?: string; role?: string } }):

@@ -9,6 +9,7 @@ import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
 import { onIssuePost } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
+import { detect, type Detected } from './remotes';
 import { spawnEnv } from './pty';
 import { handle, readJSON, STATE_DIR, writeJSON } from './store';
 
@@ -548,6 +549,8 @@ function snapshot(projectId?: string) {
 }
 export type ForgeSnapshot = ReturnType<typeof snapshot>[number];
 
+const detected = new Map<string, Promise<Detected>>();
+
 export function registerForgeIpc(): void {
   // The quick-add script: ~/.myide/bin/issue PROJECT "title".
   try {
@@ -561,6 +564,13 @@ export function registerForgeIpc(): void {
   setInterval(() => void pollAll(), POLL_MS);
 
   handle('forge:issues', (projectId?: string) => snapshot(projectId));
+  // The forge a project's git remotes point at, for the confirm line; kept until Re-detect.
+  handle('forge:detect', (projectId: string, force?: boolean) => {
+    const p = projects().find((x) => x.id === projectId);
+    if (!p) throw new Error('No such project');
+    if (force || !detected.has(p.id)) detected.set(p.id, detect(p.path).catch((e) => ({ found: [], reason: (e as Error).message })));
+    return detected.get(p.id)!;
+  });
   handle('forge:refresh', async (projectId?: string, force?: boolean) => {
     if (projectId) await fetchIssues(projectId, !!force); else await pollAll(!!force);
   });
@@ -570,6 +580,7 @@ export function registerForgeIpc(): void {
     await setToken(service(provider), host, String(token ?? '').trim());
     for (const p of projects()) if (p.forge?.provider === provider) update(p.id, (c) => { c.me = undefined; });
   });
+  handle('forge:has-token', async (provider: Provider, host: string) => !!(await getToken(service(provider), host)));
   handle('forge:remove-token', (provider: Provider, host: string) => removeToken(service(provider), host));
   handle('forge:import-gh', async () => {
     const t = await ghToken();
