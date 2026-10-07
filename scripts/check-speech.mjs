@@ -5,7 +5,7 @@
 // Usage: node scripts/check-speech.mjs   (add --offline to skip the downloads)
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,7 +23,9 @@ globalThis.__stub = {
     app: { whenReady: () => new Promise(() => {}), getPath: () => tmp }, dialog: {}, shell: {}, BrowserWindow: {},
     ipcMain: { handle() {}, on() {} }, webContents: { getAllWebContents: () => [] },
   },
-  pty: { spawnEnv: async () => ({ PATH: `${bin}:/usr/bin:/bin` }) },
+  pty: { spawnEnv: async () => ({ PATH: `${bin}:/usr/bin:/bin` }),
+    // the real findOnPath (src/main/pty.ts), which cannot be bundled here because it loads node-pty
+    findOnPath: (name, path = '') => path.split(':').filter(Boolean).map((d) => join(d, name)).filter((p) => { try { accessSync(p, constants.X_OK); return statSync(p).isFile(); } catch { return false; } }) },
 };
 const stubs = { electron: 'electron', './pty': 'pty' };
 const out = join(tmp, 'speech.cjs');
@@ -114,8 +116,19 @@ comp.remove('whisper');
 assert.ok(existsSync(cli), 'removing an existing install leaves its files');
 assert.equal(speech.status().dictation, false);
 
+// ---- install: a download needs a published checksum (refused before fetching), a cap at 110% of its size ----
+const fake = { id: 'nosha', name: 'No checksum', kind: '', adds: '', licence: '', licenceUrl: '', version: '1', detect: {}, url: 'https://example.invalid/x.bin', file: 'x.bin' };
+comp.MANIFEST.push(fake);
+await assert.rejects(comp.install('nosha'), /no published checksum/);
+comp.MANIFEST.pop();
+
 // ---- install: checksum failure, then a real gh ----
 if (!process.argv.includes('--offline')) {
+  comp.MANIFEST.push({ id: 'small', name: 'Small', kind: '', adds: '', licence: '', licenceUrl: '', version: '1', detect: {}, size: 100,
+    url: 'https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_checksums.txt', sha256: '0'.repeat(64), file: 'gh_2.102.0_checksums.txt' });
+  await assert.rejects(comp.install('small'), /larger than Small's published size/);
+  assert.ok(!existsSync(join(comp.COMPONENTS_DIR, 'small')) && !existsSync(join(comp.COMPONENTS_DIR, 'small.partial')));
+  comp.MANIFEST.pop();
   comp.MANIFEST.push({ id: 'tiny', name: 'Tiny', kind: '', adds: '', licence: '', licenceUrl: '', version: '1', detect: {},
     url: 'https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_checksums.txt', sha256: '0'.repeat(64), file: 'gh_2.102.0_checksums.txt' });
   await assert.rejects(comp.install('tiny'), /checksum/);
@@ -132,6 +145,9 @@ if (!process.argv.includes('--offline')) {
   assert.equal(rows.gh.installedVersion, '2.102.0');
   assert.ok(rows.gh.disk > 1e6);
   assert.equal(JSON.parse(readFileSync(join(home, 'config.json'), 'utf8')).components.gh.path, gh);
+  // An update swaps in the new install and leaves no .old or .partial behind.
+  assert.equal(await comp.install('gh'), gh);
+  assert.ok(!existsSync(join(comp.COMPONENTS_DIR, 'gh.old')) && !existsSync(join(comp.COMPONENTS_DIR, 'gh.partial')));
   comp.remove('gh');
   assert.ok(!existsSync(join(comp.COMPONENTS_DIR, 'gh')));
   assert.equal(comp.componentPath('gh'), null);

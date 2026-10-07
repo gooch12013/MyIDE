@@ -3,7 +3,9 @@
 // image-path finder in src/renderer/attach.ts.
 // Usage: node scripts/check-attach.mjs
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { deflateSync } from 'node:zlib';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,15 +24,33 @@ const m = await load('src/main/attach.ts', 'main.cjs');
 const r = await load('src/renderer/attach.ts', 'renderer.cjs');
 
 try {
-  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0]);
-  const jpg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0]);
-  const gif = new TextEncoder().encode('GIF89a...');
+  // A real w x h grey PNG; sips turns it into a JPEG and a GIF.
+  const chunk = (type, data) => { const b = Buffer.alloc(12 + data.length); b.writeUInt32BE(data.length); b.write(type, 4); data.copy(b, 8); b.writeUInt32BE(crc32(b.subarray(4, 8 + data.length)), 8 + data.length); return b; };
+  const { crc32 } = await import('node:zlib');
+  const makePng = (w, hh) => { const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w); ihdr.writeUInt32BE(hh, 4); ihdr[8] = 8; ihdr[9] = 0;
+    return new Uint8Array(Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', deflateSync(Buffer.alloc((w + 1) * hh, 0x80))), chunk('IEND', Buffer.alloc(0))])); };
+  const png = makePng(3, 2);
+  writeFileSync(join(tmp, 'src.png'), png);
+  execFileSync('/usr/bin/sips', ['-s', 'format', 'jpeg', join(tmp, 'src.png'), '--out', join(tmp, 'x.jpg')], { stdio: 'ignore' });
+  execFileSync('/usr/bin/sips', ['-s', 'format', 'gif', join(tmp, 'src.png'), '--out', join(tmp, 'x.gif')], { stdio: 'ignore' });
+  const jpg = new Uint8Array(readFileSync(join(tmp, 'x.jpg')));
+  const gif = new Uint8Array(readFileSync(join(tmp, 'x.gif')));
   const webp = new TextEncoder().encode('RIFF\0\0\0\0WEBPVP8 ');
   assert.equal(m.sniff(png), 'image/png');
   assert.equal(m.sniff(jpg), 'image/jpeg');
   assert.equal(m.sniff(gif), 'image/gif');
   assert.equal(m.sniff(webp), 'image/webp');
   assert.equal(m.sniff(new TextEncoder().encode('<svg>')), undefined);
+  // Sizes from headers; over 8000 px a side is refused.
+  for (const b of [png, jpg, gif]) assert.deepEqual(m.size(b), [3, 2]);
+  const riff = (kind, body) => new Uint8Array([...new TextEncoder().encode(`RIFF\0\0\0\0WEBP${kind}`), ...body]);
+  assert.deepEqual(m.size(riff('VP8X', [10, 0, 0, 0, 0, 0, 0, 0, 0x3f, 0x1f, 0, 0x2b, 0, 0])), [8000, 44]); // 7999+1, 43+1
+  const vp8l = (w, hh) => { const n = (w - 1) | ((hh - 1) << 14); return riff('VP8L', [0, 0, 0, 0, 0x2f, n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >>> 24) & 255]); };
+  assert.deepEqual(m.size(vp8l(300, 200)), [300, 200]);
+  assert.equal(m.size(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0])), undefined);
+  assert.throws(() => m.saveAttachments('p1', 'dev-3', [{ data: makePng(8001, 1) }]), /8001 x 1 pixels; the limit is 8000/);
+  assert.throws(() => m.saveAttachments('p1', 'dev-3', [{ data: vp8l(16383, 2) }]), /16383 x 2/);
+  assert.throws(() => m.saveAttachments('p1', 'dev-3', [{ data: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0]) }]), /size could not be read/);
 
   // Storage: numbered per employee, 0600, numbering carries on across messages.
   assert.deepEqual(m.saveAttachments('p1', 'dev-1', undefined), []);
@@ -43,7 +63,7 @@ try {
 
   // Limits: nothing is written when any image fails.
   assert.throws(() => m.saveAttachments('p1', 'dev-2', Array(6).fill({ data: png })), /At most 5 images/);
-  const big = new Uint8Array(m.MAX_BYTES + 1); big.set(png);
+  const big = new Uint8Array(m.MAX_BYTES + 1); big.set(png);  // header says 3 x 2
   assert.throws(() => m.saveAttachments('p1', 'dev-2', [{ data: png }, { data: big }]), /Image 2 is 5\.0 MB; the limit is 5 MB/);
   assert.throws(() => m.saveAttachments('p1', 'dev-2', [{ data: new TextEncoder().encode('<svg/>') }]), /not a PNG/);
   assert.throws(() => m.saveAttachments('p1', 'dev-2', [{ data: 'aGVsbG8=' }]), /Bad image data/);

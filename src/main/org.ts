@@ -36,12 +36,13 @@ const rank = (list: string[], v?: string) => {
 
 /** True when `want` is above `ceiling`: a stronger model, or the same model at a higher effort. `models` is the
  *  provider's list strongest first, `efforts` lowest first (providers.json order). A model not in the list counts
- *  as above, on either side; a missing effort is the CLI default. */
+ *  as above, on either side; a missing effort is the CLI default; a provider with no efforts compares models only. */
 export function aboveCeiling(want: Pick, ceiling: Pick | undefined, models: string[], efforts: string[]): boolean {
   if (!ceiling?.model) return false;
   const w = rank(models, want.model), c = rank(models, ceiling.model);
   if (w < 0 || c < 0) return true;
   if (w !== c) return w < c;
+  if (!efforts.length) return false; // the provider has no effort setting (Gemini): same model, nothing above
   const we = rank(efforts, want.effort || DEFAULT_EFFORT), ce = rank(efforts, ceiling.effort || DEFAULT_EFFORT);
   return we < 0 || ce < 0 || we > ce;
 }

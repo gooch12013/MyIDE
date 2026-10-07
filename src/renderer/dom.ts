@@ -11,3 +11,28 @@ export const errText = (e: unknown): string => (e as Error).message.replace(/^Er
 /** A small rubber key (button). */
 export const key = (label: string, onclick: (() => void) | null = null, extra: Partial<HTMLButtonElement> = {}): HTMLButtonElement =>
   h('button', { type: 'button', className: 'key key--sm', textContent: label, onclick, ...extra });
+
+/** Shows `form` in a modal in-app sheet, removed when it closes. */
+export function sheet(label: string, form: HTMLFormElement, className = ''): HTMLDialogElement {
+  const d = h('dialog', { className: `sheet ${className}`.trim() }, form);
+  d.setAttribute('aria-label', label);
+  d.addEventListener('close', () => d.remove());
+  document.body.append(d);
+  d.showModal();
+  return d;
+}
+
+/** A modal question with keys [value, label, className]; resolves with the picked value ('cancel' on Escape). Cancel comes first. */
+export function choose(title: string, detail: string, keys: [string, string, string][]): Promise<string> {
+  const d = sheet(title, h('form', { method: 'dialog' },
+    h('p', { className: 'legend', textContent: title }),
+    h('p', { className: 'pref-hint ask-detail', textContent: detail }),
+    h('div', { className: 'sheet-keys' },
+      h('button', { className: 'btn', value: 'cancel', textContent: 'Cancel' }),
+      ...keys.map(([value, textContent, className]) => h('button', { className, value, textContent })))));
+  return new Promise((r) => d.addEventListener('close', () => r(d.returnValue || 'cancel'), { once: true }));
+}
+
+/** A modal yes/no; resolves true when the user picks `ok`. */
+export const ask = (title: string, detail: string, ok: string, danger = false): Promise<boolean> =>
+  choose(title, detail, [['ok', ok, danger ? 'btn rm' : 'btn btn--primary']]).then((v) => v === 'ok');

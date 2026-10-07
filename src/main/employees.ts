@@ -1,22 +1,24 @@
-import { BrowserWindow, ipcMain, Notification } from 'electron';
+import { BrowserWindow, Notification } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { HF_DENY, HF_SERVER } from './assets';
 import { saveAttachments, worktreeImage } from './attach';
 import { installHooks } from './attribution';
 import type { ClaudeEvent, TaskState } from './claude/parse';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
 import { account, claudeConfigDir, listAccounts, usageOf } from './accounts';
+import { frontmatter } from './buttons';
 import { forgeAction } from './forge';
 import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
 import { planCommands } from './mac';
 import { addApproval, clearGrants, employeeMcpConfig, grantCommands, hookUrl, onApproval, onApprovalGone, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
 import { aboveCeiling, autoPick, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
-import { listProjects, readConfig, writeConfig } from './projects';
+import { listProjects, projectById, readConfig, writeConfig } from './projects';
 import { onPtyExit } from './pty';
-import { lockDown, readJSON, STATE_DIR, writeJSON, writePrivate } from './store';
+import { broadcast, handle, lockDown, readJSON, slug, STATE_DIR, writeJSON, writePrivate } from './store';
 import { addWorktree, branchExists, checkRepo, git, removeWorktree } from './worktree';
 
 export type EmployeeState = 'idle' | 'queued' | 'working' | 'needs-you' | 'done' | 'failed' | 'interrupted' | 'talking';
@@ -74,12 +76,8 @@ const projDir = (projectId: string) => join('projects', projectId);
 const settingsFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'settings', `${e.id}.json`);
 const mcpFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'mcp', `${e.id}.json`);
 const talkPromptFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'talk', `${e.id}.md`);
-const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'employee';
 const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, go, ...e }: Emp): Employee => e;
 const put = (file: string, data: object) => writePrivate(file, JSON.stringify(data, null, 2));
-const broadcast = (channel: string, ...args: unknown[]) => {
-  for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
-};
 
 // ---- This Mac: a built-in pseudo-project, no repo and no worktrees; its employees plan read-only, then run on GO ----
 
@@ -89,17 +87,27 @@ const goTurns = new Set<string>(); // This Mac employees whose running turn is a
 const quietTurns = new Set<string>(); // employees whose running turn is a scheduled run
 const MAC_RULES = 'You work on David\'s Mac itself (shell, files, settings, his servers and services), not in a code repository. '
   + 'Every task starts in plan mode: investigate read-only, then call ExitPlanMode with your plan. In the plan put every command you will run, '
-  + 'exactly as you will run it, one per line, in a single ```bash block, and list each file you will edit with its full path. '
+  + 'exactly as you will run it, one per line (a heredoc is one command), in a single ```bash block, and list each file you will edit with its full path. '
+  + 'Put how to undo it under a heading "## Undo", after the commands: Undo commands are never pre-approved. Use ```text for output you quote. '
   + 'David approves the plan (GO); your next turn runs with exactly those commands allowed once each, and anything else waits for him. '
   + 'Never print keychain secrets or tokens. Do not touch git repositories unless the task asks. Servers\' own approval rules apply.';
 
 /** This Mac's settings: the usual denies plus the change journal hooks (snapshot before an edit, log every Bash call). */
+// Credentials (under the home folder) a This Mac employee never reads, whatever David approves. Read rules also cover Grep and Glob.
+const SECRETS = ['.ssh/id_*', '.ssh/*key*', '.appstoreconnect/**', '.config/googleplay/**', '.codex/auth.json', '.gemini/**', '.claude.json',
+  '.claude/.credentials*', '.aws/**', '.netrc', '.config/gh/hosts.yml', 'Library/Keychains/**'];
 function macSettings(e: Emp): object {
   const base = employeeSettings() as { permissions: { deny: string[] } };
   const post = (fail: string) => `curl -sf --max-time 60 -H 'Content-Type: application/json' --data-binary @- '${hookUrl(e.id)}' >/dev/null 2>&1 || ${fail}`;
   return {
     ...base,
-    permissions: { deny: [...base.permissions.deny, ...['journal/**', 'todos/**'].flatMap((g) => ['Edit', 'Write'].map((t) => `${t}(/${join(STATE_DIR, g)})`))] },
+    permissions: { ...base.permissions, deny: [...base.permissions.deny,
+      // The journal, the to-do logs, and the folder's own project settings (an allow rule written there would apply next turn).
+      ...[join(STATE_DIR, 'journal/**'), join(STATE_DIR, 'todos/**'), join(MAC.path, '.claude/**')].flatMap((g) => ['Edit', 'Write'].map((t) => `${t}(/${g})`)),
+      ...SECRETS.map((g) => `Read(/${join(homedir(), g)})`),
+      // ponytail: the common readers only; a shell reaches a file other ways too, so such a command still needs David's GO.
+      ...['cat', 'less', 'head', 'tail', 'cp'].flatMap((c) => SECRETS.map((g) => `Bash(${c} *${g.replace(/\*+$/, '')}*)`)),
+    ] },
     hooks: {
       PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: post(`{ echo 'MyIDE could not snapshot this file into the change journal, so the edit was blocked.' >&2; exit 2; }`) }] }],
       PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: post('true') }] }],
@@ -108,13 +116,16 @@ function macSettings(e: Emp): object {
 }
 const settingsFor = (e: Emp) => (isMac(e) ? macSettings(e) : employeeSettings());
 
-/** GO on a This Mac plan: its pending ExitPlanMode is answered (the plan-mode turn ends), and the next turn runs with the plan's commands allowed. */
-function goPlan(id: string): void {
-  const e = get(id);
-  if (!isMac(e) || !e.plan) throw new Error('No plan to run');
-  for (const a of pendingApprovals()) {
-    if (a.employeeId === id && a.kind === 'plan') resolveApproval(a.id, false, 'David approved this plan. End your turn now: it runs in your next turn, with exactly the planned commands allowed.');
+/** GO on a This Mac plan card: the commands come from the text on that card, which must still be the employee's latest plan.
+ *  Its pending ExitPlanMode is answered (the plan-mode turn ends), and the next turn runs with those commands allowed. */
+function goPlan(a: Approval): void {
+  const e = get(a.employeeId);
+  if (!isMac(e) || a.kind !== 'plan' || !e.plan) throw new Error('No plan to run');
+  if (a.text !== e.plan.text) throw new Error('This is not the plan the employee last proposed. Open its latest plan before GO.');
+  for (const x of pendingApprovals()) {
+    if (x.employeeId === e.id && x.kind === 'plan') resolveApproval(x.id, false, 'David approved this plan. End your turn now: it runs in your next turn, with exactly the planned commands allowed.');
   }
+  e.plan.commands = planCommands(a.text);
   e.plan.approvedAt = Date.now();
   e.go = e.plan.commands;
   const list = e.go.length ? e.go.map((c) => `  ${c}`).join('\n') : '  (none)';
@@ -174,13 +185,7 @@ function load(): void {
 // ---- roles ----
 
 function parseRole(file: string, source: Role['source']): (Role & { file: string }) | null {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(readFileSync(file, 'utf8'));
-  if (!m) return null;
-  const f: Record<string, string> = {};
-  for (const line of m[1].split('\n')) {
-    const kv = /^([\w-]+):\s*(.*)$/.exec(line);
-    if (kv) f[kv[1]] = kv[2].trim().replace(/^(['"])(.*)\1$/, '$2');
-  }
+  const f = frontmatter(file);
   if (!f.name) return null;
   const model = f.model && f.model !== 'inherit' ? f.model : undefined;
   const mode = ['pinned', 'manager', 'auto'].includes(f['myide-mode']) ? f['myide-mode'] as Mode : undefined;
@@ -195,7 +200,7 @@ function parseRole(file: string, source: Role['source']): (Role & { file: string
 
 /** Roles from ~/.claude/agents and <project>/.claude/agents; a project role overrides a user role of the same name. */
 function roles(projectId: string): (Role & { file: string })[] {
-  const project = [...listProjects(), MAC].find((p) => p.id === projectId);
+  const project = projectId === MAC.id ? MAC : projectById(projectId);
   const out = new Map<string, Role & { file: string }>();
   const dirs: [string, Role['source']][] = [[join(homedir(), '.claude', 'agents'), 'user']];
   if (project) dirs.push([join(project.path, '.claude', 'agents'), 'project']);
@@ -289,7 +294,8 @@ function start(e: Emp): void {
     if (go) { grantCommands(e.id, go); goTurns.add(e.id); e.go = undefined; }
     if (typeof next !== 'string' && next.quiet) quietTurns.add(e.id); else quietTurns.delete(e.id);
     turn = runTurnFor(e, {
-      ...(isMac(e) ? { permissionMode: go ? 'default' as const : 'plan' as const, addDirs } : {}),
+      // This Mac: an explicit mode every turn, and no user settings, so David's own allow rules never run an unplanned command.
+      ...(isMac(e) ? { permissionMode: go ? 'default' as const : 'plan' as const, addDirs, settingSources: 'project,local' } : {}),
       cwd: e.worktree, prompt, images: typeof next === 'string' ? undefined : next.images, sessionId: e.sessionId, model: e.model, effort: e.effort, maxTurns,
       settingsPath: settingsFile(e), mcpConfigPath: mcpFile(e), appendSystemPrompt: systemPrompt(e), prevTasks: e.tasks, onEvent,
     });
@@ -379,16 +385,20 @@ function employeeSettings(): object {
   return {
     attribution: { commit: '', pr: '' },
     permissions: {
+      ask: [HF_SERVER],
       deny: [
         // Forge access goes through MyIDE's forge tool only.
         'Bash(gh *)', 'Bash(env gh *)', 'Bash(command gh *)', 'Bash(*/gh *)', 'Bash(tea *)', 'Bash(curl *api.github.com*)',
         'Bash(* gh *)', 'Bash(bash -c *gh *)', 'Bash(sh -c *gh *)', 'Bash(* tea *)', 'Bash(bash -c *tea *)', 'Bash(sh -c *tea *)',
         // The commit-msg hook strips attribution; skipping hooks would skip that.
-        'Bash(git commit --no-verify*)', 'Bash(git commit *--no-verify*)', 'Bash(git commit -n*)', 'Bash(git commit * -n*)',
+        'Bash(git commit --no-verify*)', 'Bash(git commit *--no-verify*)', 'Bash(git commit *--no-v*)', 'Bash(git commit -n*)', 'Bash(git commit * -n*)',
         'Bash(git * --no-verify*)', 'Bash(git -c *)',
         // The keychain (forge tokens) and MyIDE's own state: the issue endpoint token, configs, other employees' settings.
         // Worktrees live under STATE_DIR too, so the denies name what is not a worktree rather than all of it.
-        'Bash(security *)', 'Bash(*myide/bin/issue*)', 'Bash(*issue-endpoint*)',
+        'Bash(security *)', 'Bash(*myide/bin/issue*)', 'Bash(*myide/bin/todo*)', 'Bash(*issue-endpoint*)',
+        // Higgsfield: spending and publishing tools are denied; every other call reaches the approve tool, where generate_image
+        // passes only within an asset_cost approval (spendGate in src/main/assets.ts).
+        ...HF_DENY,
         ...['*.json', '*.md', 'projects/**', 'accounts/**', 'bin/**', 'hooks/**'].flatMap((g) => ['Read', 'Edit', 'Write'].map((t) => `${t}(/${join(STATE_DIR, g)})`)),
       ],
     },
@@ -513,7 +523,7 @@ function hire(o: HireOpts, by?: Emp): Promise<Employee> {
 
 async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   const mac = o.projectId === MAC.id;
-  const project = mac ? MAC : listProjects().find((p) => p.id === o.projectId);
+  const project = mac ? MAC : projectById(o.projectId);
   if (!project) throw new Error('No such project');
   if (!mac) await checkRepo(project.path, project.name);
   const role = roles(o.projectId).find((r) => r.name === o.role);
@@ -521,7 +531,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   if (typeof o.task !== 'string' || !o.task.trim()) throw new Error('Give the employee a task');
   const depth = by ? by.depth + 1 : 1;
   if (depth > maxDepth(o.projectId)) throw new Error(`Depth limit: ${project.name} allows ${maxDepth(o.projectId)} levels, and a report of ${by?.name} would be level ${depth}. Do this task yourself or ask David.`);
-  const base = slug(role.name);
+  const base = slug(role.name, 'employee');
   const taken = (name: string) => [...emps.values()].some((e) => e.projectId === o.projectId && e.name === name)
     || existsSync(join(STATE_DIR, 'worktrees', o.projectId, name));
   let n = 1;
@@ -538,6 +548,8 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   // A lead's hire may only land on an account that allows automatic use; otherwise it shares the lead's.
   if (by && !account(accountId)?.allowAuto) accountId = by.accountId;
   const provider = account(accountId)?.provider ?? o.provider ?? 'claude';
+  // This Mac's safety rests on Claude Code's plan mode, permission prompt tool and hooks; the ACP agents have no equivalent.
+  if (mac && provider !== 'claude') throw new Error('This Mac employees run on Claude only. Pick a Claude account.');
   const e: Emp = {
     id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: mac ? '' : `myide/${name}`,
     model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
@@ -581,7 +593,7 @@ async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: 
   const ptyId = `terminal-${randomUUID().slice(0, 8)}`;
   talkPtys.set(ptyId, e.id);
   // exec: when the CLI exits so does the PTY, which ends Talk.
-  const command = talkCommandFor(e, { sessionId: e.sessionId, model: e.model, effort: e.effort, settingsPath: settingsFile(e), promptFile: talkPromptFile(e) });
+  const command = talkCommandFor(e, { sessionId: e.sessionId, model: e.model, effort: e.effort, settingsPath: settingsFile(e), promptFile: talkPromptFile(e), mac: isMac(e) });
   return { cwd: e.worktree, command, ptyId };
 }
 
@@ -594,12 +606,13 @@ function talkEnded(ptyId: string): void {
 
 async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> {
   const e = get(id);
-  const project = listProjects().find((p) => p.id === e.projectId);
+  const project = projectById(e.projectId);
   emps.delete(id);
   save(e.projectId);
   broadcast('employees:removed', id);
   for (const cb of removedCbs) { try { cb(id); } catch (err) { console.error(err); } }
   for (const a of pendingApprovals()) if (a.employeeId === id) resolveApproval(a.id, false, 'Employee fired');
+  clearGrants(id, true); // its late allows go with it
   approvalGone(); // NEEDS YOU drops its cards
   await interrupt(id, 'fire');
   rmSync(settingsFile(e), { force: true });
@@ -748,7 +761,7 @@ async function setProject(id: string, patch: ProjectPatch): Promise<void> {
 /** The session transcript Claude Code itself wrote, as plain lines with tool names. */
 function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[] {
   const e = get(id);
-  if (e.provider === 'codex' || e.provider === 'gemini') return [{ role: 'tool', text: `Transcript not available for ${e.provider === 'codex' ? 'Codex' : 'Gemini'} yet.` }];
+  if (e.provider !== 'claude') return [{ role: 'tool', text: `Transcript not available for ${providers()[e.provider]?.label ?? e.provider} yet.` }];
   if (!e.sessionId) return [];
   const CLAUDE_PROJECTS = join(claudeConfigDir(e.accountId), 'projects'); // the account's own store
   const name = `${e.sessionId}.jsonl`;
@@ -855,13 +868,12 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   onPtyExit(talkEnded);
   void startMcp().then(() => { mcpReady = true; schedule(); }, (err) => console.error('MCP server failed to start', err));
 
-  const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
-  h('employees:list', listEmployees);
-  h('employees:roles', (projectId: string) => roles(projectId).map(({ file, ...r }) => r));
-  h('employees:hire', hire);
-  h('employees:send', (id: string, text: string, images?: unknown) => send(id, text, undefined, undefined, images));
-  h('employees:image', (id: string, path: string) => worktreeImage(get(id).worktree, String(path)));
-  h('employees:set-model', async (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }) => {
+  handle('employees:list', listEmployees);
+  handle('employees:roles', (projectId: string) => roles(projectId).map(({ file, ...r }) => r));
+  handle('employees:hire', hire);
+  handle('employees:send', (id: string, text: string, images?: unknown) => send(id, text, undefined, undefined, images));
+  handle('employees:image', (id: string, path: string) => worktreeImage(get(id).worktree, String(path)));
+  handle('employees:set-model', async (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }) => {
     const e = get(id);
     if (o.mode && ['pinned', 'manager', 'auto'].includes(o.mode)) e.mode = o.mode;
     if (o.model) e.model = o.model;
@@ -869,22 +881,21 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
     emit(e);
     if (o.now) await interrupt(id, 'model');
   });
-  h('employees:interrupt', (id: string) => {
+  handle('employees:interrupt', (id: string) => {
     const e = get(id);
     e.paused = true; // queued messages wait for the next send or talk
     save(e.projectId);
     return interrupt(id, 'user');
   });
-  h('employees:talk', talk);
-  h('employees:fire', fire);
-  h('employees:transcript', transcript);
-  h('employees:go', goPlan);
-  h('approvals:list', () => pendingApprovals());
-  h('approvals:resolve', (id: string, allow: boolean, message?: string) => {
+  handle('employees:talk', talk);
+  handle('employees:fire', fire);
+  handle('employees:transcript', transcript);
+  handle('approvals:list', () => pendingApprovals());
+  handle('approvals:resolve', (id: string, allow: boolean, message?: string) => {
     const a = pendingApprovals().find((x) => x.id === id);
     const mac = a?.kind === 'plan' ? emps.get(a.employeeId) : undefined;
     if (mac && isMac(mac)) {
-      if (allow) return goPlan(mac.id);
+      if (allow) return goPlan(a!);
       mac.plan = undefined; // rejected: the to-do stops offering it
       emit(mac);
     }
@@ -892,15 +903,15 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
     if (a?.timedOut && allow) allowedLate(a, message); // deny of a timed-out item just clears it
     approvalGone();
   });
-  h('org:get', orgState);
-  h('org:set-project', setProject);
-  h('claude:info', claudeInfo);
-  h('claude:test', claudeTest);
+  handle('org:get', orgState);
+  handle('org:set-project', setProject);
+  handle('claude:info', claudeInfo);
+  handle('claude:test', claudeTest);
 
   registerControlTool('status', 'List MyIDE employees with their state, task and progress. Optional projectId filter.',
     { type: 'object', properties: { projectId: { type: 'string' } } },
     async (a: { projectId?: string }) => [...emps.values()].filter((e) => !a?.projectId || e.projectId === a.projectId).map((e) => ({
-      id: e.id, name: e.name, project: listProjects().find((p) => p.id === e.projectId)?.name, state: e.state, model: e.model,
+      id: e.id, name: e.name, project: projectById(e.projectId)?.name, state: e.state, model: e.model,
       task: e.task, progress: e.progress, error: e.error,
     })));
   registerControlTool('usage', 'Rate-limit usage per AI account: five-hour and seven-day utilization (0 to 1) and reset time.',

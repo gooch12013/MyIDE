@@ -1,16 +1,16 @@
 // Action buttons and their schedules. A button sends a slash command as an ordinary turn: Claude Code 2.1.292
 // expands user, project and plugin commands and skills inside `claude -p` (checked with a project command and
 // a plugin skill), so no command file is read or inlined here.
-import { BrowserWindow, ipcMain, Notification, powerMonitor, powerSaveBlocker } from 'electron';
+import { Notification, powerMonitor, powerSaveBlocker } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Employee } from './employees';
 import { hireEmployee, listEmployees, onEmployeeChange, sendToEmployee } from './employees';
-import { listProjects } from './projects';
-import { due, nextRun, type Schedule } from './schedules';
-import { readJSON, STATE_DIR, writeJSON, writePrivate } from './store';
+import { listProjects, projectById } from './projects';
+import { due, fingerprint, nextRun, type Schedule } from './schedules';
+import { broadcast, handle, readJSON, slug, STATE_DIR, writeJSON, writePrivate } from './store';
 
 export type Target = 'lead' | 'selected' | { role: string };
 export interface Button { id: string; label: string; command: string; target: Target; input?: string; scope: 'global' | 'project'; projectId?: string }
@@ -22,10 +22,11 @@ type SchedFile = { paused: boolean; schedules: Schedule[] };
 
 const CLAUDE = join(homedir(), '.claude');
 
-function frontmatter(file: string): Record<string, string> {
+/** A markdown file's YAML frontmatter as flat `key: value` strings (quotes stripped); {} if it has none or cannot be read. */
+export function frontmatter(file: string): Record<string, string> {
   try {
     const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(readFileSync(file, 'utf8'));
-    return Object.fromEntries((m?.[1] ?? '').split('\n').map((l) => /^([\w-]+):\s*(.*)$/.exec(l)).filter((x) => !!x).map((x) => [x![1], x![2].replace(/^["']|["']$/g, '')]));
+    return Object.fromEntries((m?.[1] ?? '').split('\n').map((l) => /^([\w-]+):\s*(.*)$/.exec(l)).filter((x) => !!x).map((x) => [x![1], x![2].trim().replace(/^(['"])(.*)\1$/, '$2')]));
   } catch { return {}; }
 }
 const ls = (dir: string) => { try { return readdirSync(dir); } catch { return []; } };
@@ -58,7 +59,7 @@ export function palette(projectPath?: string): PaletteItem[] {
 
 // ---- buttons: global in ~/.myide/buttons.json, project ones in <repo>/.myide/buttons.json (committed with the repo) ----
 
-const projectPath = (id?: string) => listProjects().find((p) => p.id === id)?.path;
+const projectPath = (id?: string) => projectById(id)?.path;
 const projectFile = (id: string) => { const p = projectPath(id); if (!p) throw new Error('No such project'); return join(p, '.myide', 'buttons.json'); };
 
 function readProject(id: string): Button[] {
@@ -107,11 +108,18 @@ function removeButton(id: string): void {
 /** Sends `command` (plus input) to the button's target in `projectId`; resolves to the employee that runs it.
  *  quiet: a scheduled run, which notifies only on failure or needs-you. */
 export async function runButton(b: Pick<Button, 'command' | 'target' | 'label'>, projectId: string, o: { employeeId?: string; input?: string; quiet?: boolean } = {}): Promise<Employee> {
-  const project = listProjects().find((p) => p.id === projectId);
+  const project = projectById(projectId);
   if (!project) throw new Error('No such project');
   const text = [b.command.trim(), o.input?.trim()].filter(Boolean).join(' ');
-  if (typeof b.target === 'object') return hireEmployee({ projectId, role: b.target.role, task: text, quiet: o.quiet });
   const emps = listEmployees(projectId);
+  if (typeof b.target === 'object') {
+    const role = b.target.role;
+    // A scheduled run reuses an idle top-level employee with the role, so a daily button does not hire one a day.
+    const idle = o.quiet && emps.find((x) => x.role === role && !x.parentId && (x.state === 'idle' || x.state === 'done'));
+    if (!idle) return hireEmployee({ projectId, role, task: text, quiet: o.quiet });
+    sendToEmployee(idle.id, text, { quiet: true });
+    return idle;
+  }
   const e = b.target === 'selected'
     ? emps.find((x) => x.id === o.employeeId)
     : emps.find((x) => x.lead && !x.parentId) ?? emps.find((x) => x.lead);
@@ -125,9 +133,6 @@ export async function runButton(b: Pick<Button, 'command' | 'target' | 'label'>,
 let now = () => Date.now(); // tests move the clock (see registerButtonsIpc)
 const readScheds = () => readJSON<SchedFile>('schedules.json', { paused: false, schedules: [] });
 const writeScheds = (f: SchedFile) => { writeJSON('schedules.json', f); changed(); };
-const broadcast = (channel: string, ...args: unknown[]) => {
-  for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
-};
 let onPausedChange: (paused: boolean) => void = () => {};
 function changed(): void { broadcast('schedules:change'); onPausedChange(readScheds().paused); }
 
@@ -149,13 +154,14 @@ function saveSchedule(s: Schedule): Schedule {
     missed: s.missed === 'skip' ? 'skip' : 'run', enabled: s.enabled !== false, input: s.input?.trim() || undefined,
     handled: timing ? old.handled : now(), // a new or retimed schedule starts from now: nothing before counts as missed
     last: old?.last,
+    fingerprint: fingerprint(b), // what David scheduled; a changed button pauses the schedule instead of running
   };
   writeScheds({ ...f, schedules: [...f.schedules.filter((x) => x.id !== clean.id), clean] });
   return clean;
 }
 
-// Scheduled runs in flight: employee id -> what to report when its turn ends.
-const active = new Map<string, { schedule: Schedule; label: string; command: string; started: number }>();
+// Scheduled runs in flight: schedule id -> its employee and what to report when that employee's turn ends.
+const active = new Map<string, { employeeId: string; schedule: Schedule; label: string; command: string; started: number }>();
 let blocker: number | null = null;
 function awake(): void {
   if (active.size && blocker === null) blocker = powerSaveBlocker.start('prevent-app-suspension');
@@ -166,12 +172,11 @@ export const keepingAwake = (): boolean => blocker !== null;
 const ENDED: Partial<Record<Employee['state'], string>> = { done: 'Done', failed: 'Failed', 'needs-you': 'Needs you', interrupted: 'Interrupted' };
 const RUN_LIMIT_MS = 6 * 3600_000; // a run that never reports back (employee fired) stops keeping the Mac awake
 
-const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'schedule';
 const day = (ms: number) => { const d = new Date(ms); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
 
 /** Records a scheduled run's outcome on its schedule and in ~/.myide/reports/<date>-<schedule>.md. */
 function record(s: Schedule, label: string, status: string, body: string): void {
-  const file = join(STATE_DIR, 'reports', `${day(now())}-${slug(label)}.md`);
+  const file = join(STATE_DIR, 'reports', `${day(now())}-${slug(label, 'schedule')}.md`);
   writePrivate(file, `# ${label}\n\n${body}\n`);
   const f = readScheds();
   const cur = f.schedules.find((x) => x.id === s.id);
@@ -179,12 +184,12 @@ function record(s: Schedule, label: string, status: string, body: string): void 
 }
 
 function ended(e: Employee): void {
-  const run = active.get(e.id);
   const status = ENDED[e.state];
+  const [id, run] = [...active].find(([, r]) => r.employeeId === e.id) ?? [];
   if (!run || !status) return;
-  active.delete(e.id);
+  active.delete(id!);
   awake();
-  const project = listProjects().find((p) => p.id === e.projectId)?.name ?? e.projectId;
+  const project = projectById(e.projectId)?.name ?? e.projectId;
   record(run.schedule, run.label, status, [
     `- Status: ${status}`, `- Command: \`${run.command}\``, `- Project: ${project}`, `- Employee: ${e.name} (${e.branch})`,
     `- Started: ${new Date(run.started).toLocaleString()}`, `- Ended: ${new Date(now()).toLocaleString()}`, '',
@@ -193,18 +198,26 @@ function ended(e: Employee): void {
   // employees.ts already notifies on failed and needs-you.
 }
 
-function fail(s: Schedule, label: string, err: unknown): void {
+function fail(s: Schedule, label: string, err: unknown, status = 'Failed'): void {
   const msg = (err as Error).message;
-  record(s, label, 'Failed', `- Status: Failed\n- Could not start: ${msg}`);
-  if (Notification.isSupported()) new Notification({ title: `Schedule "${label}" failed`, body: msg }).show();
+  record(s, label, status, `- Status: ${status}\n- ${status === 'Failed' ? 'Could not start' : 'Why'}: ${msg}`);
+  if (Notification.isSupported()) new Notification({ title: `Schedule "${label}" ${status === 'Failed' ? 'failed' : 'paused'}`, body: msg }).show();
 }
 
 async function fire(s: Schedule): Promise<void> {
   const b = findButton(s.buttonId, s.projectId);
   if (!b) return fail(s, s.buttonId, new Error('Its button was deleted'));
+  if (s.fingerprint !== fingerprint(b)) {
+    // The button's command or target changed (a project button can change with a pull): David re-saves the schedule to accept it.
+    const f = readScheds();
+    const cur = f.schedules.find((x) => x.id === s.id);
+    if (cur) { cur.enabled = false; writeScheds(f); }
+    return fail(s, b.label, new Error('Its button\'s command or target changed since the schedule was saved. Check the button, then turn the schedule back on.'), 'Paused');
+  }
+  if (active.has(s.id)) return record(s, b.label, 'Skipped', '- Status: Skipped, the previous run is still going');
   try {
     const e = await runButton(b, s.projectId, { input: s.input, quiet: true });
-    active.set(e.id, { schedule: s, label: b.label, command: b.command, started: now() });
+    active.set(s.id, { employeeId: e.id, schedule: s, label: b.label, command: b.command, started: now() });
     awake();
     record(s, b.label, 'Running', `- Status: Running on ${e.name}`);
   } catch (err) { fail(s, b.label, err); }
@@ -232,22 +245,21 @@ export function tick(at = now()): void {
 export function registerButtonsIpc(o: { onPaused?: (paused: boolean) => void } = {}): void {
   onPausedChange = o.onPaused ?? onPausedChange;
   onEmployeeChange(ended);
-  const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
-  h('buttons:list', (projectId?: string) => ({ buttons: listButtons(projectId), palette: palette(projectPath(projectId)) }));
-  h('buttons:save', saveButton);
-  h('buttons:delete', (id: string) => {
+  handle('buttons:list', (projectId?: string) => ({ buttons: listButtons(projectId), palette: palette(projectPath(projectId)) }));
+  handle('buttons:save', saveButton);
+  handle('buttons:delete', (id: string) => {
     removeButton(id);
     const f = readScheds();
     writeScheds({ ...f, schedules: f.schedules.filter((s) => s.buttonId !== id) });
   });
-  h('buttons:run', async (b: Button, projectId: string, o: { employeeId?: string; input?: string }) => (await runButton(b, projectId, { employeeId: o?.employeeId, input: o?.input })).id);
-  h('schedules:list', () => {
+  handle('buttons:run', async (b: Button, projectId: string, o: { employeeId?: string; input?: string }) => (await runButton(b, projectId, { employeeId: o?.employeeId, input: o?.input })).id);
+  handle('schedules:list', () => {
     const f = readScheds();
     return { ...f, schedules: f.schedules.map((s) => ({ ...s, next: nextRun(s, new Date(Math.max(now(), s.handled)))?.getTime() })), awake: keepingAwake() };
   });
-  h('schedules:save', saveSchedule);
-  h('schedules:delete', (id: string) => { const f = readScheds(); writeScheds({ ...f, schedules: f.schedules.filter((s) => s.id !== id) }); });
-  h('schedules:pause', pauseSchedules);
+  handle('schedules:save', saveSchedule);
+  handle('schedules:delete', (id: string) => { const f = readScheds(); writeScheds({ ...f, schedules: f.schedules.filter((s) => s.id !== id) }); });
+  handle('schedules:pause', pauseSchedules);
 
   powerMonitor.on('resume', () => tick());
   setInterval(() => tick(), 60_000);

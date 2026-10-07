@@ -1,5 +1,5 @@
 import * as monaco from 'monaco-editor';
-import { errText, h, key } from './dom';
+import { ask, choose, errText, h, key, sheet } from './dom';
 import { led } from './employees';
 import { fileRefs, resolvePath } from './links';
 import { activeProject } from './projects';
@@ -38,24 +38,12 @@ monaco.languages.setMonarchTokensProvider('cmake', {
   },
 });
 
-/** A modal in-app sheet; resolves true when the user picks `ok`. */
-export function ask(title: string, detail: string, ok: string, danger = false): Promise<boolean> {
-  const d = h('dialog', { className: 'sheet' }, h('form', { method: 'dialog' },
-    h('p', { className: 'legend', textContent: title }),
-    h('p', { className: 'pref-hint ask-detail', textContent: detail }),
-    h('div', { className: 'sheet-keys' },
-      h('button', { className: 'btn', value: 'cancel', textContent: 'Cancel' }),
-      h('button', { className: danger ? 'btn rm' : 'btn btn--primary', value: 'ok', textContent: ok }))));
-  d.setAttribute('aria-label', title);
-  document.body.append(d);
-  d.showModal();
-  return new Promise((r) => d.addEventListener('close', () => { r(d.returnValue === 'ok'); d.remove(); }, { once: true }));
-}
-
 // One model per open file, shared by every editor panel. A closed panel keeps its unsaved files;
 // the next editor panel opened picks them up.
-// disk: the file's text as last read or written; theirs: a newer disk text held back because the model has unsaved edits.
-type Doc = { model: monaco.editor.ITextModel; saved: number; root: string; branch: string; disk: string; theirs?: string };
+// disk/hash: the file's text as last read or written and the hash of its bytes (a save only lands over that hash);
+// theirs: a newer disk text held back because the model has unsaved edits.
+type Disk = { text: string; hash: string };
+type Doc = { model: monaco.editor.ITextModel; saved: number; root: string; branch: string; disk: string; hash: string; theirs?: Disk };
 const docs = new Map<string, Doc>();
 const dirty = (d: Doc): boolean => d.model.getAlternativeVersionId() !== d.saved;
 const base = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
@@ -64,10 +52,10 @@ const rel = (d: Doc, path: string): string => (path.startsWith(d.root + '/') ? p
 async function load(path: string): Promise<Doc> {
   const have = docs.get(path);
   if (have) return have;
-  const { text, root, branch } = await api.code.read(path);
+  const { text, hash, root, branch } = await api.code.read(path);
   const uri = monaco.Uri.file(path);
   const model = monaco.editor.getModel(uri) ?? monaco.editor.createModel(text, undefined, uri);
-  const doc: Doc = { model, saved: model.getAlternativeVersionId(), root, branch, disk: text };
+  const doc: Doc = { model, saved: model.getAlternativeVersionId(), root, branch, disk: text, hash };
   docs.set(path, doc);
   watchRoot(root);
   return doc;
@@ -85,21 +73,58 @@ api.git.onChanged(async (id) => {
   if (!root) return;
   for (const [path, d] of docs) {
     if (d.root !== root) continue;
-    let text: string;
-    try { text = (await api.code.read(path)).text; } catch { continue; } // deleted or moved: keep what is open
-    if (text === d.disk) { d.theirs = undefined; continue; }
-    if (dirty(d)) d.theirs = text;
-    else takeDisk(d, text);
+    await recheck(path, d);
   }
   for (const i of instances) i.redraw();
 });
+/** Compares a doc with its file: a clean doc takes the disk's text, a dirty one holds it back as `theirs`. */
+async function recheck(path: string, d: Doc): Promise<void> {
+  let now: Disk;
+  try { const r = await api.code.read(path); now = { text: r.text, hash: r.hash }; } catch { return; } // deleted or moved: keep what is open
+  if (now.hash === d.hash) { d.theirs = undefined; return; }
+  if (dirty(d)) d.theirs = now;
+  else takeDisk(d, now);
+}
 /** Replaces the model's text with the disk's, as one undoable edit, and marks it saved. */
-function takeDisk(d: Doc, text: string): void {
-  d.model.pushEditOperations([], [{ range: d.model.getFullModelRange(), text }], () => null);
-  d.disk = text;
+function takeDisk(d: Doc, disk: Disk): void {
+  d.model.pushEditOperations([], [{ range: d.model.getFullModelRange(), text: disk.text }], () => null);
+  d.disk = disk.text;
+  d.hash = disk.hash;
   d.theirs = undefined;
   d.saved = d.model.getAlternativeVersionId();
 }
+/** Saves a doc only over the disk text it was based on; returns '' or why not. A file changed on disk gets the "Changed on disk" bar. */
+async function saveDoc(path: string, d: Doc): Promise<string> {
+  const text = d.model.getValue();
+  const version = d.model.getAlternativeVersionId();
+  try {
+    d.hash = await api.code.write(path, text, d.hash);
+    d.saved = version;
+    d.disk = text; // saving after "Keep mine" overwrites their change
+    d.theirs = undefined;
+    return '';
+  } catch (e) {
+    await recheck(path, d);
+    return errText(e);
+  } finally { for (const i of instances) i.redraw(); }
+}
+
+// Quitting with unsaved files: main asks the main window (window.myideDirty, then window.myideQuitCheck) before it quits.
+const unsaved = () => [...docs].filter(([, d]) => dirty(d));
+Object.assign(window, {
+  myideDirty: () => unsaved().length,
+  async myideQuitCheck(): Promise<boolean> {
+    const list = unsaved();
+    if (!list.length) return true;
+    const pick = await choose(`Save ${list.length === 1 ? base(list[0][0]) : `${list.length} files`} before quitting?`,
+      `Unsaved changes:\n${list.map(([p]) => p).join('\n')}`,
+      [['discard', 'Don\'t save', 'btn rm'], ['save', 'Save', 'btn btn--primary']]);
+    if (pick === 'discard') return true;
+    if (pick !== 'save') return false;
+    for (const [p, d] of list) if (await saveDoc(p, d)) return false; // the bar or status shows why; quitting stops
+    return true;
+  },
+});
 
 type Instance = { open(path: string, line?: number): Promise<void>; has(path: string): boolean; redraw(): void };
 const instances: Instance[] = []; // most recently used first
@@ -152,8 +177,8 @@ registerPanel('editor', {
     const pathEl = h('span', { className: 'path' });
     const wt = h('span', { className: 'ed-wt' });
     const diskBar = h('div', { className: 'ed-disk', hidden: true }, h('span', { textContent: 'Changed on disk.' }),
-      key('Reload', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs !== undefined) takeDisk(d, d.theirs); for (const i of instances) i.redraw(); }, { className: 'key key--sm key--lit' }),
-      key('Keep mine', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs !== undefined) { d.disk = d.theirs; d.theirs = undefined; } for (const i of instances) i.redraw(); }));
+      key('Reload', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs) takeDisk(d, d.theirs); for (const i of instances) i.redraw(); }, { className: 'key key--sm key--lit' }),
+      key('Keep mine', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs) { d.disk = d.theirs.text; d.hash = d.theirs.hash; d.theirs = undefined; } for (const i of instances) i.redraw(); }));
     diskBar.setAttribute('role', 'alert');
     const status = h('p', { className: 'ed-status' });
     status.setAttribute('aria-live', 'polite');
@@ -194,7 +219,7 @@ registerPanel('editor', {
       wt.textContent = d?.branch ? `on ${d.branch}` : '';
       panel.setTitle(current ? `${d && dirty(d) ? '● ' : ''}${base(current)}` : 'Editor');
       send.disabled = !current;
-      diskBar.hidden = d?.theirs === undefined;
+      diskBar.hidden = !d?.theirs;
     }
 
     async function show(path: string, line?: number): Promise<void> {
@@ -214,15 +239,8 @@ registerPanel('editor', {
     async function save(): Promise<void> {
       const d = current ? docs.get(current) : undefined;
       if (!d || !current) return;
-      try {
-        const text = d.model.getValue();
-        await api.code.write(current, text);
-        d.saved = d.model.getAlternativeVersionId();
-        d.disk = text; // saving over a disk change is "keep mine"
-        d.theirs = undefined;
-        say(`Saved ${rel(d, current)}`);
-      } catch (e) { say(`Could not save: ${errText(e)}`); }
-      drawTabs();
+      const why = await saveDoc(current, d);
+      say(why ? `Could not save: ${why}` : `Saved ${rel(d, current)}`);
     }
 
     async function close(path: string): Promise<void> {
@@ -264,14 +282,10 @@ registerPanel('editor', {
         h('div', { className: 'sheet-keys' },
           h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }),
           h('button', { className: 'btn btn--primary', value: 'send', textContent: 'Send' })));
-      const sheet = h('dialog', { className: 'sheet send-sheet' }, form);
-      sheet.setAttribute('aria-label', 'Send selection to an employee');
-      document.body.append(sheet);
-      sheet.showModal();
-      await new Promise((r) => sheet.addEventListener('close', r, { once: true }));
+      const d2 = sheet('Send selection to an employee', form, 'send-sheet');
+      await new Promise((r) => d2.addEventListener('close', r, { once: true }));
       const id = (form.elements.namedItem('who') as RadioNodeList | null)?.value;
-      sheet.remove();
-      if (sheet.returnValue !== 'send' || !id) return;
+      if (d2.returnValue !== 'send' || !id) return;
       const fence = '```';
       const message = `${note.value.trim() ? note.value.trim() + '\n\n' : ''}From ${ref}:\n${fence}${d.model.getLanguageId()}\n${text}\n${fence}`;
       try {

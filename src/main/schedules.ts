@@ -12,7 +12,11 @@ export interface Schedule {
   input?: string; // the button's input, fixed for scheduled runs
   handled: number; // the last slot (ms) that ran or was skipped; slots at or before it are done
   last?: { at: number; status: string; report?: string };
+  fingerprint?: string; // the button's command and target when the schedule was saved (see fingerprint)
 }
+
+/** What a run of the button does: its command and who runs it. A schedule runs only while this matches what was saved. */
+export const fingerprint = (b: { command: string; target: unknown }): string => JSON.stringify([b.command, b.target]);
 
 /** How late a slot may be noticed and still count as on time. The timer ticks once a minute. */
 export const GRACE_MS = 5 * 60_000;
@@ -29,23 +33,18 @@ function slotOn(day: Date, off: number, time: string): Date {
   return new Date(day.getFullYear(), day.getMonth(), day.getDate() + off, h, m);
 }
 
-/** The first slot strictly after `after`, or null if no day is set. */
-export function nextRun(s: Pick<Schedule, 'days' | 'time'>, after: Date): Date | null {
+/** The nearest slot from `from` going `dir` days at a time (1: strictly after, -1: at or before), or null if no day is set. */
+function scan(s: Pick<Schedule, 'days' | 'time'>, from: Date, dir: 1 | -1): Date | null {
   for (let off = 0; off <= 7; off++) {
-    const d = slotOn(after, off, s.time);
-    if (d > after && s.days.includes(d.getDay())) return d;
+    const d = slotOn(from, off * dir, s.time);
+    if ((dir > 0 ? d > from : d <= from) && s.days.includes(d.getDay())) return d;
   }
   return null;
 }
-
+/** The first slot strictly after `after`, or null if no day is set. */
+export const nextRun = (s: Pick<Schedule, 'days' | 'time'>, after: Date): Date | null => scan(s, after, 1);
 /** The latest slot at or before `now`, or null. */
-export function prevRun(s: Pick<Schedule, 'days' | 'time'>, now: Date): Date | null {
-  for (let off = 0; off >= -7; off--) {
-    const d = slotOn(now, off, s.time);
-    if (d <= now && s.days.includes(d.getDay())) return d;
-  }
-  return null;
-}
+export const prevRun = (s: Pick<Schedule, 'days' | 'time'>, now: Date): Date | null => scan(s, now, -1);
 
 /** What a tick at `now` does with `s`: run, skip (a missed slot under 'skip', or everything while paused), or nothing.
  *  Several missed slots collapse into one: only the latest is run or skipped. */

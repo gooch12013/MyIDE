@@ -39,6 +39,7 @@
     "todos": [false, "Gemini CLI's ACP mode sends no plan updates (source, v0.63.0), so there is no cue list; the last tool shows instead."],
     "resume": [true, "gemini --resume with the ACP session id (docs). Not run yet: needs checking."],
     "images": [true, "ACP image blocks (promptCapabilities.image in the source). Not run yet: needs checking."],
-    "computerUse": [false, "Gemini CLI has no computer use tool."]
+    "computerUse": [false, "Gemini CLI has no computer use tool."],
+    "apiKeyInShell": [false, "Gemini CLI hands its whole env to shell commands unless environment variable redaction is on (off by default). MyIDE turns it on in its system settings for every turn and in a new account's settings (for Talk), so GEMINI_API_KEY is dropped. From the source, not run yet: needs checking."]
   }
 }

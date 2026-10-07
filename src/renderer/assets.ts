@@ -1,5 +1,5 @@
 import type { AssetRequest, Catalog, ModelInfo } from '../main/assets';
-import { errText, h, key } from './dom';
+import { ask, errText, h, key } from './dom';
 import { led } from './employees';
 import { activeProject } from './projects';
 import { registerPanel } from './registry';
@@ -33,7 +33,6 @@ registerPanel('assets', {
     el.classList.add('studio');
     const projectId = typeof params.projectId === 'string' ? params.projectId : activeProject()?.id ?? '';
     let cat: Catalog | null = null;
-    let line = 40;
     let requests: Listed[] = [];
     let current: string | null = null; // request shown in Results
     let pick: { request: string; version: number } | null = null; // version to iterate from or save
@@ -105,7 +104,7 @@ registerPanel('assets', {
     const parentNote = h('p', { className: 'pref-hint' });
     const lineInput = h('input', { type: 'number', min: '0', step: '1', className: 'input num' });
     lineInput.setAttribute('aria-label', 'Approval line in credits');
-    lineInput.onchange = () => void api.assets.setLine(Number(lineInput.value)).then(() => { line = Number(lineInput.value); }, (e) => say(errText(e), true));
+    lineInput.onchange = () => void api.assets.setLine(Number(lineInput.value)).catch((e) => say(errText(e), true));
     const balance = h('span', { className: 'as-balance' });
     const genKey = h('button', { type: 'button', className: 'key key--go', textContent: 'Generate', onclick: () => void generate() });
     const status = h('p', { className: 'as-status' });
@@ -282,7 +281,12 @@ registerPanel('assets', {
     async function save(): Promise<void> {
       if (!pick) return;
       saveKey.disabled = true;
-      try { outStatus.textContent = `Wrote ${(await api.assets.save(projectId, pick.request, pick.version)).join(', ')}.`; }
+      try {
+        const t = await api.assets.targets(projectId, pick.request, pick.version);
+        const replace = t.targets.filter((x) => x.exists).map((x) => x.rel);
+        if (replace.length && !(await ask(`Replace ${replace.length} existing file${replace.length === 1 ? '' : 's'}?`, replace.join('\n'), 'Replace', true))) return;
+        outStatus.textContent = `Wrote ${(await api.assets.save(projectId, pick.request, pick.version, replace.length > 0)).join(', ')}.`;
+      }
       catch (e) { outStatus.textContent = errText(e); }
       finally { saveKey.disabled = false; }
     }
@@ -291,7 +295,7 @@ registerPanel('assets', {
       api.assets.onChange((id) => { if (id === projectId) { void load(); void api.assets.catalog().then((c) => { cat = c.catalog; drawBalance(); }); } }),
       api.employees.onChange((e) => { if (e.projectId === projectId && e.role === 'designer' && e.state !== 'working') say(`Designer: ${e.state}${e.error ? `, ${e.error}` : ''}.`, e.state === 'failed'); }),
     ];
-    void api.assets.catalog().then((c) => { cat = c.catalog; line = c.approveAbove; lineInput.value = String(line); drawModels(); });
+    void api.assets.catalog().then((c) => { cat = c.catalog; lineInput.value = String(c.approveAbove); drawModels(); });
     void checkRole();
     void load();
     return { onShow: () => void load(), dispose: () => offs.forEach((off) => off()) };

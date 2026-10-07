@@ -64,7 +64,7 @@ export function registerOpenerIpc(): void {
 // "Open at line" in an IDE, through its URL scheme; offered only when the IDE is installed.
 const IDES: Record<string, { bundle: string; app: string; url: (file: string, line: number) => string }> = {
   WebStorm: { bundle: APPS.WebStorm, app: 'WebStorm', url: (f, l) => `webstorm://open?file=${encodeURIComponent(f)}&line=${l}` },
-  'VS Code': { bundle: 'com.microsoft.VSCode', app: 'Visual Studio Code', url: (f, l) => `vscode://file${encodeURI(f)}:${l}` },
+  'VS Code': { bundle: 'com.microsoft.VSCode', app: 'Visual Studio Code', url: (f, l) => `vscode://file${f.split('/').map(encodeURIComponent).join('/')}:${l}` },
 };
 const ideFound = (i: (typeof IDES)[string]): Promise<boolean> =>
   [`/Applications/${i.app}.app`, join(homedir(), 'Applications', `${i.app}.app`)].some(existsSync)

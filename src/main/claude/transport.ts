@@ -16,6 +16,7 @@ export interface TurnOpts {
   env?: Record<string, string>; // the account's env (CLAUDE_CONFIG_DIR for extra accounts; empty for the default)
   permissionMode?: 'plan' | 'default'; // This Mac: plan (read-only) until David's GO
   addDirs?: string[]; // This Mac: folders the role reads outside its cwd
+  settingSources?: string; // This Mac: 'project,local', so David's user settings (allow rules, default mode) never apply
 }
 export interface Turn { done: Promise<Result>; interrupt(): void }
 
@@ -30,7 +31,7 @@ export function runTurn(o: TurnOpts): Turn {
     '--output-format', 'stream-json', '--verbose',
     ...(o.sessionId ? ['--resume', o.sessionId] : []),
     '--model', o.model, ...(o.effort ? ['--effort', o.effort] : []), ...(o.maxTurns ? ['--max-turns', String(o.maxTurns)] : []),
-    ...(o.permissionMode ? ['--permission-mode', o.permissionMode] : []), ...(o.addDirs?.length ? ['--add-dir', ...o.addDirs] : []), // --add-dir is variadic: a flag must follow
+    ...(o.permissionMode ? ['--permission-mode', o.permissionMode] : []), ...(o.settingSources ? ['--setting-sources', o.settingSources] : []), ...(o.addDirs?.length ? ['--add-dir', ...o.addDirs] : []), // --add-dir is variadic: a flag must follow
     '--settings', o.settingsPath, '--mcp-config', o.mcpConfigPath,
     '--permission-prompt-tool', 'mcp__myide__approve',
     ...(o.appendSystemPrompt ? ['--append-system-prompt', o.appendSystemPrompt] : []),

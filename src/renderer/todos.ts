@@ -2,7 +2,7 @@
 // a project employee or a schedule.
 import type { Todo } from '../main/todos';
 import { scheduleForm } from './buttons';
-import { errText, h, key } from './dom';
+import { ask, errText, h, key } from './dom';
 import { cue, led, openEmployee, type Employee } from './employees';
 import { openHire } from './hire';
 import { openNewIssue } from './issues';
@@ -113,25 +113,31 @@ registerPanel('todos', {
               draw();
             }),
             key('Roll back', async () => {
-              if (!confirm(`Put ${p} back as it was before this to-do? Its current state is kept in the journal.`)) return;
+              if (!(await ask('Roll back', `Put ${p} back as it was before this to-do? Its current state is kept in the journal.`, 'Roll back', true))) return;
               try { await api.todos.rollback(t.id, p); diffs.delete(k); say(`Rolled back ${p}.`); await loadLog(t.id); } catch (x) { say(errText(x)); }
-            })));
+            }),
+            ...(t.undo?.some((u) => u.path === p) ? [key('Undo rollback', async () => {
+              try { await api.todos.undoRollback(t.id, p); diffs.delete(k); say(`Put ${p} back as it was before the rollback.`); await loadLog(t.id); } catch (x) { say(errText(x)); }
+            })] : [])));
         if (diffs.has(k)) row.append(diffView(diffs.get(k)!));
         box.append(row);
       }
 
       const project = activeProject();
+      const macTodo = !!t.role && (MAC_ROLES.includes(t.role) || e?.projectId === 'mac');
       box.append(h('div', { className: 'need-keys td-promote' }, h('span', { className: 'legend', textContent: 'Promote' }),
         key('Make it an issue', () => void openNewIssue(project?.id, t.text)),
         key('Give to a project employee', () => void openHire({ task: t.text, onHired: (x) => void api.todos.update(t.id, { employeeId: x.id, role: x.role }) }),
           { disabled: !project, title: project ? `Hire into ${project.name}` : 'Open a project first' }),
         key('Make it recurring', async () => {
+          // A schedule would run This Mac work unattended, and This Mac only acts on a plan David approved with GO.
+          if (macTodo) return say('A This Mac to-do cannot be recurring: its runs need your GO on each plan. Make it recurring without the role, or give it to a project employee.');
           try {
             const b = await api.buttons.save({ label: t.text.slice(0, 40), command: t.text, target: t.role ? { role: t.role } : 'lead', scope: 'global' });
             scheduleForm({ buttonId: b.id }, (await api.buttons.list(project?.id)).buttons, () => say('Scheduled. Edit the button in the Buttons panel to change who runs it.'));
           } catch (x) { say(errText(x)); }
-        }, { title: 'A button with this to-do as its command, then a schedule for it' }),
-        key('Delete', () => { if (confirm(`Delete "${t.text}"?`)) void api.todos.remove(t.id); })));
+        }, { title: macTodo ? 'Not for This Mac to-dos: each run needs your GO' : 'A button with this to-do as its command, then a schedule for it' }),
+        key('Delete', async () => { if (await ask('Delete to-do', `Delete "${t.text}"?`, 'Delete', true)) void api.todos.remove(t.id); })));
       return box;
     }
 

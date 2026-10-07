@@ -1,10 +1,11 @@
-import { ipcMain, webContents } from 'electron';
+import { ipcMain } from 'electron';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { componentPath, onComponentsChange } from './components';
+import { componentPath } from './components';
 import { readConfig, writeConfig } from './projects';
+import { broadcast } from './store';
 
 // Read-back through macOS `say` (feature 14), off by default, one utterance at a time; dictation
 // through an installed whisper-cli. Every child runs through execFile/spawn with an argument list,
@@ -42,9 +43,8 @@ export function speakable(text: string): string {
 }
 
 let current: ChildProcess | null = null;
-const listeners = new Set<(speaking: boolean) => void>();
-const emit = (on: boolean) => { for (const cb of listeners) cb(on); };
-export const onSpeaking = (cb: (speaking: boolean) => void) => listeners.add(cb);
+let emit = (_speaking: boolean): void => {};
+export const onSpeaking = (cb: (speaking: boolean) => void): void => { emit = cb; };
 export const speaking = () => !!current;
 
 /** Stops any utterance, then says `text`. Resolves when it ends or is stopped. `out` writes an AIFF instead of playing (tests). */
@@ -90,13 +90,8 @@ export async function transcribe(wav: Uint8Array): Promise<string> {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-const broadcast = (channel: string, ...args: unknown[]) => {
-  for (const wc of webContents.getAllWebContents()) if (!wc.isDestroyed()) wc.send(channel, ...args);
-};
-
 export function registerSpeechIpc(): void {
   onSpeaking((on) => broadcast('speech:speaking', on));
-  onComponentsChange(() => broadcast('speech:change', status()));
   ipcMain.handle('speech:get', () => status());
   ipcMain.handle('speech:voices', () => voices());
   ipcMain.handle('speech:set', (_e, patch: Partial<SpeechSettings>) => {

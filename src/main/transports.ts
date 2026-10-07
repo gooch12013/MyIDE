@@ -64,7 +64,7 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const envPrefix = (name: string, value?: string) => (value ? `env ${name}=${shq(value)}` : `env -u ${name}`);
 
 /** The command a Talk terminal runs to open the employee's session in its CLI, on its account. */
-export function talkCommandFor(emp: Emp, base: { sessionId: string; model: string; effort?: string; settingsPath: string; promptFile: string }): string {
+export function talkCommandFor(emp: Emp, base: { sessionId: string; model: string; effort?: string; settingsPath: string; promptFile: string; mac?: boolean }): string {
   const a = accountFor(emp);
   if (a.provider === 'codex') {
     // Only listed values reach the command line: a Claude model name means nothing to Codex, and the effort goes into a TOML string.
@@ -83,6 +83,8 @@ export function talkCommandFor(emp: Emp, base: { sessionId: string; model: strin
   if (a.provider !== 'claude') throw new Error(`Talk is not available for ${a.provider} yet.`);
   return ['exec', envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR), 'claude --resume', shq(base.sessionId), '--settings', shq(base.settingsPath),
     '--model', shq(base.model), ...(base.effort ? ['--effort', shq(base.effort)] : []),
+    // This Mac: Talk starts in plan mode too, and without David's user settings (their allow rules would run unplanned commands).
+    ...(base.mac ? ['--permission-mode plan --setting-sources project,local'] : []),
     '--append-system-prompt-file', shq(base.promptFile), '--disallowedTools Task ScheduleWakeup CronCreate RemoteTrigger'].join(' ');
 }
 

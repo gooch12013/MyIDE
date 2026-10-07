@@ -4,14 +4,12 @@
 // ponytail: a fresh adapter process per turn (start-up plus a session/load replay each time). Keep one
 // alive per employee if that latency shows.
 import { utilityProcess, type UtilityProcess } from 'electron';
-import { execFile } from 'node:child_process';
-import { accessSync, constants, readFileSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
-import { promisify } from 'node:util';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { readImage } from '../attach';
 import type { ClaudeEvent } from '../claude/parse';
 import type { Turn, TurnOpts } from '../claude/transport';
-import { spawnEnv } from '../pty';
+import { cliVersion, findOnPath, spawnEnv } from '../pty';
 import { MCP_TOOL_TIMEOUT_MS, ownTool } from '../mcp';
 import { hardDenied, makeAcpMapper, parseCodexStatus, permissionCommand, pickOption, rpcClient } from './client';
 
@@ -28,20 +26,14 @@ let approver: ((p: AcpPermission) => Promise<{ allow: boolean; message?: string 
 export function onAcpPermission(fn: (p: AcpPermission) => Promise<{ allow: boolean; message?: string }>): void { approver = fn; }
 
 /** The user's own codex on the login PATH; never the copy the adapter package carries. */
-export function findCodex(path = ''): string | null {
-  for (const dir of path.split(delimiter)) {
-    try { accessSync(join(dir, 'codex'), constants.X_OK); return join(dir, 'codex'); } catch { /* next */ }
-  }
-  return null;
-}
+export const findCodex = (path = ''): string | null => findOnPath('codex', path)[0] ?? null;
 
 let info: Promise<{ path: string | null; version: string | null; tested: boolean; testedVersion: string }> | undefined;
 export function codexInfo(): NonNullable<typeof info> {
   return (info ??= (async () => {
     const env = await spawnEnv();
     const path = findCodex(env.PATH);
-    let version: string | null = null;
-    try { if (path) version = /\d+\.\d+\.\d+/.exec((await promisify(execFile)(path, ['--version'], { env, timeout: 15_000 })).stdout)?.[0] ?? null; } catch { /* broken install */ }
+    const version = await cliVersion(path, env);
     return { path, version, tested: version === TESTED, testedVersion: TESTED };
   })());
 }

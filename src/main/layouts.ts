@@ -43,7 +43,7 @@ export function registerLayoutIpc(onChange: () => void): void {
   // Sent on every (debounced) layout change of the active project, so it also records `last`.
   // Quitting closes pop-out windows, which docks their groups back; that layout is not the one to keep.
   let quitting = false;
-  app.on('before-quit', () => { quitting = true; });
+  app.on('before-quit', (e) => { if (!e.defaultPrevented) quitting = true; }); // a quit held for unsaved files may be cancelled
   ipcMain.on('layouts:put-project', (_e, project: string | null, layout: unknown) => {
     if (quitting) return;
     const f = loadLayouts();

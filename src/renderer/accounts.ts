@@ -1,6 +1,6 @@
 // AI accounts: Preferences > AI accounts, the account picker on hire, and capability greying.
 import type { Account, Usage } from '../main/accounts';
-import { errText, h, key } from './dom';
+import { ask, errText, h, key } from './dom';
 import { led, meterBar } from './employees';
 import { openCommandTerminal } from './terminal';
 
@@ -43,8 +43,8 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
   const [list, p, staff, codex, gemini] = await Promise.all([api.accounts.list(), providers(), api.employees.list(), api.accounts.codexInfo(), api.accounts.geminiInfo()]);
   const act = (fn: () => Promise<unknown>) => async () => { try { await fn(); } catch (e) { say(errText(e)); } };
   // Gemini accounts are API-key only: the key goes straight to the Keychain and is never shown again.
-  const keyField = (label: string) => {
-    const k = h('input', { className: 'input', type: 'password', placeholder: label, autocomplete: 'off', spellcheck: false });
+  const keyField = (label: string, placeholder = label) => {
+    const k = h('input', { className: 'input', type: 'password', placeholder, autocomplete: 'off', spellcheck: false });
     k.setAttribute('aria-label', label);
     return k;
   };
@@ -62,8 +62,7 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
     const signin = led('idle', 'Checking…');
     void api.accounts.status(a.id).then((s) => signin.replaceWith(Object.assign(led(s.loggedIn ? 'working' : 'failed', s.loggedIn ? 'Signed in' : 'Not signed in'), { title: s.detail })));
     const where = a.env.CLAUDE_CONFIG_DIR ?? a.env.CODEX_HOME ?? a.env.GEMINI_CLI_HOME ?? (a.provider === 'codex' ? '~/.codex' : '~/.claude');
-    const newKey = keyField(`Replace API key of ${a.name}`);
-    newKey.placeholder = 'Replace API key';
+    const newKey = keyField(`Replace API key of ${a.name}`, 'Replace API key');
     newKey.onchange = act(async () => { await api.accounts.setKey(a.id, newKey.value); newKey.value = ''; say(`${a.name}: key saved in the Keychain.`); again(); });
     const td = (l: string, ...kids: Node[]) => { const c = h('td', {}, ...kids); c.dataset.l = l; return c; };
     return h('tr', {},
@@ -81,7 +80,7 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
         ...(a.id === 'claude-default' ? [] : [h('button', {
           type: 'button', className: 'btn btn--quiet rm', textContent: 'Remove', disabled: users > 0,
           title: users ? 'Fire or move its employees first' : `Forget this account. Its folder (${where}) stays on disk.`,
-          onclick: act(async () => { if (!confirm(`Remove ${a.name}? Its login stays in ${where} until you delete that folder.`)) return; await api.accounts.remove(a.id); again(); }),
+          onclick: act(async () => { if (!(await ask(`Remove ${a.name}`, `Its login stays in ${where} until you delete that folder.`, 'Remove', true))) return; await api.accounts.remove(a.id); again(); }),
         })]))));
   });
   const tbl = h('table', { className: 'ptbl acct-tbl' },

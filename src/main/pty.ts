@@ -1,8 +1,9 @@
 import { app, BrowserWindow, dialog, ipcMain, type WebContents } from 'electron';
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
+import { promisify } from 'node:util';
 import * as pty from 'node-pty';
 
 const shell = process.env.SHELL || '/bin/zsh';
@@ -28,6 +29,19 @@ const loginPath = new Promise<string>((resolve) => {
 /** Env for a `claude` or `codex` child process: no inherited CLAUDE* vars, the login-shell PATH. */
 export async function spawnEnv(): Promise<Record<string, string>> {
   return { ...baseEnv, PATH: await loginPath, LANG: baseEnv.LANG || 'en_US.UTF-8' };
+}
+
+/** Every executable file named `bin` on `path` (a PATH string), in PATH order. */
+export function findOnPath(bin: string, path = ''): string[] {
+  return path.split(':').filter(Boolean).map((d) => join(d, bin)).filter((p) => {
+    try { accessSync(p, constants.X_OK); return statSync(p).isFile(); } catch { return false; }
+  });
+}
+
+/** The x.y.z a CLI prints for --version, or null if it is missing or broken. */
+export async function cliVersion(path: string | null, env: Record<string, string>): Promise<string | null> {
+  if (!path) return null;
+  try { return /\d+\.\d+\.\d+/.exec((await promisify(execFile)(path, ['--version'], { env, timeout: 15_000 })).stdout)?.[0] ?? null; } catch { return null; }
 }
 
 // One PTY per panel id. PTYs live here, so a panel can move between windows (or the renderer reload)

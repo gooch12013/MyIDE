@@ -1,6 +1,5 @@
 // The personal to-do list (~/.myide/todos.json), its This Mac assignments, and the change journal and command log
 // fed by the This Mac employees' hooks (see macSettings in employees.ts).
-import { BrowserWindow, ipcMain } from 'electron';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -8,12 +7,13 @@ import { dirname, join } from 'node:path';
 import { hireEmployee, MAC } from './employees';
 import { diffSnap, rollback, snapshot, type Snap } from './mac';
 import { onEmployeeHook, onTodoPost } from './mcp';
-import { readJSON, STATE_DIR, writeJSON } from './store';
+import { broadcast, handle, readJSON, STATE_DIR, writeJSON } from './store';
 
 export interface Todo {
   id: string; text: string; done: boolean; due?: string; priority: 'high' | 'normal' | 'low'; tags: string[];
   role?: string; employeeId?: string; createdAt: number;
   journal: Snap[]; // files snapshotted before this to-do's employee edited them, oldest first
+  undo?: Snap[]; // each rollback's snapshot of what it overwrote, so "Undo rollback" can put that back
 }
 
 const JOURNAL = join(STATE_DIR, 'journal');
@@ -24,7 +24,7 @@ export const MAC_ROLES = ['sysadmin', 'lab-ops', 'assistant', 'desktop'];
 const list = (): Todo[] => readJSON<Todo[]>('todos.json', []);
 function save(todos: Todo[]): void {
   writeJSON('todos.json', todos);
-  for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send('todos:change');
+  broadcast('todos:change');
 }
 function change(id: string, fn: (t: Todo) => void): Todo {
   const todos = list();
@@ -107,10 +107,10 @@ function onHook(employeeId: string, b: any): void {
 }
 
 export function registerTodosIpc(): void {
-  // The quick-add script: ~/.myide/bin/todo "what" [@role].
+  // The quick-add script: ~/.myide/bin/todo "what" [@role], the issue script under another name (it branches on its name).
   try {
     mkdirSync(join(STATE_DIR, 'bin'), { recursive: true, mode: 0o700 });
-    copyFileSync(join(__dirname, 'bin', 'todo'), join(STATE_DIR, 'bin', 'todo'));
+    copyFileSync(join(__dirname, 'bin', 'issue'), join(STATE_DIR, 'bin', 'todo'));
     chmodSync(join(STATE_DIR, 'bin', 'todo'), 0o700);
   } catch (e) { console.error('Could not install the todo script', e); }
   onTodoPost(async (text) => {
@@ -119,10 +119,9 @@ export function registerTodosIpc(): void {
   });
   onEmployeeHook(onHook);
 
-  const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
-  h('todos:list', list);
-  h('todos:add', add);
-  h('todos:update', (id: string, p: Partial<Pick<Todo, 'text' | 'done' | 'due' | 'priority' | 'tags' | 'role' | 'employeeId'>>) => change(id, (t) => {
+  handle('todos:list', list);
+  handle('todos:add', add);
+  handle('todos:update', (id: string, p: Partial<Pick<Todo, 'text' | 'done' | 'due' | 'priority' | 'tags' | 'role' | 'employeeId'>>) => change(id, (t) => {
     if (typeof p.text === 'string' && p.text.trim()) t.text = p.text.trim();
     if (typeof p.done === 'boolean') t.done = p.done;
     if (p.due !== undefined) t.due = /^\d{4}-\d{2}-\d{2}$/.test(String(p.due)) ? p.due : undefined;
@@ -131,13 +130,21 @@ export function registerTodosIpc(): void {
     if (typeof p.role === 'string') t.role = p.role;
     if (typeof p.employeeId === 'string') t.employeeId = p.employeeId;
   }));
-  h('todos:remove', (id: string) => save(list().filter((t) => t.id !== id)));
-  h('todos:assign', assign);
-  h('todos:log', (id: string) => { try { return readFileSync(join(LOGS, `${id}.log`), 'utf8').slice(-100_000); } catch { return ''; } });
-  h('todos:diff', (id: string, path: string) => diffSnap(JOURNAL, firstSnap(id, path)));
-  h('todos:rollback', (id: string, path: string) => {
+  handle('todos:remove', (id: string) => save(list().filter((t) => t.id !== id)));
+  handle('todos:assign', assign);
+  handle('todos:log', (id: string) => { try { return readFileSync(join(LOGS, `${id}.log`), 'utf8').slice(-100_000); } catch { return ''; } });
+  handle('todos:diff', (id: string, path: string) => diffSnap(JOURNAL, firstSnap(id, path)));
+  handle('todos:rollback', (id: string, path: string) => {
     const now = rollback(JOURNAL, firstSnap(id, path), `to-do ${id}`);
-    log(id, `rolled back ${path}${now ? ` (the state before rollback is ${now.commit.slice(0, 8)} in the journal)` : ''}`);
+    change(id, (t) => { t.undo = [...(t.undo ?? []).filter((u) => u.path !== path), now]; });
+    log(id, `rolled back ${path} (the state before rollback is ${now.commit.slice(0, 8)} in the journal)`);
   });
-  h('todos:install-roles', installRoles);
+  handle('todos:undo-rollback', (id: string, path: string) => {
+    const u = list().find((x) => x.id === id)?.undo?.find((x) => x.path === path);
+    if (!u) throw new Error('No rollback of that file to undo');
+    rollback(JOURNAL, u, `to-do ${id}, undo rollback`);
+    change(id, (t) => { t.undo = t.undo?.filter((x) => x.path !== path); });
+    log(id, `undid the rollback of ${path} (back to ${u.commit.slice(0, 8)})`);
+  });
+  handle('todos:install-roles', installRoles);
 }

@@ -2,7 +2,7 @@
 // Usage: TZ=America/New_York node scripts/check-schedules.mjs (re-runs itself in that zone if TZ is unset)
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { describe, due, GRACE_MS, nextRun, prevRun, WEEKDAYS } from '../src/main/schedules.ts';
+import { describe, due, fingerprint, GRACE_MS, nextRun, prevRun, WEEKDAYS } from '../src/main/schedules.ts';
 
 if (process.env.TZ !== 'America/New_York') {
   const r = spawnSync(process.execPath, process.argv.slice(1), { stdio: 'inherit', env: { ...process.env, TZ: 'America/New_York' } });
@@ -58,4 +58,12 @@ assert.equal(due(s({ handled: at(2026, 10, 9, 7).getTime() }), at(2026, 10, 11, 
 assert.equal(describe(wk), 'Weekdays 07:00');
 assert.equal(describe(daily('09:30')), 'Daily 09:30');
 assert.equal(describe({ days: [0, 4, 1], time: '18:00' }), 'Mon, Thu, Sun 18:00');
+// A changed button pauses its schedule (buttons.ts fire): the fingerprint covers the command and target, not the label.
+const btn = { id: 'b', label: 'Morning', command: '/standup', target: 'lead', scope: 'global' };
+const saved = fingerprint(btn);
+assert.equal(fingerprint({ ...btn, label: 'Renamed' }), saved);
+assert.notEqual(fingerprint({ ...btn, command: '/standup --push' }), saved);
+assert.notEqual(fingerprint({ ...btn, target: { role: 'sysadmin' } }), saved);
+assert.notEqual(fingerprint({ ...btn, target: { role: 'a' } }), fingerprint({ ...btn, target: { role: 'b' } }));
+assert.notEqual(saved, undefined, 'a schedule saved before fingerprints (none stored) counts as changed');
 console.log('check-schedules: ok');

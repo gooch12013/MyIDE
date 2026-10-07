@@ -1,15 +1,23 @@
 #!/bin/sh
-# issue PROJECT "title": files an issue on PROJECT's forge through the running MyIDE
-# (same attribution strip and outbox as the New issue form). Installed by MyIDE into ~/.myide/bin.
+# One script under two names, installed by MyIDE into ~/.myide/bin; the token goes in the request body, never in argv.
+#   issue PROJECT "title": files an issue on PROJECT's forge through the running MyIDE (same attribution strip and
+#     outbox as the New issue form).
+#   todo "what to do" [@role] [#tag]: adds to MyIDE's to-do list; @sysadmin (lab-ops, assistant, desktop) also assigns
+#     it to that This Mac employee, which plans it read-only and waits for GO.
 set -u
-[ $# -eq 2 ] && [ -n "$2" ] || { echo 'usage: issue PROJECT "title"' >&2; exit 2; }
+case "$(basename "$0")" in
+  todo) [ $# -ge 1 ] && [ -n "$1" ] || { echo 'usage: todo "what to do" [@role] [#tag]' >&2; exit 2; }
+        route=todo; js='{text:a.slice(1).join(" "),token:ep.token}'; wait=120 ;;
+  *)    [ $# -eq 2 ] && [ -n "$2" ] || { echo 'usage: issue PROJECT "title"' >&2; exit 2; }
+        route=issue; js='{project:a[1],title:a[2],token:ep.token}'; wait=60 ;;
+esac
 ep="${MYIDE_HOME:-$HOME/.myide}/issue-endpoint.json"
 [ -r "$ep" ] || { echo 'MyIDE is not running.' >&2; exit 1; }
-url=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$ep")
-# The token is read from the file inside osascript and goes in the request body, so it never shows in argv.
-json=$(osascript -l JavaScript -e 'function run(a){var ep=JSON.parse(ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(a[0],4,null)));
-  return JSON.stringify({project:a[1],title:a[2],token:ep.token})}' "$ep" "$1" "$2") || exit 1
-if out=$(printf '%s' "$json" | curl -sS --fail-with-body --max-time 60 -H 'Content-Type: application/json' --data-binary @- "$url" 2>/dev/null); then
+url=$(sed -n 's/.*"url": *"\([^"]*\)\/issue".*/\1/p' "$ep")/$route
+# The token is read from the file inside osascript.
+json=$(osascript -l JavaScript -e "function run(a){var ep=JSON.parse(ObjC.unwrap(\$.NSString.stringWithContentsOfFileEncodingError(a[0],4,null)));
+  return JSON.stringify($js)}" "$ep" "$@") || exit 1
+if out=$(printf '%s' "$json" | curl -sS --fail-with-body --max-time "$wait" -H 'Content-Type: application/json' --data-binary @- "$url" 2>/dev/null); then
   echo "$out"
 else
   echo "${out:-MyIDE is not running.}" >&2

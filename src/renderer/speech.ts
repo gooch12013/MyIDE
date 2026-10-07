@@ -21,8 +21,10 @@ function sync(): void {
     }
   }
 }
-void api.speech.get().then((s) => { status = s; sync(); });
+const refetch = () => void api.speech.get().then((s) => { status = s; sync(); });
+refetch();
 api.speech.onChange((s) => { status = s; sync(); });
+api.components.onChange(refetch); // dictation needs Local Whisper and a model
 
 const ICON = {
   speaker: '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>',
@@ -88,8 +90,15 @@ export function micButton(input: HTMLInputElement | HTMLTextAreaElement, onError
     try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); } catch { onError('MyIDE has no access to the microphone. Allow it in System Settings > Privacy & Security > Microphone.'); return; }
     const chunks: Blob[] = [];
     rec = new MediaRecorder(stream);
+    // Never left recording: it stops (and transcribes) after 5 minutes or when its window is hidden.
+    const doc = b.ownerDocument;
+    const hidden = () => { if (doc.hidden) rec?.stop(); };
+    const cap = setTimeout(() => rec?.stop(), 5 * 60_000);
+    doc.addEventListener('visibilitychange', hidden);
     rec.ondataavailable = (e) => chunks.push(e.data);
     rec.onstop = async () => {
+      clearTimeout(cap);
+      doc.removeEventListener('visibilitychange', hidden);
       stream.getTracks().forEach((t) => t.stop());
       rec = null;
       b.classList.remove('key--lit');

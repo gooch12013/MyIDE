@@ -1,4 +1,4 @@
-import { BrowserWindow, ipcMain, shell } from 'electron';
+import { BrowserWindow, shell } from 'electron';
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
@@ -10,7 +10,7 @@ import { getToken, removeToken, setToken } from './keychain';
 import { onIssuePost } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
 import { spawnEnv } from './pty';
-import { readJSON, STATE_DIR, writeJSON } from './store';
+import { handle, readJSON, STATE_DIR, writeJSON } from './store';
 
 // Forge issues: GitHub and Forgejo over REST with fetch. One cache file per project
 // (~/.myide/projects/<id>/issues.json) holds the last list, the URL that worked, linked PRs,
@@ -339,7 +339,10 @@ function drain(id: string): Promise<void> {
           return;
         }
         if (!(e instanceof Rejected && (e.status === 404 || e.status === 422))) {
-          update(id, (c) => { c.blocked = `${what}: ${err.message}`; });
+          // Anything but a refusal or MyIDE's own pacing may have come after the forge took the write (a 2xx that is not
+          // JSON, say): the replay looks for it first.
+          const maybe = !(e instanceof Rejected) && !(e instanceof Paced);
+          update(id, (c) => { c.blocked = `${what}: ${err.message}`; if (maybe) c.outbox.forEach((o) => { if (o.id === sent) o.uncertain = true; }); });
           changed(id);
           return;
         }
@@ -539,7 +542,7 @@ function snapshot(projectId?: string) {
     return {
       projectId: p.id, provider: p.forge!.provider, repo: p.forge!.repo, urls: p.forge!.urls, host,
       fetchedAt: c.fetchedAt, offline: !!c.offline, error: c.error, lastError: c.lastError, blocked: c.blocked, me: c.me,
-      issues: c.issues, prs: c.prs, outbox: c.outbox.length, drafts: c.drafts,
+      issues: c.issues, prs: c.prs, outbox: c.outbox.length, drafts: c.drafts, blockedOp: c.blocked ? c.outbox[0]?.id : undefined,
     };
   });
 }
@@ -557,33 +560,33 @@ export function registerForgeIpc(): void {
   setTimeout(() => void pollAll(), 3000);
   setInterval(() => void pollAll(), POLL_MS);
 
-  const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
-  h('forge:issues', (projectId?: string) => snapshot(projectId));
-  h('forge:refresh', async (projectId?: string, force?: boolean) => {
+  handle('forge:issues', (projectId?: string) => snapshot(projectId));
+  handle('forge:refresh', async (projectId?: string, force?: boolean) => {
     if (projectId) await fetchIssues(projectId, !!force); else await pollAll(!!force);
   });
-  h('forge:set-link', (projectId: string, link: unknown) => setLink(projectId, link));
-  h('forge:tokens', async () => ({ rows: await tokenRows(), gh: !!(await ghToken()) }));
-  h('forge:set-token', async (provider: Provider, host: string, token: string) => {
+  handle('forge:set-link', (projectId: string, link: unknown) => setLink(projectId, link));
+  handle('forge:tokens', async () => ({ rows: await tokenRows(), gh: !!(await ghToken()) }));
+  handle('forge:set-token', async (provider: Provider, host: string, token: string) => {
     await setToken(service(provider), host, String(token ?? '').trim());
     for (const p of projects()) if (p.forge?.provider === provider) update(p.id, (c) => { c.me = undefined; });
   });
-  h('forge:remove-token', (provider: Provider, host: string) => removeToken(service(provider), host));
-  h('forge:import-gh', async () => {
+  handle('forge:remove-token', (provider: Provider, host: string) => removeToken(service(provider), host));
+  handle('forge:import-gh', async () => {
     const t = await ghToken();
     if (!t) throw new Error('gh has no token for github.com.');
     await setToken('myide-github', 'github.com', t);
   });
-  h('forge:test', testConnection);
-  h('forge:create', createIssue);
-  h('forge:assign', assign);
-  h('forge:file-draft', fileDraft);
-  h('forge:drop-op', (projectId: string) => { // the blocked op at the front of the outbox, dropped by David
-    update(projectId, (c) => { c.outbox.shift(); c.blocked = undefined; });
+  handle('forge:test', testConnection);
+  handle('forge:create', createIssue);
+  handle('forge:assign', assign);
+  handle('forge:file-draft', fileDraft);
+  handle('forge:drop-op', (projectId: string, opId: string) => { // the blocked op David saw, by id: never whatever is at the front now
+    if (!cache(projectId).outbox.some((o) => o.id === opId)) throw new Error('That write already went out or was dropped.');
+    update(projectId, (c) => { c.outbox = c.outbox.filter((o) => o.id !== opId); c.blocked = undefined; });
     changed(projectId);
     void drain(projectId);
   });
-  h('forge:discard-draft', (projectId: string, id: string) => {
+  handle('forge:discard-draft', (projectId: string, id: string) => {
     update(projectId, (c) => { c.drafts = c.drafts.filter((x) => x.id !== id); });
     changed(projectId);
   });

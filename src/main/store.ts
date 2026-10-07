@@ -1,4 +1,4 @@
-import { app, dialog } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -59,3 +59,14 @@ export function lockDown(dir = STATE_DIR): void {
     } catch { /* vanished or not ours */ }
   }
 }
+
+/** Sends `channel` to every window, pop-outs included. */
+export function broadcast(channel: string, ...args: unknown[]): void {
+  for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
+}
+
+/** ipcMain.handle without the event argument. */
+export const handle = (channel: string, fn: (...a: any[]) => unknown): void => ipcMain.handle(channel, (_e, ...a) => fn(...a));
+
+/** `My Role!` -> `my-role`, or `fallback` when nothing is left. */
+export const slug = (s: string, fallback: string): string => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || fallback;

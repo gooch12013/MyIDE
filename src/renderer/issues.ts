@@ -1,6 +1,6 @@
 import type { ForgeSnapshot } from '../main/forge';
 import { attachBox } from './attach';
-import { errText, h, key } from './dom';
+import { ask, errText, h, key, sheet } from './dom';
 import { led, openEmployee, type Employee } from './employees';
 import { activeProject, allProjects } from './projects';
 import { registerPanel } from './registry';
@@ -26,15 +26,6 @@ const sheetText = (form: HTMLElement) => {
   return (s: string) => { t.textContent = s; };
 };
 
-/** A modal sheet; resolves when closed. */
-function sheet(label: string, form: HTMLFormElement): HTMLDialogElement {
-  const d = h('dialog', { className: 'sheet iss-sheet' }, form);
-  d.setAttribute('aria-label', label);
-  d.onclose = () => d.remove();
-  document.body.append(d);
-  d.showModal();
-  return d;
-}
 
 /** "Give to": an existing employee of the project, or a role to hire. Values are "e:<id>" or "r:<role>". */
 async function assignee(projectId: string, withNone: boolean): Promise<HTMLSelectElement> {
@@ -64,7 +55,7 @@ async function openAssign(s: ForgeSnapshot, i: Issue): Promise<void> {
   form.append(h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), go));
   go.disabled = !who.options.length;
   if (!who.options.length) say('No employees and no roles in this project yet.');
-  const d = sheet(`Assign issue ${i.number}`, form);
+  const d = sheet(`Assign issue ${i.number}`, form, 'iss-sheet');
   form.onsubmit = async (ev) => {
     if (ev.submitter !== go) return;
     ev.preventDefault();
@@ -121,7 +112,7 @@ export async function openNewIssue(projectId?: string, prefill = ''): Promise<vo
   );
   const say = sheetText(form);
   form.append(h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), file));
-  const d = sheet('New issue', form);
+  const d = sheet('New issue', form, 'iss-sheet');
   title.focus();
   form.onsubmit = async (ev) => {
     if (ev.submitter !== file) return;
@@ -245,7 +236,7 @@ registerPanel('issues', {
           h('span', { className: 'forge-note', textContent: note }),
           ...(s.outbox ? [h('span', { className: 'forge-note', textContent: `${s.outbox} write-back${s.outbox === 1 ? '' : 's'} waiting to send` })] : []),
           ...(s.blocked ? [h('span', { className: 'forge-note forge-err', textContent: `Sending paused: ${s.blocked}` }),
-            key('Drop it', () => void api.forge.dropOp(s.projectId), { title: 'Drop the write at the front of the queue and send the rest' })] : []),
+            key('Drop it', () => void api.forge.dropOp(s.projectId, s.blockedOp!).catch(() => {}), { title: 'Drop the write at the front of the queue and send the rest' })] : []),
           ...(s.lastError ? [h('span', { className: 'forge-note forge-err', textContent: `Not sent: ${s.lastError}` })] : []),
           retry(s));
         const row = h('div', { className: 'forge' }, h('dt', { textContent: `${p?.name ?? '?'} · ${FORGE[s.provider]}` }), dd);
@@ -334,7 +325,7 @@ export function forgesSection(say: (t: string) => void): Node[] {
           return `Saved. ${await api.forge.test(r.provider, r.host).catch((e) => errText(e))}`;
         }),
         ...(r.has ? [act('Test connection', () => api.forge.test(r.provider, r.host)),
-          act('Remove', async () => { if (!confirm(`Remove the ${FORGE[r.provider]} token for ${r.host} from the Keychain?`)) return; await api.forge.removeToken(r.provider, r.host); void draw(); return 'Removed.'; })] : []),
+          act('Remove', async () => { if (!(await ask('Remove token', `Remove the ${FORGE[r.provider]} token for ${r.host} from the Keychain?`, 'Remove', true))) return; await api.forge.removeToken(r.provider, r.host); void draw(); return 'Removed.'; })] : []),
         ...(r.provider === 'github' && gh ? [act('Import from gh', async () => { await api.forge.importGh(); void draw(); return `Imported. ${await api.forge.test('github', 'github.com').catch((e) => errText(e))}`; })] : []),
       ];
       const hint = r.provider === 'github' ? 'Issues read anonymously; writing back needs a token with repo access.' : `Used by ${r.projects.join(', ')}.`;

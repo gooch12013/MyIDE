@@ -27,7 +27,9 @@ let onNew: (a: Approval) => void = () => {};
 let onGone: (id: string) => void = () => {};
 // Late allows: the next `approve` for the same employee, tool and input is allowed at once, then forgotten.
 // `cmd`: a GO on a This Mac plan; matches a Bash call by its command alone (the description the model adds varies).
-const grants: { employeeId: string; tool: string; input: unknown; cmd?: boolean }[] = [];
+// A late allow lapses after GRANT_TTL_MS: the retry it is for comes in the follow-up turn, not half a day later.
+const grants: { employeeId: string; tool: string; input: unknown; cmd?: boolean; at: number }[] = [];
+const GRANT_TTL_MS = 30 * 60_000;
 const control = new Map<string, Tool>();
 // Org tools (assign_task, forge, ...): `show` decides per employee whether tools/list offers it.
 const extra = new Map<string, { description: string; inputSchema: object; run(employeeId: string, args: any): Promise<unknown>; show(employeeId: string): boolean }>();
@@ -44,17 +46,17 @@ export function resolveApproval(id: string, allow: boolean, message?: string): v
   const p = pending.get(id);
   if (!p) return;
   pending.delete(id);
-  if (p.a.timedOut && allow && p.a.kind !== 'question') grants.push({ employeeId: p.a.employeeId, tool: p.a.tool, input: p.a.input });
+  if (p.a.timedOut && allow && p.a.kind !== 'question') grants.push({ employeeId: p.a.employeeId, tool: p.a.tool, input: p.a.input, at: Date.now() });
   p.answer(allow, message);
 }
 
 /** A GO on a plan: each command is allowed once, exactly as written; anything else still reaches David. */
 export function grantCommands(employeeId: string, commands: string[]): void {
-  for (const command of commands) grants.push({ employeeId, tool: 'Bash', input: { command }, cmd: true });
+  for (const command of commands) grants.push({ employeeId, tool: 'Bash', input: { command }, cmd: true, at: Date.now() });
 }
-/** Drops a GO's unused commands once its turn ends. */
-export function clearGrants(employeeId: string): void {
-  for (let i = grants.length - 1; i >= 0; i--) if (grants[i].employeeId === employeeId && grants[i].cmd) grants.splice(i, 1);
+/** Drops a GO's unused commands once its turn ends; `all` (a fired employee) drops its late allows too. */
+export function clearGrants(employeeId: string, all = false): void {
+  for (let i = grants.length - 1; i >= 0; i--) if (grants[i].employeeId === employeeId && (all || grants[i].cmd)) grants.splice(i, 1);
 }
 
 // Claude Code hooks in an employee's settings POST their JSON to /hook/<employeeId>?token=… (This Mac's change journal).
@@ -68,6 +70,10 @@ export function hookUrl(employeeId: string): string {
 // POST /todo from ~/.myide/bin/todo, same token as /issue; answers the text the script prints.
 let onTodo: (text: string) => Promise<string> = async () => { throw new Error('to-dos not available'); };
 export function onTodoPost(fn: (text: string) => Promise<string>): void { onTodo = fn; }
+
+// Answers a permission prompt before grants or David: 'allow', a deny message, or undefined to carry on (the asset studio's spend gate).
+let gate: (employeeId: string, tool: string, input: any) => string | undefined = () => undefined;
+export function setApproveGate(fn: typeof gate): void { gate = fn; }
 
 export function registerEmployeeTool(name: string, description: string, schema: object,
   run: (employeeId: string, args: any) => Promise<unknown>, show: (employeeId: string) => boolean = () => true): void {
@@ -124,6 +130,15 @@ function hold(res: ServerResponse, a: Omit<Approval, 'id' | 'createdAt'>, reply:
   });
 }
 
+// An asset request id (asset_cost, asset_result) belongs to the first employee that reports on it: the one the request went to.
+// ponytail: in memory, so after a restart the first caller binds it again.
+const requestOwners = new Map<string, string>();
+function ownRequest(employeeId: string, requestId: unknown): void {
+  if (typeof requestId !== 'string') return;
+  if (!requestOwners.has(requestId)) requestOwners.set(requestId, employeeId);
+  if (requestOwners.get(requestId) !== employeeId) throw new Error('That asset request belongs to another employee.');
+}
+
 function employeeTools(employeeId: string, res: ServerResponse): Map<string, Tool> {
   const tools = new Map<string, Tool>([
     ['approve', {
@@ -133,7 +148,9 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
         const tool = String(args?.tool_name ?? '');
         const input = args?.input ?? {};
         const plan = tool === 'ExitPlanMode';
-        const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool
+        const verdict = gate(employeeId, tool, input);
+        if (verdict) return text(JSON.stringify(verdict === 'allow' ? { behavior: 'allow', updatedInput: input } : { behavior: 'deny', message: verdict }));
+        const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool && (x.cmd || Date.now() - x.at < GRANT_TTL_MS)
           && (x.cmd ? (x.input as { command: string }).command === input.command : isDeepStrictEqual(x.input, input)));
         // MyIDE's own tools enforce their own caps and approvals; asking David about each assign_task is noise.
         // Exact names only: approve itself, or anything else under mcp__myide__, still asks.
@@ -156,7 +173,7 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
     }],
   ]);
   for (const [name, t] of extra) {
-    if (t.show(employeeId)) tools.set(name, { description: t.description, inputSchema: t.inputSchema, run: (args) => t.run(employeeId, args) });
+    if (t.show(employeeId)) tools.set(name, { description: t.description, inputSchema: t.inputSchema, run: (args) => { ownRequest(employeeId, args?.requestId); return t.run(employeeId, args); } });
   }
   return tools;
 }
@@ -200,10 +217,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   const tok = url.searchParams.get('token');
   if (!key || !sameToken(tok, key === 'control' ? controlToken : tokens.get(key))) return reply(res, 401);
   if (req.method !== 'POST') return reply(res, 405); // no server-initiated SSE stream
-  let body = '';
-  req.on('error', () => {}); // a client hanging up mid-body
-  req.on('data', (c) => { body += c; if (body.length > 4e6) req.destroy(); });
-  req.on('end', async () => {
+  readBody(req, 4e6, async (body) => {
     try {
       let m: any;
       try { m = JSON.parse(body); } catch { return reply(res, 400); }
@@ -218,13 +232,19 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   });
 }
 
+/** Calls `done` with the whole request body as text; a body over `max` bytes (or a client hanging up mid-body) drops the request. */
+function readBody(req: IncomingMessage, max: number, done: (body: string) => void): void {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  req.on('error', () => {});
+  req.on('data', (c: Buffer) => { size += c.length; if (size > max) req.destroy(); else chunks.push(c); });
+  req.on('end', () => done(Buffer.concat(chunks).toString('utf8')));
+}
+
 /** `issue <project> "title"`: JSON { project, title, token } in (the token in the body, never in argv), plain text out. */
 function postIssue(req: IncomingMessage, res: ServerResponse, todo = false): void {
   if (req.method !== 'POST') return reply(res, 405);
-  let body = '';
-  req.on('error', () => {});
-  req.on('data', (c) => { body += c; if (body.length > 1e5) req.destroy(); });
-  req.on('end', async () => {
+  readBody(req, 1e5, async (body) => {
     const send = (status: number, t: string) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' }).end(t + '\n'); };
     let m: any;
     try { m = JSON.parse(body); } catch { return send(400, 'MyIDE refused the request (restart it if this persists).'); }
@@ -247,10 +267,9 @@ function postHook(req: IncomingMessage, res: ServerResponse, id: string, tok: st
   try { key = decodeURIComponent(id); } catch { return reply(res, 400); }
   if (!sameToken(tok, tokens.get(key))) return reply(res, 401);
   if (req.method !== 'POST') return reply(res, 405);
-  let body = '';
-  req.on('error', () => {});
-  req.on('data', (c) => { body += c; if (body.length > 4e6) req.destroy(); });
-  req.on('end', async () => {
+  // A Write hook carries the whole file it writes. Over the cap curl fails and the hook blocks the edit (never unjournaled).
+  // ponytail: 32 MB in memory; send the path only (and read the file here) if bigger files need editing.
+  readBody(req, 32e6, async (body) => {
     try { await onHook(key, JSON.parse(body)); reply(res, 200); }
     catch (e) { if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' }).end(String((e as Error).message) + '\n'); }
   });

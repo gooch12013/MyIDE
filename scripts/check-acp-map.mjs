@@ -85,11 +85,16 @@ rpc.push('not json');
 for (const c of ['gh pr create --fill', '/opt/homebrew/bin/gh issue list', 'env GH_TOKEN=x gh api user', 'cd x && gh pr create', 'bash -c "gh pr create"',
   "sh -lc 'tea pr create'", 'tea issues', 'security find-generic-password -s myide-github -w', 'git commit --no-verify -m x', 'git commit -n -m x',
   'git commit -anm wip', 'git -c core.hooksPath=/dev/null commit -m x', 'git config core.hooksPath .', '~/.myide/bin/issue p "t"',
-  'cat ~/.myide/issue-endpoint.json', 'curl -X POST https://api.github.com/repos/o/r/issues', 'echo $(gh auth token)', 'command gh --version', 'sudo security dump-keychain']) {
+  'cat ~/.myide/issue-endpoint.json', 'curl -X POST https://api.github.com/repos/o/r/issues', 'echo $(gh auth token)', 'command gh --version', 'sudo security dump-keychain',
+  // git takes any unambiguous abbreviation of --no-verify; xargs and find -exec run a command word too; the to-do script is MyIDE's.
+  'git commit --no-v -m x', 'git commit --no-ver -m x', 'git commit --no-verif', 'git commit -am x --no-veri', 'echo x | xargs gh issue close',
+  'ls | xargs -n1 security delete-generic-password -s', 'find . -name x -exec gh pr create \\;', 'find . -execdir tea issues \\;',
+  'find . -ok security find-generic-password -w \\;', '~/.myide/bin/todo "x" @sysadmin', 'sh -c "$HOME/.myide/bin/todo hi"']) {
   assert.equal(hardDenied(c), true, c);
 }
 for (const c of ['git commit -m "fix: n items"', 'git push -u origin myide/x', 'grep -r security src/', 'npm test', 'ls ghost', 'git commit -am "x"',
-  'curl https://example.com', 'echo high', 'npx tsc --noEmit']) {
+  'curl https://example.com', 'echo high', 'npx tsc --noEmit', 'git commit --no-edit', 'find . -exec grep -l x {} \\;', 'ls | xargs wc -l',
+  'git log --oneline', 'cat todo.txt']) {
   assert.equal(hardDenied(c), false, c);
 }
 

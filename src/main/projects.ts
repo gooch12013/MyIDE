@@ -17,6 +17,7 @@ export type Config = { prefs?: Partial<Prefs>; projects?: Project[] };
 export const readConfig = (): Config => readJSON<Config>('config.json', {});
 export const writeConfig = (c: Config): void => writeJSON('config.json', c);
 export const listProjects = (): Project[] => readConfig().projects ?? [];
+export const projectById = (id?: string): Project | undefined => listProjects().find((p) => p.id === id);
 const saveProjects = (projects: Project[]): void => writeConfig({ ...readConfig(), projects });
 
 // Only paths inside a registered project are listed or opened. ponytail: symlinks are not resolved,
@@ -77,11 +78,11 @@ export function registerProjectIpc(onChange: () => void): void {
     onChange();
   });
   ipcMain.handle('projects:reveal', (_e, id: string) => {
-    const p = listProjects().find((x) => x.id === id);
+    const p = projectById(id);
     if (p) shell.showItemInFolder(p.path);
   });
   ipcMain.handle('projects:remove', async (e, id: string) => {
-    const project = listProjects().find((p) => p.id === id);
+    const project = projectById(id);
     if (!project) return false;
     const { response } = await dialog.showMessageBox(BrowserWindow.fromWebContents(e.sender)!, {
       type: 'warning', buttons: ['Remove', 'Cancel'], defaultId: 1, cancelId: 1,

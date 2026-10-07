@@ -1,7 +1,7 @@
 // Buttons panel: saved buttons as keys, the installed commands and skills, the button and schedule forms, and the schedules list.
 import type { Button, PaletteItem, Schedule, Target } from '../main/buttons';
 import { describe, nextRun, WEEKDAYS } from '../main/schedules';
-import { errText, h, key } from './dom';
+import { errText, h, key, sheet as modal } from './dom';
 import { activeProject, allProjects } from './projects';
 import { registerPanel } from './registry';
 import { micButton, speakButton } from './speech';
@@ -22,15 +22,13 @@ const sure = (label: string, act: () => void) => {
 const when = (ms?: number) => (ms ? new Date(ms).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
 
 /** A modal sheet; `submit` returns an error message or '' to close. */
-function sheet(title: string, body: HTMLElement[], submit: () => Promise<string>, ok = 'Save'): void {
+function sheet(title: string, body: HTMLElement[], submit: () => Promise<string>, ok = 'Save'): HTMLDialogElement {
   const status = h('p', { className: 'pref-warn' });
   status.setAttribute('aria-live', 'polite');
   const go = h('button', { className: 'btn btn--primary', value: 'ok', textContent: ok });
   const form = h('form', { method: 'dialog' }, h('h2', { className: 'legend', textContent: title }), ...body, status,
     h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), go));
-  const dlg = h('dialog', { className: 'sheet btn-sheet' }, form);
-  dlg.setAttribute('aria-label', title);
-  dlg.onclose = () => dlg.remove();
+  const dlg = modal(title, form, 'btn-sheet');
   form.onsubmit = async (ev) => {
     if (ev.submitter !== go) return;
     ev.preventDefault();
@@ -39,8 +37,7 @@ function sheet(title: string, body: HTMLElement[], submit: () => Promise<string>
     go.disabled = false;
     if (!status.textContent) dlg.close();
   };
-  document.body.append(dlg);
-  dlg.showModal();
+  return dlg;
 }
 
 async function buttonForm(b: Partial<Button>, palette: PaletteItem[], onSaved: () => void): Promise<void> {
@@ -120,12 +117,11 @@ export function scheduleForm(s: Partial<Schedule>, buttons: Button[], onSaved: (
   });
 }
 
-function ask(b: Pick<Button, 'label' | 'input'>): Promise<string | null> {
+function askInput(b: Pick<Button, 'label' | 'input'>): Promise<string | null> {
   return new Promise((resolve) => {
     const input = h('input', { className: 'input', required: true });
     let value: string | null = null;
-    sheet(b.label, [field(b.input!, input), micButton(input)], async () => { value = input.value; return ''; }, 'Run');
-    document.querySelector<HTMLDialogElement>('.btn-sheet')!.addEventListener('close', () => resolve(value));
+    sheet(b.label, [field(b.input!, input), micButton(input)], async () => { value = input.value; return ''; }, 'Run').addEventListener('close', () => resolve(value));
     input.focus();
   });
 }
@@ -167,7 +163,7 @@ registerPanel('buttons', {
 
     async function run(b: Pick<Button, 'command' | 'target' | 'label' | 'input'>): Promise<void> {
       if (!project) return say('Open a project first.');
-      const input = b.input ? await ask(b) : undefined;
+      const input = b.input ? await askInput(b) : undefined;
       if (input === null) return;
       try {
         const id = await api.buttons.run(b, project.id, { employeeId: runOn.value || undefined, input });

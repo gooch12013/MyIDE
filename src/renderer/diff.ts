@@ -1,6 +1,6 @@
 import * as monaco from 'monaco-editor';
-import { errText, h, key } from './dom';
-import { ask, EDITOR_OPTIONS, openAt } from './editor';
+import { ask, errText, h, key } from './dom';
+import { EDITOR_OPTIONS, openAt } from './editor';
 import { mark } from './files';
 import { activeProject } from './projects';
 import { registerPanel } from './registry';
@@ -110,7 +110,7 @@ registerPanel('diff', {
       try {
         const r = await api.git.merge(project!.id, branch);
         if (r.conflicts?.length) {
-          const links = r.conflicts.map((c) => h('button', { type: 'button', className: 'rv-link', textContent: c, onclick: () => void openAt(`${project!.path}/${c}`, 1, panel.id) }));
+          const links = r.conflicts.map((c) => h('button', { type: 'button', className: 'rv-link', textContent: c.startsWith(project!.path + '/') ? c.slice(project!.path.length + 1) : c, onclick: () => void openAt(c, 1, panel.id) }));
           say(`${r.message} `, ...links);
           return;
         }
@@ -127,9 +127,11 @@ registerPanel('diff', {
         if (!r.ok && r.worktree) {
           const emp = (await api.employees.list(project!.id)).find((e) => e.branch === b);
           const who = emp ? ` ${emp.name} works there and will be fired.` : '';
-          if (!(await ask(`Remove the worktree too?`, `${r.message}${who} Git refuses if it has uncommitted changes.`, 'Remove worktree and discard', true))) return;
-          if (emp) await api.employees.fire(emp.id, { removeWorktree: true });
-          r = await api.git.discard(project!.id, b, true);
+          const lost = r.lost ?? [];
+          const files = lost.length ? `\n\nIn the worktree now (!! is ignored, deleted with it; anything else makes git refuse):\n${lost.slice(0, 30).join('\n')}${lost.length > 30 ? `\n…and ${lost.length - 30} more` : ''}` : '';
+          if (!(await ask(`Remove the worktree too?`, `${r.message}${who} Git refuses if it has uncommitted changes.${files}`, 'Remove worktree and discard', true))) return;
+          r = await api.git.discard(project!.id, b, true); // throws, keeping the employee, if git will not remove it
+          if (emp) await api.employees.fire(emp.id, { removeWorktree: false });
         }
         say(r.message);
         await load();

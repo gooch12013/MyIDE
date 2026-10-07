@@ -106,7 +106,6 @@ const api = {
     talk: (id: string): Promise<{ cwd: string; command: string; ptyId: string }> => ipcRenderer.invoke('employees:talk', id),
     fire: (id: string, o: { removeWorktree: boolean }): Promise<void> => ipcRenderer.invoke('employees:fire', id, o),
     /** GO on a This Mac employee's plan: its next turn runs exactly the planned commands. */
-    go: (id: string): Promise<void> => ipcRenderer.invoke('employees:go', id),
     transcript: (id: string): Promise<{ role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[]> => ipcRenderer.invoke('employees:transcript', id),
     onChange: (cb: (e: Employee) => void) => on('employees:change', cb),
     onRemoved: (cb: (id: string) => void) => on('employees:removed', cb),
@@ -166,15 +165,16 @@ const api = {
     fileDraft: (projectId: string, id: string): Promise<{ number: number; url: string; warning?: string }> => ipcRenderer.invoke('forge:file-draft', projectId, id),
     discardDraft: (projectId: string, id: string): Promise<void> => ipcRenderer.invoke('forge:discard-draft', projectId, id),
     /** Drops the write that stopped the outbox (shown as blocked) and sends the rest. */
-    dropOp: (projectId: string): Promise<void> => ipcRenderer.invoke('forge:drop-op', projectId),
+    dropOp: (projectId: string, opId: string): Promise<void> => ipcRenderer.invoke('forge:drop-op', projectId, opId),
     /** A project's issues, drafts or outbox changed. */
     onChange: (cb: (projectId: string) => void) => on('forge:change', cb),
   },
   // Code: the editor's files (inside a project or a MyIDE worktree only), the git tree, review and merge.
   code: {
-    /** The file's text and the checkout it is in (root, branch). */
-    read: (path: string): Promise<{ text: string; root: string; branch: string }> => ipcRenderer.invoke('code:read', path),
-    write: (path: string, text: string): Promise<void> => ipcRenderer.invoke('code:write', path, text),
+    /** The file's text, the hash of its bytes, and the checkout it is in (root, branch). */
+    read: (path: string): Promise<{ text: string; hash: string; root: string; branch: string }> => ipcRenderer.invoke('code:read', path),
+    /** Saves only if the file still has `hash` on disk ("changed on disk" otherwise); resolves with the new hash. */
+    write: (path: string, text: string, hash: string): Promise<string> => ipcRenderer.invoke('code:write', path, text, hash),
     /** True for an existing file the editor may open (inside a project or a MyIDE worktree). */
     exists: (path: string): Promise<boolean> => ipcRenderer.invoke('code:exists', path),
     /** Installed IDEs ('WebStorm', 'VS Code'), and opening a file at a line in one. */
@@ -197,7 +197,7 @@ const api = {
     /** `git merge --no-ff` into the main checkout; refuses when it has uncommitted changes. */
     merge: (projectId: string, branch: string): Promise<{ ok: boolean; message: string; conflicts?: string[] }> => ipcRenderer.invoke('git:merge', projectId, branch),
     /** Deletes the branch; without removeWorktree it refuses (and names the worktree) while one has it checked out. */
-    discard: (projectId: string, branch: string, removeWorktree = false): Promise<{ ok: boolean; worktree?: string; message: string }> => ipcRenderer.invoke('git:discard', projectId, branch, removeWorktree),
+    discard: (projectId: string, branch: string, removeWorktree = false): Promise<{ ok: boolean; worktree?: string; lost?: string[]; message: string }> => ipcRenderer.invoke('git:discard', projectId, branch, removeWorktree),
   },
   // Read-back (macOS say) and dictation (an installed whisper-cli).
   speech: {
@@ -253,7 +253,7 @@ const api = {
       parent?: { request: string; version: number }; reference?: { name: string; data: Uint8Array; acceptedWarning: boolean } }): Promise<{ request: AssetRequest; turn: string }> => ipcRenderer.invoke('assets:request', o),
     list: (projectId: string): Promise<(AssetRequest & { thumbs: string[]; dir: string })[]> => ipcRenderer.invoke('assets:list', projectId),
     targets: (projectId: string, id: string, version: number): Promise<{ kind: string; note: string; targets: { label: string; rel: string; size?: number; exists: boolean }[] }> => ipcRenderer.invoke('assets:targets', projectId, id, version),
-    save: (projectId: string, id: string, version: number): Promise<string[]> => ipcRenderer.invoke('assets:save', projectId, id, version),
+    save: (projectId: string, id: string, version: number, overwrite = false): Promise<string[]> => ipcRenderer.invoke('assets:save', projectId, id, version, overwrite),
     reveal: (id: string, version: number): Promise<void> => ipcRenderer.invoke('assets:reveal', id, version),
     setLine: (credits: number): Promise<void> => ipcRenderer.invoke('assets:set-line', credits),
     installRole: (): Promise<string> => ipcRenderer.invoke('assets:install-role'),
@@ -272,6 +272,8 @@ const api = {
     log: (id: string): Promise<string> => ipcRenderer.invoke('todos:log', id),
     diff: (id: string, path: string): Promise<string> => ipcRenderer.invoke('todos:diff', id, path),
     rollback: (id: string, path: string): Promise<void> => ipcRenderer.invoke('todos:rollback', id, path),
+    /** Puts back what the last rollback of `path` overwrote. */
+    undoRollback: (id: string, path: string): Promise<void> => ipcRenderer.invoke('todos:undo-rollback', id, path),
     /** Copies the This Mac roles into ~/.claude/agents (never over an existing file). */
     installRoles: (): Promise<string> => ipcRenderer.invoke('todos:install-roles'),
     onChange: (cb: () => void) => on('todos:change', cb),

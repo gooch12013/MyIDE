@@ -9,7 +9,7 @@ import { geminiHome, KEY_SERVICE } from './acp/gemini';
 import { removeToken, setToken } from './keychain';
 import type { Usage } from './org';
 import { readConfig, writeConfig } from './projects';
-import { STATE_DIR, writePrivate } from './store';
+import { slug, STATE_DIR, writePrivate } from './store';
 
 export type Provider = 'claude' | 'codex' | 'gemini';
 export type Account = { id: string; name: string; provider: Provider; env: Record<string, string>; cap: number; allowAuto: boolean };
@@ -54,8 +54,6 @@ export const usageOf = (accountId: string): Usage | undefined => usage.get(accou
 
 // ---- add, change, remove ----
 
-const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'account';
-
 /** A second Claude dir starts empty: share roles, skills, commands and CLAUDE.md by symlink, and copy
  *  only enabledPlugins and permissions.defaultMode (plugins/ holds install state the CLI writes, so it is never shared). */
 function claudeDir(dir: string): void {
@@ -77,8 +75,8 @@ export function addAccount(o: { name?: string; provider: Provider; ownLogin?: bo
   if (!PROVIDERS.includes(o.provider)) throw new Error('Unknown provider');
   const all = listAccounts();
   const name = (o.name ?? '').trim().slice(0, 40) || { claude: 'Claude', codex: 'Codex', gemini: 'Gemini' }[o.provider];
-  let id = slug(`${o.provider}-${name}`);
-  for (let n = 2; all.some((a) => a.id === id); n++) id = slug(`${o.provider}-${name}-${n}`);
+  let id = slug(`${o.provider}-${name}`, 'account');
+  for (let n = 2; all.some((a) => a.id === id); n++) id = slug(`${o.provider}-${name}-${n}`, 'account');
   const env: Record<string, string> = {};
   // Claude: the default login is already account one, so every extra account gets its own dir.
   // Codex: the login in ~/.codex (CODEX_HOME unset) or a dir of its own.

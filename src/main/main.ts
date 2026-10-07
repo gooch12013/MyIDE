@@ -35,7 +35,22 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: t
 let mainWindow: BrowserWindow | null = null;
 // Closing the main window hides it (and its pop-outs) so schedules keep firing; Cmd+Q and the tray's Quit really quit.
 let quitting = false;
-app.on('before-quit', () => { quitting = true; });
+// Unsaved editor files: the first quit is held while the main window asks Save / Don't save / Cancel (src/renderer/editor.ts).
+// Every other before-quit listener checks defaultPrevented, so a cancelled quit changes nothing.
+let quitAsked = false;
+app.on('before-quit', (e) => {
+  const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+  if (quitAsked || !wc) return;
+  e.preventDefault();
+  quitAsked = true;
+  void (async () => {
+    const n = await Promise.race([wc.executeJavaScript('window.myideDirty ? window.myideDirty() : 0').catch(() => 0), new Promise((r) => setTimeout(() => r(0), 2000))]); // a hung renderer does not block quitting
+    if (n) showAll();
+    const ok = !n || await wc.executeJavaScript('window.myideQuitCheck()').catch(() => true);
+    if (ok) app.quit(); else quitAsked = false;
+  })();
+});
+app.on('before-quit', (e) => { if (!e.defaultPrevented) quitting = true; });
 function showAll(): void {
   if (!mainWindow) return;
   if (mainWindow.isMinimized()) mainWindow.restore();
@@ -120,6 +135,9 @@ app.whenReady().then(() => {
   void startTray({ open: showAll, showNeeds: () => { showAll(); mainWindow?.webContents.send('command', 'panel:employees'); } });
 });
 
-app.on('before-quit', killAllPtys);
-app.on('before-quit', stopAllTurns);
-app.on('before-quit', stopSpeech);
+app.on('before-quit', (e) => {
+  if (e.defaultPrevented) return;
+  killAllPtys();
+  stopAllTurns();
+  stopSpeech();
+});

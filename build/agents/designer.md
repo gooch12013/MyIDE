@@ -22,6 +22,8 @@ Reference images: a version made earlier is passed by its Higgsfield job id as a
 
 Never generate without an `asset_cost` answer of "generate", never retry a submission whose outcome is unknown, and never generate video, audio or 3D unless asked.
 
+MyIDE enforces this: `generate_image` is refused until `asset_cost` says "generate", and only up to the request's count with its model; `asset_result` refuses more images than were asked for. Tools that spend credits or publish anything else (video, audio, 3D, upscales, websites, TikTok, presets and the like) are blocked, and other Higgsfield tools besides reads wait for David.
+
 ## Provenance
 
 Keep every Higgsfield provenance mark, watermark and metadata block. Never strip, rewrite or re-encode the original files; resized copies are made next to them, the originals stay as delivered.

@@ -2,7 +2,7 @@
 // capture of the read-only Higgsfield turn, the model list, the designer turn and project output paths.
 // Usage: node scripts/check-assets.mjs
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +11,7 @@ import { build } from 'esbuild';
 const tmp = mkdtempSync(join(tmpdir(), 'myide-assets-check-'));
 process.env.MYIDE_HOME = join(tmp, 'home');
 const stub = join(tmp, 'stub.cjs');
-writeFileSync(stub, 'module.exports = new Proxy({}, { get: () => new Proxy(function () {}, { get: () => () => {} }) });');
+writeFileSync(stub, 'module.exports = new Proxy({ BrowserWindow: { getAllWindows: () => [] } }, { get: (t, k) => t[k] ?? new Proxy(function () {}, { get: () => () => {} }) });');
 const out = join(tmp, 'assets.cjs');
 await build({ entryPoints: ['src/main/assets.ts'], outfile: out, bundle: true, platform: 'node', format: 'cjs', logLevel: 'error', alias: { electron: stub, 'node-pty': stub } });
 const a = createRequire(import.meta.url)(out);
@@ -77,6 +77,62 @@ assert.equal(t.kind, 'web');
 assert.deepEqual(t.targets.map((x) => x.size), [16, 32, 180, 192, 512]);
 assert.ok(t.targets.every((x) => x.rel.startsWith('public/')));
 assert.deepEqual(a.projectTargets(join(tmp, 'nothing'), 'Logo', 'l.png'), { kind: 'plain', targets: [{ label: 'Image', rel: 'assets/l.png' }], note: '' });
+
+// Spend gate: reads pass, spenders are denied, generate_image only within an asset_cost approval (count and model).
+const HF = 'mcp__claude_ai_Higgsfield__';
+assert.equal(a.spendGate('e1', 'Bash', {}), undefined);
+assert.equal(a.spendGate('e1', HF + 'balance', {}), 'allow');
+assert.equal(a.spendGate('e1', HF + 'generate_image', { get_cost: true, count: 4 }), 'allow');
+assert.match(a.spendGate('e1', HF + 'generate_image', { count: 1 }), /asset_cost/);
+assert.match(a.spendGate('e1', HF + 'generate_video', {}), /spends credits/);
+assert.match(a.spendGate('e1', HF + 'publish_website', {}), /spends credits/);
+assert.equal(a.spendGate('e1', HF + 'media_upload', {}), undefined); // David decides
+a.allowSpend('r9', 'e1', 'nano_banana_pro', 3);
+assert.match(a.spendGate('e2', HF + 'generate_image', { count: 1 }), /asset_cost/); // another employee
+assert.match(a.spendGate('e1', HF + 'generate_image', { count: 1, model: 'flux' }), /asset_cost/); // another model
+assert.match(a.spendGate('e1', HF + 'generate_image', { count: 4 }), /asset_cost/); // more than approved
+assert.equal(a.spendGate('e1', HF + 'generate_image', { count: 2, model: 'nano_banana_pro' }), 'allow');
+assert.match(a.spendGate('e1', HF + 'generate_image', { count: 2 }), /asset_cost/);
+assert.equal(a.spendGate('e1', HF + 'generate_image', {}), 'allow'); // count defaults to 1
+assert.match(a.spendGate('e1', HF + 'generate_image', {}), /asset_cost/); // used up
+assert.match(a.spendGate('e1', HF + 'generate_image', { count: 0.5 }), /whole-number/);
+assert.ok(a.HF_DENY.every((t) => t.startsWith(HF)) && !a.HF_DENY.includes(HF + 'generate_image'));
+
+// Downloads: the extension comes from the bytes; non-images are refused.
+const dl = join(tmp, 'dl');
+mkdirSync(dl);
+const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0, 0, 13]);
+assert.equal(await a.download(`data:image/jpeg;base64,${pngBytes.toString('base64')}`, dl, 1), 'v1.png');
+assert.deepEqual([...readFileSync(join(dl, 'v1.png'))], [...pngBytes]);
+await assert.rejects(a.download(`data:image/png;base64,${Buffer.from('<svg onload=x>').toString('base64')}`, dl, 2), /Not a PNG/);
+await assert.rejects(a.download('http://example.com/a.png', dl, 3), /Not an https image URL/);
+assert.ok(!existsSync(join(dl, 'v2.png')));
+
+// Saving into a project: refuses links out, a link as the file, and existing files without overwrite; checks request.json.
+const proj = join(tmp, 'proj'), away = join(tmp, 'outside');
+mkdirSync(join(proj, 'assets', 'generated', 'r1'), { recursive: true });
+mkdirSync(away);
+mkdirSync(process.env.MYIDE_HOME, { recursive: true });
+writeFileSync(join(process.env.MYIDE_HOME, 'config.json'), JSON.stringify({ projects: [{ id: 'pp', name: 'proj', path: proj, colour: '#000000' }] }));
+const genReq = (id, extra = {}) => { mkdirSync(join(proj, 'assets', 'generated', id), { recursive: true }); writeFileSync(join(proj, 'assets', 'generated', id, 'request.json'), JSON.stringify({ ...req, id, projectId: 'pp', type: 'Logo', versions: [{ file: 'v1.png' }], ...extra })); writeFileSync(join(proj, 'assets', 'generated', id, 'v1.png'), pngBytes); };
+genReq('r1');
+assert.deepEqual(await a.saveToProject('pp', 'r1', 1), ['assets/Logo-r1-v1.png']);
+await assert.rejects(a.saveToProject('pp', 'r1', 1), /already exists/);
+assert.deepEqual(await a.saveToProject('pp', 'r1', 1, true), ['assets/Logo-r1-v1.png']);
+rmSync(join(proj, 'assets', 'Logo-r1-v1.png'));
+symlinkSync(join(away, 'victim.png'), join(proj, 'assets', 'Logo-r1-v1.png'));
+await assert.rejects(a.saveToProject('pp', 'r1', 1, true), /symbolic link/);
+assert.ok(!existsSync(join(away, 'victim.png')));
+genReq('r2', { versions: [{ file: '../../../../outside/x.png' }] });
+await assert.rejects(a.saveToProject('pp', 'r2', 1), /names a file/);
+genReq('r3', { reference: '../secret' });
+await assert.rejects(a.saveToProject('pp', 'r3', 1), /names a reference/);
+// A project whose assets folder is a link out of it.
+const proj2 = join(tmp, 'proj2');
+mkdirSync(join(proj2, 'gen'), { recursive: true });
+symlinkSync(away, join(proj2, 'assets'));
+writeFileSync(join(process.env.MYIDE_HOME, 'config.json'), JSON.stringify({ projects: [{ id: 'p2', name: 'p2', path: proj2, colour: '#000000' }, { id: 'pp', name: 'proj', path: proj, colour: '#000000' }] }));
+await assert.rejects(a.saveToProject('p2', 'r1', 1), /outside the project through a link/);
 
 rmSync(tmp, { recursive: true, force: true });
 console.log('check-assets: ok');

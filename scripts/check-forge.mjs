@@ -31,6 +31,7 @@ const times = []; // when each logged write arrived
 let down = false;
 let slowNext = false; // handle the next write, but answer after the client's 5 s timeout
 let failNext; // { status, message, headers }: refuse the next write without handling it
+let garbleNext = false; // handle the next write, then answer 201 with a body that is not JSON
 const comments = [];
 const pulls = [];
 let nextIssue = 10, nextPr = 50, nextLabel = 1;
@@ -53,7 +54,9 @@ const fake = createServer((req, res) => {
     if (req.method !== 'GET') { log.push({ m: req.method, path, body, ct }); times.push(Date.now()); }
     const slow = req.method !== 'GET' && slowNext;
     if (slow) slowNext = false;
-    const json = (s, o) => (slow ? setTimeout(() => res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o)), 6000)
+    const garble = req.method !== 'GET' && garbleNext;
+    if (garble) garbleNext = false;
+    const json = (s, o) => (garble ? res.writeHead(201, { 'content-type': 'text/html' }).end('<html>proxy</html>') : slow ? setTimeout(() => res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o)), 6000)
       : res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o)));
     const authed = ['token fj-token-123', 'Bearer fj-token-123'].includes(req.headers.authorization);
     if (req.method !== 'GET' && !authed) return json(401, { message: 'token required' });
@@ -293,6 +296,12 @@ try {
   sh = await issueSh('nope', 'x');
   assert.equal(sh.code, 1);
   assert.match(sh.stderr, /No project named nope/);
+  // The same script named todo posts to /todo (no to-do handler in this bundle, so MyIDE's refusal comes back as text).
+  cpSync(join(home, 'bin', 'issue'), join(tmp, 'todo'));
+  sh = await new Promise((resolve) => execFile(join(tmp, 'todo'), ['renew the key', '@sysadmin'], { env: { ...process.env, MYIDE_HOME: home } },
+    (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stdout, stderr })));
+  assert.equal(sh.code, 1);
+  assert.match(sh.stderr, /to-dos not available/);
   const ep = JSON.parse(readFileSync(join(home, 'issue-endpoint.json'), 'utf8'));
   const bad = await fetch(ep.url, { method: 'POST', headers: { host: new URL(ep.url).host }, body: JSON.stringify({ project: 'Relay', title: 'x', token: 'wrong' }) });
   assert.equal(bad.status, 401);
@@ -371,6 +380,23 @@ try {
   assert.equal(told.length, 1);
   assert.equal(told[0].id, 'e1');
   assert.match(told[0].text, /dropped it.*404/);
+  // A 2xx that is not JSON came after the forge took the write: blocked, marked uncertain, and the replay does not post twice.
+  garbleNext = true;
+  assert.match(await forge.forgeAction(emp, 'comment', { body: 'garbled answer' }), /^Queued/);
+  assert.equal(cache().outbox[0].uncertain, true);
+  await call('forge:refresh', 'p1', true);
+  assert.equal(cache().outbox.length, 0);
+  assert.equal(comments.filter((c) => c.body === 'garbled answer').length, 1, 'posted once');
+  // Drop: by the id of the blocked write David saw, never whatever is at the front now.
+  failNext = { status: 401, message: 'bad token' };
+  assert.match(await forge.forgeAction(emp, 'comment', { body: 'to drop' }), /^Queued/);
+  const snap = (await call('forge:issues', 'p1'))[0];
+  assert.equal(snap.blockedOp, cache().outbox[0].id);
+  await assert.rejects(async () => call('forge:drop-op', 'p1', 'not-an-op'), /already went out/);
+  assert.equal(cache().outbox.length, 1);
+  await call('forge:drop-op', 'p1', snap.blockedOp);
+  assert.equal(cache().outbox.length, 0);
+  assert.equal(comments.filter((c) => c.body === 'to drop').length, 0);
   // GitHub writes: one at a time, at least a second apart.
   log.length = times.length = 0;
   const gh = { ...emp, projectId: 'ghf' };

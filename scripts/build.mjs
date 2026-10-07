@@ -17,10 +17,9 @@ await Promise.all([
       .map(([name, file]) => [`${name}.worker`, `node_modules/monaco-editor/esm/vs/${file}`])) }),
 ]);
 cpSync('build/hooks', 'dist/hooks', { recursive: true }); // the chaining git hook, installed into ~/.myide/hooks under every hook name at launch
-cpSync('build/bin', 'dist/bin', { recursive: true }); // the `issue` quick-add script, copied to ~/.myide/bin at launch
+cpSync('build/bin', 'dist/bin', { recursive: true }); // the issue/todo quick-add script, copied to ~/.myide/bin (as both names) at launch
 cpSync('build/providers.json', 'dist/providers.json'); // the AI capability table
-cpSync('build/prompt-guides', 'dist/prompt-guides', { recursive: true }); // asset studio prompt guides, copied to ~/.myide/prompt-guides on first use
-cpSync('build/agents', 'dist/agents', { recursive: true }); // the designer role, installed into ~/.claude/agents only on a click
+for (const f of ['trayTemplate.png', 'trayTemplate@2x.png']) cpSync(`build/${f}`, `dist/${f}`); // the menu-bar icon
 cpSync('build/prompt-guides', 'dist/prompt-guides', { recursive: true }); // asset studio prompt guides, copied to ~/.myide/prompt-guides on first use
 cpSync('build/agents', 'dist/agents', { recursive: true }); // the designer role, installed into ~/.claude/agents only on a click
 for (const f of ['index.html', 'popout.html']) cpSync(`src/renderer/${f}`, `dist/renderer/${f}`);

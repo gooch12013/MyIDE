@@ -83,4 +83,9 @@ assert.deepEqual(rollup(all, 'L'), { done: 7, total: 12, reports: 3 });
 assert.deepEqual(rollup(all, 'r2'), { done: 1, total: 3, reports: 1 });
 assert.deepEqual(rollup(all, 'nope'), { done: 0, total: 0, reports: 0 });
 
+// A provider with no efforts list (Gemini): the effort never makes a pick above the ceiling; the model still does.
+assert.equal(above({ model: 'flash', effort: 'high' }, { model: 'flash' }, 'gemini'), false);
+assert.equal(above({ model: 'flash', effort: 'max' }, { model: 'flash', effort: 'low' }, 'gemini'), false);
+assert.equal(above({ model: 'pro' }, { model: 'flash' }, 'gemini'), true);
+assert.equal(above({ model: 'flash-lite' }, { model: 'flash' }, 'gemini'), false);
 console.log('check-org: ok');
