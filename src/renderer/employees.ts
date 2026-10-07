@@ -1,6 +1,7 @@
 import { h, key } from './dom';
 import { openHire } from './hire';
 import { activeProject, allProjects } from './projects';
+import { showProject } from './layouts';
 import { openPanel, registerPanel } from './registry';
 import type { DockviewPanelApi } from 'dockview-core';
 import type { Employee, EmployeeState } from '../main/employees';
@@ -59,7 +60,10 @@ export function steps(e: Employee): HTMLSpanElement {
 
 /** Open employee panels by employee id, so a second open focuses the first. */
 export const openEmployees = new Map<string, DockviewPanelApi>();
-export function openEmployee(id: string): void {
+/** An employee of another project opens in that project's layout (its tab shown, or reopened). */
+export async function openEmployee(id: string): Promise<void> {
+  const e = (await api.employees.list()).find((x) => x.id === id);
+  if (e && e.projectId !== activeProject()?.id && allProjects().some((p) => p.id === e.projectId)) await showProject(e.projectId);
   const open = openEmployees.get(id);
   if (open) open.setActive();
   else openPanel('employee', { id });
@@ -245,22 +249,42 @@ function macLine(list: Employee[], closed: Set<string>, open: { on: boolean }): 
 
 const CEILINGS = [['', 'No ceiling'], ['haiku', 'Haiku'], ['sonnet', 'Sonnet'], ['opus', 'Opus']];
 
+/** Five-hour usage on one line, for a project's panel: the gauges live in the all-projects view. */
+function usageLine(accounts: { id: string; name: string; cap: number; usage?: Usage }[]): HTMLElement[] {
+  return accounts.map((a) => {
+    const f = a.usage?.fiveHour;
+    const slow = f !== undefined && f >= SLOW_AT;
+    return h('span', { className: `usage-item${slow ? ' is-slow' : ''}`, title: slow ? `Hiring slowed: cap ${Math.max(1, a.cap - 1)}` : `Cap ${a.cap}`,
+      textContent: `${a.name} ${f === undefined ? '—' : `${pct(f)}%`}` });
+  });
+}
+
+const rollText = (all: Employee[]) => {
+  const working = all.filter((e) => e.state === 'working').length;
+  const attention = all.filter((e) => ATTENTION.includes(e.state)).length;
+  return [`${all.length} employee${all.length === 1 ? '' : 's'}`, working && `${working} working`, attention && `${attention} need${attention === 1 ? 's' : ''} you`].filter(Boolean).join(' · ');
+};
+
 registerPanel('employees', {
   title: 'Employees',
-  create(el) {
+  create(el, params) {
     el.classList.add('emps');
-    const project = activeProject();
+    // In a project's layout the panel shows that project; only { scope: 'all' } (View > Employees: All Projects) shows every one.
+    const all = params.scope === 'all';
+    const project = all ? null : activeProject();
+    const mine = (projectId?: string) => all || (!!project && projectId === project.id);
     const needs = h('section', { className: 'needs' });
     needs.setAttribute('aria-label', 'Needs you');
-    // Across projects: usage per account, then one line per project.
-    const usage = h('div', { className: 'cap-table gauge' });
-    usage.setAttribute('aria-label', 'AI usage');
+    // All projects: usage gauges per account and one line per project. A project: a usage line and its own line.
+    const usage = h('div', { className: all ? 'cap-table gauge' : 'usage-line' });
+    usage.setAttribute('aria-label', 'AI usage, five-hour window');
     const lines = h('div', { className: 'proj-lines' });
-    lines.setAttribute('aria-label', 'Projects');
-    const top = h('section', { className: 'org-top' },
-      h('h2', { className: 'legend box-title', textContent: 'Usage · five-hour window' }), usage,
-      h('h2', { className: 'legend box-title', textContent: 'Projects' }), lines);
-    el.append(needs, top);
+    lines.setAttribute('aria-label', all ? 'Projects' : 'Project');
+    const pages = h('div', { className: 'xpages' }); // all projects: one page per project with staff
+    el.append(needs, all
+      ? h('section', { className: 'org-top' }, h('h2', { className: 'legend box-title', textContent: 'Usage · five-hour window' }), usage,
+        h('h2', { className: 'legend box-title', textContent: 'Projects' }), lines)
+      : h('section', { className: 'org-top' }, lines, usage));
 
     const roll = h('span', { className: 'xpage-roll' });
     const list = h('div', { className: 'o-list' });
@@ -268,40 +292,56 @@ registerPanel('employees', {
     ceiling.setAttribute('aria-label', 'Model ceiling for this project');
     ceiling.title = 'A lead or auto mode picking a model above this waits for your approval';
     const depthNote = h('span', { className: 'capflag' });
-    if (project) {
+    if (all) el.append(pages);
+    else if (project) {
       ceiling.onchange = () => void api.org.setProject(project.id, { ceiling: ceiling.value ? { model: ceiling.value } : null });
       const page = h('details', { className: 'xpage', open: true },
         h('summary', { className: 'xpage-head' }, h('span', { className: 'xpage-name', textContent: project.name }), roll), list);
       page.style.setProperty('--proj', project.colour);
       el.append(h('div', { className: 'emps-bar' },
         h('label', { className: 'org-ceiling-field' }, h('span', { className: 'legend', textContent: 'Ceiling' }), ceiling), depthNote,
-        key('Hire', () => void openHire(), { title: 'Hire an employee into this project' })), page);
+        key('Hire', () => void openHire({ project }), { title: `Hire an employee into ${project.name}` })), page);
     } else el.append(h('p', { className: 'files-note', textContent: 'No project open.' }));
 
     const emps = new Map<string, Employee>();
     const closed = new Set<string>();
+    const shut = new Set<string>(); // folded project pages in the all-projects view
     const macOpen = { on: false };
     let org: OrgState | undefined;
     const draw = () => {
       const everyone = [...emps.values()];
-      const mac = everyone.filter((e) => e.projectId === 'mac');
-      if (org) lines.replaceChildren(...allProjects().map((p) => projectLine(p, everyone.filter((e) => e.projectId === p.id), org!, p.id === project?.id)),
-        ...(mac.length ? [macLine(mac, closed, macOpen)] : []));
+      const of = (id: string) => everyone.filter((e) => e.projectId === id);
+      const max = org?.caps.maxReports ?? 3;
+      if (all) {
+        const mac = of('mac');
+        if (org) lines.replaceChildren(...allProjects().map((p) => projectLine(p, of(p.id), org!, false)), ...(mac.length ? [macLine(mac, closed, macOpen)] : []));
+        pages.replaceChildren(...allProjects().filter((p) => of(p.id).length).map((p) => {
+          const d = h('details', { className: 'xpage', open: !shut.has(p.id) },
+            h('summary', { className: 'xpage-head' }, h('span', { className: 'xpage-name', textContent: p.name }), h('span', { className: 'xpage-roll', textContent: rollText(of(p.id)) })),
+            h('div', { className: 'o-list' }, ...tree(of(p.id), closed, max)));
+          d.style.setProperty('--proj', p.colour);
+          d.addEventListener('toggle', () => { if (d.open) shut.delete(p.id); else shut.add(p.id); });
+          return d;
+        }));
+        if (!pages.children.length) pages.append(h('p', { className: 'files-note', textContent: 'No employees in any project yet.' }));
+        return;
+      }
       if (!project) return;
-      const all = everyone.filter((e) => e.projectId === project.id);
-      list.replaceChildren(...tree(all, closed, org?.caps.maxReports ?? 3));
-      if (!all.length) list.append(h('p', { className: 'files-note', textContent: 'No employees yet. Hire one to give it a task in its own worktree.' }));
-      const working = all.filter((e) => e.state === 'working').length;
-      const attention = all.filter((e) => ATTENTION.includes(e.state)).length;
-      roll.textContent = [`${all.length} employee${all.length === 1 ? '' : 's'}`, working && `${working} working`, attention && `${attention} need${attention === 1 ? 's' : ''} you`].filter(Boolean).join(' · ');
-      const po = org?.projects.find((p) => p.id === project.id);
+      const p = allProjects().find((x) => x.id === project.id) ?? project; // a renamed or recoloured project
+      const mineList = of(project.id);
+      if (org) lines.replaceChildren(projectLine(p, mineList, org, false));
+      list.replaceChildren(...tree(mineList, closed, max));
+      if (!mineList.length) list.append(h('p', { className: 'files-note', textContent: 'No employees yet. Hire one to give it a task in its own worktree.' }));
+      roll.textContent = rollText(mineList);
+      const po = org?.projects.find((x) => x.id === project.id);
       ceiling.value = po?.ceiling?.model ?? '';
       depthNote.textContent = `Max depth ${po?.maxDepth ?? 3}`;
     };
     const readings = new Map<string, Usage>(); // newest from the usage event, which can beat accounts.list()
     const drawUsage = async () => {
-      const accounts = await api.accounts.list().catch(() => []);
-      usage.replaceChildren(...accounts.flatMap((a) => gauge({ ...a, usage: readings.get(a.id) ?? a.usage })));
+      const accounts = (await api.accounts.list().catch(() => [])).map((a) => ({ ...a, usage: readings.get(a.id) ?? a.usage }));
+      if (all) usage.replaceChildren(...accounts.flatMap(gauge));
+      else usage.replaceChildren(...(accounts.length ? [h('span', { className: 'legend', textContent: 'Usage 5 h' }), ...usageLine(accounts)] : []));
     };
 
     let seq = 0;
@@ -309,16 +349,18 @@ registerPanel('employees', {
       const n = ++seq;
       const [pending, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
       if (n !== seq) return;
-      const drafts = forges.flatMap((f) => f.drafts.map((d) => draftCard(f, d)));
-      needs.hidden = !pending.length && !drafts.length;
-      needs.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · ${pending.length + drafts.length}` }), ...pending.map((a) => {
+      const drafts = forges.filter((f) => mine(f.projectId)).flatMap((f) => f.drafts.map((d) => draftCard(f, d)));
+      const asks = pending.flatMap((a) => {
         const e = everyone.find((x) => x.id === a.employeeId);
+        if (!mine(e?.projectId)) return [];
         const p = allProjects().find((x) => x.id === e?.projectId);
-        return needCard(a, `${p?.name ?? (e?.projectId === 'mac' ? 'This Mac' : '?')} / ${e?.name ?? a.employeeId}`, p?.colour);
-      }), ...drafts);
+        return [needCard(a, all ? `${p?.name ?? (e?.projectId === 'mac' ? 'This Mac' : '?')} / ${e?.name ?? a.employeeId}` : e?.name ?? a.employeeId, p?.colour)];
+      });
+      needs.hidden = !asks.length && !drafts.length;
+      needs.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · ${asks.length + drafts.length}` }), ...asks, ...drafts);
     };
 
-    void Promise.all([api.employees.list(), api.org.get()]).then(([all, o]) => { org = o; all.forEach((e) => emps.set(e.id, e)); draw(); });
+    void Promise.all([api.employees.list(), api.org.get()]).then(([list0, o]) => { org = o; list0.forEach((e) => emps.set(e.id, e)); draw(); });
     void drawNeeds();
     void drawUsage();
     const offs = [
@@ -345,4 +387,4 @@ if (banner) {
 }
 
 // A notification click opens the employee.
-api.employees.onOpen(openEmployee);
+api.employees.onOpen((id) => void openEmployee(id));

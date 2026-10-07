@@ -132,7 +132,7 @@ app.whenReady().then(() => {
   registerAssetsIpc();
   registerTodosIpc();
   createMainWindow();
-  void startTray({ open: showAll, showNeeds: () => { showAll(); mainWindow?.webContents.send('command', 'panel:employees'); } });
+  void startTray({ open: showAll, showNeeds: () => { showAll(); mainWindow?.webContents.send('command', 'employees-all'); } });
 });
 
 app.on('before-quit', (e) => {

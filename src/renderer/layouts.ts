@@ -118,7 +118,7 @@ export async function closeProject(p = activeProject()): Promise<boolean> {
 }
 
 /** Reopens a closed tab (or shows an open one) with its saved layout. */
-async function showProject(id?: string): Promise<void> {
+export async function showProject(id?: string): Promise<void> {
   const p = allProjects().find((x) => x.id === id);
   if (!p) return;
   if (p.closed) { await api.projects.setClosed(p.id, false); await loadProjects(); }
@@ -164,11 +164,18 @@ async function closeTab(): Promise<void> {
 }
 
 function showPanel(type: string): void {
-  const open = dock.panels.find((p) => p.api.component === type);
+  const open = dock.panels.find((p) => p.api.component === type && p.params?.scope !== 'all'); // a project's panel, not the all-projects view
   if (open) open.api.setActive();
   else if (type === 'files') openPanel('files', {}, { position: { direction: 'left' }, initialWidth: 260 });
   else if (type === 'employees') openPanel('employees', {}, { position: { direction: 'left' }, initialWidth: EMPLOYEES_WIDTH });
   else openPanel(type, type === 'terminal' ? { cwd: cwd() } : {});
+}
+
+/** Focuses (or opens) Employees: All Projects in this layout. */
+export function showEmployeesAll(): void {
+  const open = dock.panels.find((p) => p.api.component === 'employees' && p.params?.scope === 'all');
+  if (open) open.api.setActive();
+  else openPanel('employees', { scope: 'all' }, { position: { direction: 'left' }, initialWidth: EMPLOYEES_WIDTH * 2 }).api.setTitle('Employees: All');
 }
 
 // The menu shows which panel types are open; the empty state shows when there is nothing at all.
@@ -215,6 +222,7 @@ const commands: Record<string, (arg: string) => void> = {
   preset: (name) => void okToClose().then((ok) => ok && preset(name)),
   layout: (name) => void restoreNamed(name),
   panel: showPanel,
+  'employees-all': () => showEmployeesAll(),
   'flush-layout': () => save(), // the main window was hidden (closed while MyIDE keeps running)
 };
 

@@ -2,6 +2,7 @@ import type { Mode, Pick } from '../main/org';
 import { accountPicker } from './accounts';
 import { attachBox } from './attach';
 import { h } from './dom';
+import type { Project } from '../main/projects';
 import { activeProject } from './projects';
 import { micButton } from './speech';
 
@@ -75,8 +76,9 @@ let sheet: HTMLDialogElement | undefined;
 
 /** The hire sheet: role, task, model and effort (defaults from the role). */
 /** `o.task` prefills the task (a promoted to-do); `o.onHired` hears the new employee. */
-export async function openHire(o: { task?: string; onHired?: (e: { id: string; role: string }) => void } = {}): Promise<void> {
-  const project = activeProject();
+/** `o.project` is the project to hire into (a project's Employees panel); default the active one. */
+export async function openHire(o: { task?: string; project?: Project; onHired?: (e: { id: string; role: string }) => void } = {}): Promise<void> {
+  const project = o.project ?? activeProject();
   if (!project) return;
   sheet?.remove();
   const [roles, org] = await Promise.all([api.employees.roles(project.id), api.org.get()]);

@@ -7,7 +7,8 @@ import { cue, led, openEmployee, type Employee } from './employees';
 import { openHire } from './hire';
 import { openNewIssue } from './issues';
 import { activeProject } from './projects';
-import { openPanel, registerPanel } from './registry';
+import { showEmployeesAll } from './layouts';
+import { registerPanel } from './registry';
 import { micButton } from './speech';
 
 const api = window.myide;
@@ -96,7 +97,7 @@ registerPanel('todos', {
       // Other things the employee waits on (a command outside the plan, a question) answer in the Employees panel.
       const other = e ? pending.filter((a) => a.employeeId === e.id && a.kind !== 'plan') : [];
       if (other.length) box.append(h('p', { className: 'td-note' }, led('needs-you', 'Needs you'), `${other.length} waiting: ${other.map((a) => a.text ?? a.tool).join(' · ').slice(0, 300)}`,
-        key('Open', () => openPanel('employees'))));
+        key('Open', showEmployeesAll)));
 
       box.append(h('h3', { className: 'legend', textContent: 'Log' }), h('pre', { className: 'need-input td-log', textContent: logs.get(t.id) || 'Nothing run yet.' }));
       const paths = [...new Set(t.journal.map((j) => j.path))];

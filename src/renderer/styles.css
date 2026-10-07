@@ -818,3 +818,8 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .forge-found-box:empty { display: none; }
 .iss-found .forge { align-items: start; }
 .iss-found dt { margin-top: 6px; }
+/* A project's Employees panel: usage on one line (the gauges are in the all-projects view) */
+.usage-line { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--sp-2) var(--sp-5); font-size: var(--fs-sm); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.usage-line:empty { display: none; }
+.usage-item.is-slow { color: var(--st-needs); }
+.xpages { display: grid; gap: var(--sp-4); }
