@@ -1,3 +1,4 @@
+import type { Mode, Pick } from '../main/org';
 import { accountPicker } from './accounts';
 import { h } from './dom';
 import { activeProject } from './projects';
@@ -38,8 +39,6 @@ export function modelPicker(model: string, effort: string | undefined, onchange?
 
 // ---- mode: pinned, manager picks, auto ----
 
-type Mode = 'pinned' | 'manager' | 'auto';
-type Pick = { model: string; effort?: string };
 export const MODE_TEXT: Record<Mode, string> = { pinned: 'Pinned', manager: 'Manager picks', auto: 'Auto' };
 const MODE_HINT: Record<Mode, string> = {
   pinned: 'You pick the exact model and effort.',

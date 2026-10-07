@@ -51,6 +51,9 @@ for (const dir of dirs) {
   if (!allowed(licence)) bad.push(`${pkg.name}@${pkg.version}: ${licence}`);
   const file = readdirSync(dir).find((f) => /^(licen[cs]e|copying)/i.test(f));
   parts.push(`${'='.repeat(78)}\n${pkg.name} ${pkg.version}\nLicence: ${licence}\n\n${file ? readFileSync(join(dir, file), 'utf8').trim() : '(no licence file in package)'}\n`);
+  // Packages that bundle others (Monaco) ship those notices in their own file.
+  const extra = readdirSync(dir).find((f) => /^third_?party_?notices/i.test(f));
+  if (extra) parts.push(`${pkg.name} bundles:\n\n${readFileSync(join(dir, extra), 'utf8').trim()}\n`);
 }
 
 if (bad.length) {

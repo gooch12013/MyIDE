@@ -1,0 +1,71 @@
+[
+  {
+    "id": "whisper",
+    "name": "Local Whisper",
+    "kind": "speech to text",
+    "adds": "Mic buttons in text boxes, transcribed on this Mac. Fallback: macOS dictation.",
+    "licence": "MIT",
+    "licenceUrl": "https://github.com/ggml-org/whisper.cpp/blob/master/LICENSE",
+    "version": "v1.9.5",
+    "status": "build-needed",
+    "note": "whisper.cpp publishes no macOS command-line build (its v1.9.5 release has no downloads). Use an existing whisper-cli, e.g. from Homebrew's whisper-cpp.",
+    "detect": { "bin": "whisper-cli" }
+  },
+  {
+    "id": "whisper-model",
+    "name": "Whisper model",
+    "kind": "base.en, OpenAI weights",
+    "adds": "The speech model Local Whisper runs: OpenAI's Whisper base.en converted to ggml by whisper.cpp.",
+    "licence": "MIT",
+    "licenceUrl": "https://github.com/openai/whisper/blob/main/LICENSE",
+    "version": "5359861c739e955e79d9a303bcbc70fb988958b1",
+    "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.en.bin",
+    "sha256": "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+    "size": 147964211,
+    "file": "ggml-base.en.bin",
+    "detect": { "dirs": ["~/.cache/whisper-cpp", "~/.cache/whisper", "/opt/homebrew/share/whisper-cpp", "/usr/local/share/whisper-cpp"], "match": "^ggml-[a-z0-9.-]+\\.bin$" }
+  },
+  {
+    "id": "gh",
+    "name": "GitHub CLI",
+    "kind": "gh, forge",
+    "adds": "Import a GitHub token from gh instead of pasting one. Issues work without it.",
+    "licence": "MIT",
+    "licenceUrl": "https://github.com/cli/cli/blob/trunk/LICENSE",
+    "version": "2.102.0",
+    "url": "https://github.com/cli/cli/releases/download/v2.102.0/gh_2.102.0_macOS_arm64.zip",
+    "sha256": "da922c20d1792e5b2cbf375593d7a658acf034c12c84e007e71c76ef959c337e",
+    "size": 14359983,
+    "archive": "zip",
+    "file": "gh_2.102.0_macOS_arm64/bin/gh",
+    "detect": { "bin": "gh" }
+  },
+  {
+    "id": "kokoro",
+    "name": "Kokoro voice",
+    "kind": "read-back",
+    "adds": "Natural read-back voices. Fallback: macOS voices.",
+    "licence": "Apache-2.0 (pulls in GPL espeak-ng and phonemizer, installed separately)",
+    "licenceUrl": "https://huggingface.co/hexgrad/Kokoro-82M",
+    "version": "0.9.4",
+    "status": "coming-soon",
+    "advanced": "Installs a private Python environment with a standalone uv binary into ~/.myide/components.",
+    "size": 344256443,
+    "sizeNote": "Model 327 MB and uv 17 MB, plus Python packages",
+    "detect": { "dirs": ["~/.cache/huggingface/hub"], "match": "^models--.*[Kk]okoro" }
+  },
+  {
+    "id": "qwen3-tts",
+    "name": "Qwen3-TTS",
+    "kind": "voice cloning",
+    "adds": "Reads back in your own voice from a recorded sample.",
+    "licence": "Apache-2.0",
+    "licenceUrl": "https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "version": "0.1.1",
+    "status": "coming-soon",
+    "advanced": "Installs a private Python environment with a standalone uv binary into ~/.myide/components.",
+    "size": 3850446769,
+    "sizeNote": "Model 3.8 GB and uv 17 MB, plus Python packages",
+    "detect": { "dirs": ["~/.cache/huggingface/hub"], "match": "^models--.*Qwen3-TTS" }
+  }
+]

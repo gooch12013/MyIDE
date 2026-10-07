@@ -1,10 +1,12 @@
 // Checks src/main/forge.ts against a local fake Forgejo (node http): list, URL fallback with the 5 s
 // timeout, comment/label/assignee/PR/create/assets, attribution strip on every body, the outbox
-// replaying in order after an outage, drafts, quick-add and assign. Then one read-only anonymous list
+// replaying in order after an outage, drafts, quick-add and assign; writes failing over on a refused
+// connection only, the look-up before replaying a write that may have landed, which HTTP errors stop
+// the outbox and which drop a write, and GitHub write pacing. Then one read-only anonymous list
 // of gooch12013/MyIDE on GitHub. Never writes to a real forge; tokens go in a temp keychain.
 // Usage: node scripts/check-forge.mjs   (add --offline-only to skip the GitHub read)
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
@@ -25,11 +27,16 @@ process.env.MYIDE_KEYCHAIN = kc;
 
 // ---- fake Forgejo ----
 const log = [];
+const times = []; // when each logged write arrived
 let down = false;
+let slowNext = false; // handle the next write, but answer after the client's 5 s timeout
+let failNext; // { status, message, headers }: refuse the next write without handling it
+const comments = [];
+const pulls = [];
 let nextIssue = 10, nextPr = 50, nextLabel = 1;
 const labels = [{ id: 99, name: 'bug' }];
 const issues = new Map([[1, { number: 1, title: 'Sync teardown', body: '', state: 'open', labels: [], assignees: [], user: { login: 'david' } }]]);
-const withUrl = (i) => ({ ...i, html_url: `http://forge/o/r/issues/${i.number}`, updated_at: '2026-10-07T00:00:00Z', pull_request: null });
+const withUrl = (i) => ({ ...i, html_url: `http://forge/o/r/issues/${i.number}`, updated_at: '2026-10-07T00:00:00Z', created_at: i.created_at ?? new Date().toISOString(), pull_request: null });
 const fake = createServer((req, res) => {
   if (down) return req.socket.destroy();
   let raw = Buffer.alloc(0);
@@ -39,9 +46,16 @@ const fake = createServer((req, res) => {
     const path = url.pathname.replace('/api/v1', '');
     const ct = req.headers['content-type'] ?? '';
     const body = ct.includes('json') ? JSON.parse(raw.toString() || 'null') : raw.toString('latin1');
-    if (req.method !== 'GET') log.push({ m: req.method, path, body, ct });
-    const json = (s, o) => res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o));
-    const authed = req.headers.authorization === 'token fj-token-123';
+    if (req.method !== 'GET' && failNext) {
+      const f = failNext; failNext = undefined;
+      return res.writeHead(f.status, { 'content-type': 'application/json', ...f.headers }).end(JSON.stringify({ message: f.message }));
+    }
+    if (req.method !== 'GET') { log.push({ m: req.method, path, body, ct }); times.push(Date.now()); }
+    const slow = req.method !== 'GET' && slowNext;
+    if (slow) slowNext = false;
+    const json = (s, o) => (slow ? setTimeout(() => res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o)), 6000)
+      : res.writeHead(s, { 'content-type': 'application/json' }).end(JSON.stringify(o)));
+    const authed = ['token fj-token-123', 'Bearer fj-token-123'].includes(req.headers.authorization);
     if (req.method !== 'GET' && !authed) return json(401, { message: 'token required' });
     let m;
     if (path === '/user') return authed ? json(200, { login: 'david' }) : json(401, { message: 'no' });
@@ -57,7 +71,12 @@ const fake = createServer((req, res) => {
       if (req.method === 'PATCH') { if (body.body !== undefined) i.body = body.body; if (body.assignees) i.assignees = body.assignees.map((login) => ({ login })); }
       return json(200, withUrl(i));
     }
-    if ((m = /^\/repos\/o\/r\/issues\/(\d+)\/comments$/.exec(path))) return json(201, { id: 1, body: body.body });
+    if ((m = /^\/repos\/o\/r\/issues\/(\d+)\/comments$/.exec(path))) {
+      if (req.method === 'GET') return json(200, comments.filter((c) => c.issue === +m[1]));
+      const c = { id: comments.length + 1, issue: +m[1], body: body.body, user: { login: 'david' }, created_at: new Date().toISOString() };
+      comments.push(c);
+      return json(201, c);
+    }
     if ((m = /^\/repos\/o\/r\/issues\/(\d+)\/labels$/.exec(path))) return json(200, body.labels.map((id) => labels.find((l) => l.id === id)));
     if ((m = /^\/repos\/o\/r\/issues\/(\d+)\/assets$/.exec(path))) {
       assert.match(ct, /^multipart\/form-data/);
@@ -66,10 +85,13 @@ const fake = createServer((req, res) => {
     }
     if (path === '/repos/o/r/labels' && req.method === 'GET') return json(200, labels);
     if (path === '/repos/o/r/labels') { const l = { id: nextLabel++, name: body.name }; labels.push(l); return json(201, l); }
+    if (path === '/repos/o/r/pulls' && req.method === 'GET') return json(200, pulls);
     if (path === '/repos/o/r/pulls' && req.method === 'POST') {
       if (body.head === 'unpushed') return json(422, { message: 'head branch does not exist' });
       const n = nextPr++;
-      return json(201, { number: n, html_url: `http://forge/o/r/pulls/${n}` });
+      const pr = { number: n, html_url: `http://forge/o/r/pulls/${n}`, state: 'open', head: { ref: body.head } };
+      pulls.push(pr);
+      return json(201, pr);
     }
     if ((m = /^\/repos\/o\/r\/pulls\/(\d+)$/.exec(path))) return json(200, { number: +m[1], state: 'closed', merged: true });
     json(404, { message: `fake has no ${req.method} ${path}` });
@@ -80,11 +102,17 @@ const hang = createServer(() => {});
 const listen = (s) => new Promise((r) => s.listen(0, '127.0.0.1', () => r(s.address().port)));
 const [livePort, hangPort] = [await listen(fake), await listen(hang)];
 const LIVE = `http://127.0.0.1:${livePort}`, HANG = `http://127.0.0.1:${hangPort}`;
+// A port nothing listens on: connection refused, so nothing was sent.
+const closed = createServer();
+const refusedPort = await listen(closed);
+await new Promise((r) => closed.close(r));
+const REFUSED = `http://127.0.0.1:${refusedPort}`;
 
 // ---- bundle forge.ts with electron, employees and pty stubbed ----
 const ipc = new Map();
 const opened = [];
 const assigned = [];
+const told = [];
 globalThis.__stub = {
   electron: {
     app: { whenReady: () => new Promise(() => {}), getPath: () => tmp },
@@ -94,13 +122,15 @@ globalThis.__stub = {
   },
   employees: {
     assignIssue: async (o) => { assigned.push(o); return { id: 'e1', projectId: o.projectId, name: 'engineer-1', branch: 'myide/engineer-1', issue: o.issue }; },
+    tell: (id, text) => told.push({ id, text }),
   },
   pty: { spawnEnv: async () => ({ ...process.env }) },
 };
 const stubs = { electron: 'electron', './employees': 'employees', './pty': 'pty' };
 const out = join(tmp, 'forge.cjs');
 await build({
-  entryPoints: ['src/main/forge.ts'], bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
+  // forge.ts plus mcp.ts's startMcp, so the issue script can be run against the real /issue endpoint.
+  stdin: { contents: "export * from './src/main/forge.ts'; export { startMcp } from './src/main/mcp.ts';", resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
   plugins: [{
     name: 'stubs',
     setup(b) {
@@ -115,6 +145,10 @@ const forge = createRequire(import.meta.url)(out);
 const projects = [
   { id: 'p1', name: 'Relay', path: tmp, colour: '#3cd2da', forge: { provider: 'forgejo', repo: 'o/r', urls: [HANG, LIVE] } },
   { id: 'gh', name: 'MyIDE', path: tmp, colour: '#ff7eb6', forge: { provider: 'github', repo: 'gooch12013/MyIDE', urls: [] } },
+  // Same fake forge behind other URL lists, and as a GitHub (Enterprise-style) host for the pacing check.
+  { id: 'p3', name: 'Refused', path: tmp, colour: '#ffb21a', forge: { provider: 'forgejo', repo: 'o/r', urls: [REFUSED, LIVE] } },
+  { id: 'p4', name: 'Hanging', path: tmp, colour: '#ffb21a', forge: { provider: 'forgejo', repo: 'o/r', urls: [HANG, LIVE] } },
+  { id: 'ghf', name: 'Ghe', path: tmp, colour: '#ffb21a', forge: { provider: 'github', repo: 'o/r', urls: [LIVE] } },
 ];
 mkdirSync(home, { recursive: true });
 writeFileSync(join(home, 'config.json'), JSON.stringify({ projects }));
@@ -133,6 +167,21 @@ try {
   assert.throws(() => forge.cleanLink({ provider: 'gitlab', repo: 'a/b' }), /GitHub or Forgejo/);
   assert.throws(() => forge.cleanLink({ provider: 'forgejo', repo: 'a/b', urls: [] }), /at least one URL/);
   assert.throws(() => forge.cleanLink({ provider: 'forgejo', repo: 'a/b', urls: ['file:///etc'] }), /not an http/);
+  // Plain http only to this Mac or a private address.
+  assert.throws(() => forge.cleanLink({ provider: 'forgejo', repo: 'a/b', urls: ['http://forge.example.com'] }), /use https/);
+  assert.throws(() => forge.cleanLink({ provider: 'forgejo', repo: 'a/b', urls: ['http://172.32.0.1:3000'] }), /use https/);
+  for (const u of ['http://127.0.0.1:3000', 'http://localhost', 'http://10.1.2.3', 'http://172.16.0.9', 'http://192.168.1.5:3000', 'https://forge.example.com']) {
+    assert.equal(forge.cleanLink({ provider: 'forgejo', repo: 'a/b', urls: [u] }).urls[0], u);
+  }
+  // GitHub tokens are keyed by URL host: api.github.com is github.com, an Enterprise host its own.
+  assert.equal(forge.tokenHost({ provider: 'github', repo: 'a/b', urls: [] }), 'github.com');
+  assert.equal(forge.tokenHost({ provider: 'github', repo: 'a/b', urls: ['https://ghe.corp.example/api/v3'] }), 'ghe.corp.example');
+  // Pacing: at least 1 s apart, fewer than 80 a minute and 500 an hour.
+  assert.equal(forge.ghPace([], 10_000), 0);
+  assert.equal(forge.ghPace([9_500], 10_000), 500);
+  assert.equal(forge.ghPace(Array.from({ length: 78 }, (_, i) => 1_000_000 - 59_000 + i * 700), 1_000_000), 0);
+  assert.equal(forge.ghPace(Array.from({ length: 79 }, (_, i) => 1_000_000 - 59_000 + i * 700), 1_000_000), -1);
+  assert.equal(forge.ghPace(Array.from({ length: 499 }, (_, i) => 10_000_000 - 3_500_000 + i * 7000), 10_000_000), -1);
   assert.deepEqual(forge.cleanLink({ provider: 'github', repo: ' a/b.git ', urls: [] }), { provider: 'github', repo: 'a/b', urls: [] });
 
   // URL fallback: the first URL never answers, so the 5 s timeout moves on and the live one is remembered.
@@ -147,11 +196,18 @@ try {
   await call('forge:refresh', 'p1', true);
   assert.ok(Date.now() - t < 1000, 'the remembered URL goes first');
 
-  // No token: writes are refused with a pointer to Preferences, and nothing reaches the forge.
+  // No token: the write waits in the outbox with a pointer to Preferences, and nothing reaches the forge.
   const emp = { id: 'e1', projectId: 'p1', name: 'engineer-1', branch: 'myide/engineer-1', issue: { provider: 'forgejo', repo: 'o/r', number: 1, title: 'Sync teardown', url: '' } };
-  await assert.rejects(forge.forgeAction(emp, 'comment', { body: 'hi' }), /No Forgejo token.*Preferences > Forges/);
+  assert.match(await forge.forgeAction(emp, 'comment', { body: 'hi' }), /^Queued: comment #1: No Forgejo token.*Preferences > Forges/);
   assert.equal(log.length, 0);
+  assert.equal(cache().outbox.length, 1);
+  assert.match((await call('forge:issues', 'p1'))[0].blocked, /No Forgejo token/);
   await call('forge:set-token', 'forgejo', `127.0.0.1:${hangPort}`, 'fj-token-123');
+  await call('forge:refresh', 'p1', true);
+  assert.deepEqual(log.map((l) => l.body.body), ['hi'], 'the queued write went out once a token was there');
+  assert.equal(cache().outbox.length, 0);
+  assert.equal(cache().blocked, undefined);
+  log.length = 0;
   assert.equal((await call('forge:tokens')).rows.find((r) => r.provider === 'forgejo').has, true);
   assert.equal(await call('forge:test', 'forgejo', `127.0.0.1:${hangPort}`), 'Connected as david.');
 
@@ -224,6 +280,22 @@ try {
   // Quick-add: project by name, case-insensitive, same path.
   assert.deepEqual(await forge.quickAddIssue('relay', 'From the shell'), { number: 12, url: 'http://forge/o/r/issues/12' });
   await assert.rejects(forge.quickAddIssue('nope', 'x'), /No project named nope/);
+  // The issue script: the endpoint token goes in the request body (never argv), the reply is plain text.
+  await forge.startMcp();
+  const issueSh = (...a) => new Promise((resolve) => execFile(join(home, 'bin', 'issue'), a, { env: { ...process.env, MYIDE_HOME: home } },
+    (err, stdout, stderr) => resolve({ code: err?.code ?? 0, stdout, stderr })));
+  const scriptText = readFileSync(join(home, 'bin', 'issue'), 'utf8');
+  assert.doesNotMatch(scriptText, /Authorization|token=\$|\$token/, 'no token on a command line');
+  let sh = await issueSh('Relay', 'From the "script" $HOME');
+  assert.equal(sh.code, 0, sh.stderr);
+  assert.match(sh.stdout, /^#13 http:\/\/forge\/o\/r\/issues\/13\n$/);
+  assert.equal(issues.get(13).title, 'From the "script" $HOME');
+  sh = await issueSh('nope', 'x');
+  assert.equal(sh.code, 1);
+  assert.match(sh.stderr, /No project named nope/);
+  const ep = JSON.parse(readFileSync(join(home, 'issue-endpoint.json'), 'utf8'));
+  const bad = await fetch(ep.url, { method: 'POST', headers: { host: new URL(ep.url).host }, body: JSON.stringify({ project: 'Relay', title: 'x', token: 'wrong' }) });
+  assert.equal(bad.status, 401);
 
   // GitHub with images opens the prefilled new-issue page; nothing is posted.
   const gr = await call('forge:create', { projectId: 'gh', title: 'Crash', body: 'Trace\n\nClaude-Session: x', images: [img] });
@@ -238,6 +310,74 @@ try {
     assert.ok(Array.isArray(g.issues));
     console.log(`github: ${g.issues.length} issue(s) on gooch12013/MyIDE`);
   }
+  // ---- writes that may have landed, and which errors stop the outbox ----
+  const at = (projectId) => ({ ...emp, projectId });
+  // A refused connection sent nothing, so the write moves to the next URL.
+  for (const id of ['p3', 'p4', 'ghf']) await call('forge:set-token', id === 'ghf' ? 'github' : 'forgejo', new URL(projects.find((x) => x.id === id).forge.urls[0]).host, 'fj-token-123');
+  log.length = 0;
+  assert.equal(await forge.forgeAction(at('p3'), 'comment', { body: 'via refused' }), 'Commented on #1.');
+  assert.deepEqual(log.map((l) => l.body.body), ['via refused']);
+  // A timeout may have landed: no failover for a write; it waits, marked, and the replay finds nothing so posts it.
+  log.length = 0;
+  t = Date.now();
+  assert.match(await forge.forgeAction(at('p4'), 'comment', { body: 'after a hang' }), /^Queued/);
+  assert.ok(Date.now() - t >= 4900);
+  assert.equal(log.length, 0, 'not sent to the second URL');
+  assert.equal(cache('p4').outbox[0].uncertain, true);
+  await call('forge:refresh', 'p4', true); // the read fails over to the live URL, then the outbox replays there
+  assert.deepEqual(log.map((l) => l.body.body), ['after a hang']);
+  assert.equal(cache('p4').outbox.length, 0);
+  // Landed but the answer came too late: the replay finds it and does not post again.
+  for (const [action, args, check] of [
+    ['comment', { body: 'slow comment' }, () => comments.filter((c) => c.body === 'slow comment').length],
+    ['open_pr', { title: 'Slow PR', body: 'x', head: 'myide/slow' }, () => pulls.filter((p) => p.head.ref === 'myide/slow').length],
+  ]) {
+    slowNext = true;
+    assert.match(await forge.forgeAction(emp, action, args), /^Queued/);
+    assert.equal(cache().outbox[0].uncertain, true);
+    await new Promise((r) => setTimeout(r, 1500)); // the slow answer is still on its way; the write already happened
+    await call('forge:refresh', 'p1', true);
+    assert.equal(cache().outbox.length, 0);
+    assert.equal(check(), 1, `${action} posted once`);
+  }
+  slowNext = true;
+  assert.deepEqual(await call('forge:create', { projectId: 'p1', title: 'Slow issue' }), { number: 0, url: '', queued: true, warning: undefined });
+  await call('forge:refresh', 'p1', true);
+  assert.equal([...issues.values()].filter((i) => i.title === 'Slow issue').length, 1, 'issue filed once');
+  // A 5xx may have landed too: marked, looked up (not there), sent once.
+  failNext = { status: 503, message: 'busy' };
+  assert.match(await forge.forgeAction(emp, 'comment', { body: 'after a 503' }), /^Queued/);
+  assert.equal(cache().outbox[0].uncertain, true);
+  await call('forge:refresh', 'p1', true);
+  assert.equal(comments.filter((c) => c.body === 'after a 503').length, 1);
+  // 401, a 403 rate limit and 429 stop the outbox and keep it; the panel says why.
+  for (const f of [{ status: 401, message: 'bad token' }, { status: 403, message: 'API rate limit exceeded', headers: { 'x-ratelimit-remaining': '0' } }, { status: 429, message: 'slow down' }]) {
+    failNext = f;
+    assert.match(await forge.forgeAction(emp, 'comment', { body: `kept ${f.status}` }), new RegExp(`^Queued: comment #1: .*${f.status}`));
+    assert.equal(cache().outbox.length, 1);
+    assert.match((await call('forge:issues', 'p1'))[0].blocked, new RegExp(String(f.status)));
+    await call('forge:refresh', 'p1', true);
+    assert.equal(cache().outbox.length, 0, 'sent on the next poll');
+    assert.equal(comments.filter((c) => c.body === `kept ${f.status}`).length, 1);
+  }
+  // 404 and 422 drop the write; an employee that already got "Queued" hears about it on its next turn.
+  down = true;
+  await call('forge:refresh', 'p1', true);
+  assert.match(await forge.forgeAction(emp, 'comment', { body: 'gone issue' }), /^Queued/);
+  down = false;
+  failNext = { status: 404, message: 'issue gone' };
+  await call('forge:refresh', 'p1', true);
+  assert.equal(cache().outbox.length, 0);
+  assert.equal(told.length, 1);
+  assert.equal(told[0].id, 'e1');
+  assert.match(told[0].text, /dropped it.*404/);
+  // GitHub writes: one at a time, at least a second apart.
+  log.length = times.length = 0;
+  const gh = { ...emp, projectId: 'ghf' };
+  await Promise.all([1, 2, 3].map((n) => forge.forgeAction(gh, 'comment', { body: `paced ${n}` })));
+  assert.deepEqual(log.map((l) => l.body.body), ['paced 1', 'paced 2', 'paced 3']);
+  for (let i = 1; i < 3; i++) assert.ok(times[i] - times[i - 1] >= 950, `GitHub writes ${times[i] - times[i - 1]} ms apart`);
+
   console.log('forge ok');
 } finally {
   fake.close(); hang.close(); hang.closeAllConnections();

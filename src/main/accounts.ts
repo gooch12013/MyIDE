@@ -5,12 +5,13 @@ import { BrowserWindow, ipcMain } from 'electron';
 import { existsSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import type { Usage } from './org';
 import { readConfig, writeConfig } from './projects';
 import { STATE_DIR, writePrivate } from './store';
 
 export type Provider = 'claude' | 'codex' | 'gemini';
 export type Account = { id: string; name: string; provider: Provider; env: Record<string, string>; cap: number; allowAuto: boolean };
-export type Usage = { fiveHour?: number; sevenDay?: number; resetsAt?: string };
+export type { Usage };
 
 export const DEFAULT_ACCOUNT = 'claude-default';
 // The default Claude login is only found with CLAUDE_CONFIG_DIR unset; even pointing it at ~/.claude reads as logged out (spike L).
@@ -54,7 +55,7 @@ export const usageOf = (accountId: string): Usage | undefined => usage.get(accou
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'account';
 
 /** A second Claude dir starts empty: share roles, skills, commands and CLAUDE.md by symlink, and copy
- *  only enabledPlugins (plugins/ holds install state the CLI writes, so it is never shared). */
+ *  only enabledPlugins and permissions.defaultMode (plugins/ holds install state the CLI writes, so it is never shared). */
 function claudeDir(dir: string): void {
   const home = join(homedir(), '.claude');
   for (const name of ['agents', 'skills', 'commands', 'CLAUDE.md']) {
@@ -62,8 +63,11 @@ function claudeDir(dir: string): void {
   }
   if (existsSync(join(dir, 'settings.json'))) return;
   try {
-    const { enabledPlugins } = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
-    if (enabledPlugins && typeof enabledPlugins === 'object') writePrivate(join(dir, 'settings.json'), JSON.stringify({ enabledPlugins }, null, 2));
+    const { enabledPlugins, permissions } = JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8'));
+    const out: Record<string, unknown> = {};
+    if (enabledPlugins && typeof enabledPlugins === 'object') out.enabledPlugins = enabledPlugins;
+    if (typeof permissions?.defaultMode === 'string') out.permissions = { defaultMode: permissions.defaultMode };
+    if (Object.keys(out).length) writePrivate(join(dir, 'settings.json'), JSON.stringify(out, null, 2));
   } catch { /* no settings to copy */ }
 }
 

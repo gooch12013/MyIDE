@@ -2,6 +2,9 @@ import { execFile } from 'node:child_process';
 
 // Forge tokens live in the macOS login keychain (service myide-github / myide-forgejo, account = host),
 // never in a file. MYIDE_KEYCHAIN names another keychain file (tests use a temp one).
+// No `-T` access list: the only app that reads these items is /usr/bin/security, which an employee's shell can run
+// just as well, so an ACL cannot tell MyIDE from an employee. Employees are kept off it by their deny rules
+// (Bash(security *) for Claude) and the hard-deny list for Codex (acp/client.ts).
 const KC = process.env.MYIDE_KEYCHAIN ? [process.env.MYIDE_KEYCHAIN] : [];
 
 const HOST = /^[a-z0-9.-]+(:\d+)?$/i;

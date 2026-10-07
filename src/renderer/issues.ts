@@ -148,7 +148,8 @@ export async function openNewIssue(projectId?: string): Promise<void> {
   };
 }
 
-function draftCard(s: ForgeSnapshot, d: ForgeSnapshot['drafts'][number]): HTMLElement {
+/** A drafted issue (forge draft_issue), in the Issues panel and in NEEDS YOU: nothing was posted; File strips and posts it. */
+export function draftCard(s: ForgeSnapshot, d: ForgeSnapshot['drafts'][number]): HTMLElement {
   const p = proj(s.projectId);
   const card = h('article', { className: 'need' });
   if (p) card.style.setProperty('--proj', p.colour);
@@ -252,6 +253,8 @@ registerPanel('issues', {
         const dd = h('dd', {}, s.offline ? led('interrupted', 'Unreachable') : s.error ? led('failed', 'Error') : led('working', 'Connected'),
           h('span', { className: 'forge-note', textContent: note }),
           ...(s.outbox ? [h('span', { className: 'forge-note', textContent: `${s.outbox} write-back${s.outbox === 1 ? '' : 's'} waiting to send` })] : []),
+          ...(s.blocked ? [h('span', { className: 'forge-note forge-err', textContent: `Sending paused: ${s.blocked}` }),
+            key('Drop it', () => void api.forge.dropOp(s.projectId), { title: 'Drop the write at the front of the queue and send the rest' })] : []),
           ...(s.lastError ? [h('span', { className: 'forge-note forge-err', textContent: `Not sent: ${s.lastError}` })] : []),
           retry(s));
         const row = h('div', { className: 'forge' }, h('dt', { textContent: `${p?.name ?? '?'} · ${FORGE[s.provider]}` }), dd);

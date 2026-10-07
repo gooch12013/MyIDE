@@ -7,6 +7,7 @@ import { api as staff, led } from './employees';
 import { openCommandTerminal, reloadTerminalSettings } from './terminal';
 import { forgesSection } from './issues';
 import { accountsSection } from './accounts';
+import { componentsSection, voiceSection } from './speech';
 
 const api = window.myide;
 type Info = Awaited<ReturnType<typeof api.prefs.get>>;
@@ -34,18 +35,18 @@ function colourWarning(colour: string, id: string): string {
   return twin.colour.toLowerCase() === colour.toLowerCase() ? `Same colour as ${twin.name}.` : `Hard to tell apart from ${twin.name}.`;
 }
 
-const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['accounts', 'AI accounts'], ['forges', 'Forges'], ['advanced', 'Advanced']] as const;
+const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['accounts', 'AI accounts'], ['forges', 'Forges'], ['voice', 'Voice & read-back'], ['components', 'Optional components'], ['advanced', 'Advanced']] as const;
 type Section = (typeof SECTIONS)[number][0];
 
 registerPanel('preferences', {
   title: 'Preferences',
-  create(el) {
+  create(el, params, panel) {
     el.classList.add('prefs');
     const nav = h('nav', { className: 'prefs-nav' });
     nav.setAttribute('aria-label', 'Preference sections');
     const main = h('div', { className: 'prefs-main' });
     el.append(nav, main);
-    let current: Section = 'appearance';
+    let current: Section = SECTIONS.some(([s]) => s === params.section) ? params.section as Section : 'appearance';
     const navKeys = SECTIONS.map(([id, title]) => key(title, () => void show(id), { className: 'key pnav-key' }));
     nav.append(...navKeys);
 
@@ -197,6 +198,10 @@ registerPanel('preferences', {
 
       accounts: (_info, say) => accountsSection(say, () => void show()),
 
+      voice: (_info, say) => voiceSection(say),
+
+      components: (_info, say) => componentsSection(say),
+
       advanced({ dataDir }, say) {
         return [
           pref('Data folder', 'Projects, preferences and layouts. Set MYIDE_HOME to use another folder.',
@@ -210,6 +215,9 @@ registerPanel('preferences', {
     };
 
     void show();
-    return {};
+    // openComponents() in speech.ts: jump to a section of this open panel.
+    const jump = (e: Event) => { e.preventDefault(); panel.setActive(); void show((e as CustomEvent<Section>).detail); };
+    window.addEventListener('myide:prefs-section', jump);
+    return { dispose: () => window.removeEventListener('myide:prefs-section', jump) };
   },
 });

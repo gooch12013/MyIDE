@@ -51,6 +51,7 @@ export function buildMenu(): void {
           submenu: [
             { label: 'Terminal Only', click: cmd('preset:terminal') },
             { label: 'Terminal + Files', click: cmd('preset:files') },
+            { label: 'Code Review', click: cmd('preset:review') },
             { type: 'separator' },
             ...named.map((n) => ({ label: n, click: cmd(`layout:${n}`) })),
             ...(named.length ? [{ type: 'separator' as const }] : []),

@@ -32,7 +32,7 @@ const control = new Map<string, Tool>();
 const extra = new Map<string, { description: string; inputSchema: object; run(employeeId: string, args: any): Promise<unknown>; show(employeeId: string): boolean }>();
 // POST /issue from ~/.myide/bin/issue; its URL and token are in ~/.myide/issue-endpoint.json.
 const issueToken = randomBytes(24).toString('hex');
-let onIssue: (project: string, title: string) => Promise<unknown> = async () => { throw new Error('forge not available'); };
+let onIssue: (project: string, title: string) => Promise<{ number: number; url: string }> = async () => { throw new Error('forge not available'); };
 let seq = 0;
 
 export function onApproval(cb: (a: Approval) => void): void { onNew = cb; }
@@ -52,7 +52,10 @@ export function registerEmployeeTool(name: string, description: string, schema: 
   extra.set(name, { description, inputSchema: schema, run, show });
 }
 
-export function onIssuePost(fn: (project: string, title: string) => Promise<unknown>): void { onIssue = fn; }
+/** MyIDE's own employee tools by exact name (not `approve`): callers may run them without asking David. */
+export const ownTool = (name: string): boolean => name === 'ask_human' || extra.has(name);
+
+export function onIssuePost(fn: (project: string, title: string) => Promise<{ number: number; url: string }>): void { onIssue = fn; }
 
 /** A NEEDS YOU item no tool call waits on (e.g. a lead hiring above the ceiling); `answer` runs when David decides. */
 export function addApproval(a: Omit<Approval, 'id' | 'createdAt'>, answer: (allow: boolean, message?: string) => void): Approval {
@@ -110,7 +113,9 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
         const plan = tool === 'ExitPlanMode';
         const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool && isDeepStrictEqual(x.input, input));
         // MyIDE's own tools enforce their own caps and approvals; asking David about each assign_task is noise.
-        if (g >= 0 || /^mcp__myide__/.test(tool)) { if (g >= 0) grants.splice(g, 1); return text(JSON.stringify({ behavior: 'allow', updatedInput: input })); }
+        // Exact names only: approve itself, or anything else under mcp__myide__, still asks.
+        const own = tool.startsWith('mcp__myide__') && ownTool(tool.slice('mcp__myide__'.length));
+        if (g >= 0 || own) { if (g >= 0) grants.splice(g, 1); return text(JSON.stringify({ behavior: 'allow', updatedInput: input })); }
         return hold(res, {
           employeeId, tool, input,
           kind: plan ? 'plan' : 'permission',
@@ -162,7 +167,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   // Only the local CLI may call: a browser page sends Origin, and a DNS-rebound one a foreign Host.
   if (req.headers.origin !== undefined || req.headers.host !== `127.0.0.1:${port}`) return reply(res, 403);
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-  if (url.pathname === '/issue') return postIssue(req, res, url);
+  if (url.pathname === '/issue') return postIssue(req, res);
   const id = /^\/mcp\/([^/]+)$/.exec(url.pathname)?.[1];
   let key: string | undefined;
   try { key = id && decodeURIComponent(id); } catch { return reply(res, 400); }
@@ -187,20 +192,22 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   });
 }
 
-/** `issue <project> "title"`: JSON { project, title } in, { number, url } or { error } out. */
-function postIssue(req: IncomingMessage, res: ServerResponse, url: URL): void {
-  const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? null;
-  if (!sameToken(bearer ?? url.searchParams.get('token'), issueToken)) return reply(res, 401);
+/** `issue <project> "title"`: JSON { project, title, token } in (the token in the body, never in argv), plain text out. */
+function postIssue(req: IncomingMessage, res: ServerResponse): void {
   if (req.method !== 'POST') return reply(res, 405);
   let body = '';
   req.on('error', () => {});
   req.on('data', (c) => { body += c; if (body.length > 1e5) req.destroy(); });
   req.on('end', async () => {
-    const send = (status: number, o: object) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(o)); };
+    const send = (status: number, t: string) => { if (!res.headersSent) res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' }).end(t + '\n'); };
     let m: any;
-    try { m = JSON.parse(body); } catch { return send(400, { error: 'Send JSON: {"project": "...", "title": "..."}' }); }
-    if (typeof m?.project !== 'string' || typeof m?.title !== 'string' || !m.title.trim()) return send(400, { error: 'Give a project and a title' });
-    try { send(200, (await onIssue(m.project, m.title.trim())) as object); } catch (e) { send(400, { error: (e as Error).message }); }
+    try { m = JSON.parse(body); } catch { return send(400, 'MyIDE refused the request (restart it if this persists).'); }
+    if (!sameToken(typeof m?.token === 'string' ? m.token : null, issueToken)) return send(401, 'MyIDE refused the request (restart it if this persists).');
+    if (typeof m.project !== 'string' || typeof m.title !== 'string' || !m.title.trim()) return send(400, 'Give a project and a title');
+    try {
+      const r = await onIssue(m.project, m.title.trim());
+      send(200, r.number ? `#${r.number} ${r.url}` : 'Queued: the forge is unreachable; MyIDE files it when it is back.');
+    } catch (e) { send(400, (e as Error).message); }
   });
 }
 

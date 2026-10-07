@@ -1,7 +1,12 @@
-// Checks the org rules in src/main/org.ts: queue order, caps, auto picks, ceiling, layering, roll-up.
+// Checks the org rules in src/main/org.ts: queue order, caps, auto picks, ceiling, roll-up.
 // Usage: node scripts/check-org.mjs
 import assert from 'node:assert/strict';
-import { aboveCeiling, autoPick, layered, pickStarts, rollup, slowedCap } from '../src/main/org.ts';
+import { readFileSync } from 'node:fs';
+import { aboveCeiling, autoPick, pickStarts, rollup, slowedCap } from '../src/main/org.ts';
+
+const table = JSON.parse(readFileSync(new URL('../build/providers.json', import.meta.url), 'utf8'));
+const lists = (p) => [table[p].models.map(([m]) => m), table[p].efforts.map(([e]) => e)];
+const above = (want, ceiling, p = 'claude') => aboveCeiling(want, ceiling, ...lists(p));
 
 const lim = (o = {}) => ({
   global: 3, perProject: 2, account: () => 9, maxReports: () => 2, paused: () => false, priority: () => 0, ...o,
@@ -39,18 +44,32 @@ assert.equal(autoPick('Add a retry to the uploader').model, 'sonnet');
 assert.equal(autoPick('Reformat nothing; replant trees').model, 'sonnet', 'keywords match at a word start only');
 assert.deepEqual(autoPick('tidy', [{ match: ['tidy'], model: 'haiku', effort: 'low' }], 'opus'), { model: 'haiku', effort: 'low' });
 
-// Ceiling.
-assert.equal(aboveCeiling({ model: 'opus' }, { model: 'sonnet' }), true);
-assert.equal(aboveCeiling({ model: 'haiku' }, { model: 'sonnet', effort: 'low' }), false);
-assert.equal(aboveCeiling({ model: 'sonnet', effort: 'high' }, { model: 'sonnet', effort: 'medium' }), true);
-assert.equal(aboveCeiling({ model: 'sonnet', effort: 'low' }, { model: 'sonnet', effort: 'medium' }), false);
-assert.equal(aboveCeiling({ model: 'sonnet', effort: 'max' }, { model: 'sonnet' }), false, 'no effort ceiling set');
-assert.equal(aboveCeiling({ model: 'claude-opus-4-1' }, { model: 'sonnet' }), true);
-assert.equal(aboveCeiling({ model: 'opus' }, undefined), false);
-assert.equal(aboveCeiling({ model: 'gpt-5' }, { model: 'sonnet' }), false, 'unknown names never count as above');
-
-// Layered defaults: role, then project, then employee; blanks do not override.
-assert.deepEqual(layered({ model: 'opus', effort: 'high' }, { model: 'sonnet', effort: '' }, { effort: 'low', model: undefined }), { model: 'sonnet', effort: 'low' });
+// Ceiling: providers.json order, unknown names above, a missing effort is the CLI default (medium).
+assert.equal(above({ model: 'opus' }, { model: 'sonnet' }), true);
+assert.equal(above({ model: 'haiku' }, { model: 'sonnet', effort: 'low' }), false);
+assert.equal(above({ model: 'sonnet', effort: 'high' }, { model: 'sonnet', effort: 'medium' }), true);
+assert.equal(above({ model: 'sonnet', effort: 'low' }, { model: 'sonnet', effort: 'medium' }), false);
+assert.equal(above({ model: 'sonnet', effort: 'max' }, { model: 'sonnet' }), true, 'no ceiling effort = default medium');
+assert.equal(above({ model: 'sonnet', effort: 'medium' }, { model: 'sonnet' }), false);
+assert.equal(above({ model: 'sonnet' }, { model: 'sonnet', effort: 'low' }), true, 'no effort = default medium');
+assert.equal(above({ model: 'sonnet' }, { model: 'sonnet', effort: 'medium' }), false);
+assert.equal(above({ model: 'claude-opus-4-1' }, { model: 'sonnet' }), true);
+assert.equal(above({ model: 'claude-haiku-4-5' }, { model: 'sonnet' }), false, 'a full id ranks as its family');
+assert.equal(above({ model: 'opus' }, undefined), false);
+assert.equal(above({ model: 'gpt-5' }, { model: 'opus' }), true, 'unknown names count as above');
+assert.equal(above({ model: 'sonnet', effort: 'ultra' }, { model: 'sonnet' }), true, 'unknown effort counts as above');
+assert.equal(above({ model: 'haiku' }, { model: 'gpt-6-sol' }), true, 'a ceiling the provider does not know: above');
+// Codex: providers.json order, strongest first.
+assert.equal(above({ model: 'gpt-6-luna' }, { model: 'gpt-6-sol' }, 'codex'), false);
+assert.equal(above({ model: 'gpt-6-astra' }, { model: 'gpt-6-sol' }, 'codex'), true);
+assert.equal(above({ model: 'gpt-5.6-terra' }, { model: 'gpt-6-luna' }, 'codex'), false);
+assert.equal(above({ model: 'gpt-6-sol' }, { model: 'gpt-5.6-sol' }, 'codex'), true);
+assert.equal(above({ model: 'gpt-6-luna', effort: 'high' }, { model: 'gpt-6-luna', effort: 'low' }, 'codex'), true);
+// Effective ceiling = the lower of the project ceiling and the lead's model: both must hold.
+const effective = (want, project, lead) => above(want, project) || above(want, lead);
+assert.equal(effective({ model: 'sonnet' }, { model: 'opus' }, { model: 'haiku' }), true, 'lead lower than project');
+assert.equal(effective({ model: 'sonnet' }, { model: 'haiku' }, { model: 'opus' }), true, 'project lower than lead');
+assert.equal(effective({ model: 'haiku' }, { model: 'sonnet' }, { model: 'opus' }), false);
 
 // Roll-up over a lead's subtree.
 const all = [

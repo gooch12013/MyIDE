@@ -7,14 +7,15 @@ import { installHooks } from './attribution';
 import type { ClaudeEvent, TaskState } from './claude/parse';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
 import { account, claudeConfigDir, listAccounts, usageOf } from './accounts';
-import { runTurnFor, talkCommandFor } from './transports';
+import { forgeAction } from './forge';
+import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
-import { addApproval, employeeMcpConfig, onApproval, onApprovalGone, onIssuePost, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
-import { aboveCeiling, autoPick, layered, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
+import { addApproval, employeeMcpConfig, onApproval, onApprovalGone, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
+import { aboveCeiling, autoPick, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
 import { listProjects, readConfig, writeConfig } from './projects';
 import { onPtyExit } from './pty';
 import { lockDown, readJSON, STATE_DIR, writeJSON, writePrivate } from './store';
-import { addWorktree, branchExists, checkRepo, removeWorktree } from './worktree';
+import { addWorktree, branchExists, checkRepo, git, removeWorktree } from './worktree';
 
 export type EmployeeState = 'idle' | 'queued' | 'working' | 'needs-you' | 'done' | 'failed' | 'interrupted' | 'talking';
 export type { Mode, Pick, Usage };
@@ -30,7 +31,7 @@ export interface Employee {
   /** A model above the ceiling, waiting on David's approval; the next turn waits with it. */
   held?: Pick;
 }
-export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; source: 'user' | 'project' }
+export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; source: 'user' | 'project' }
 /** Per-project org settings, kept in that project's state.json. Priority and pause live in config.json projects[]. */
 export interface ProjectOrg { model?: string; effort?: string; mode?: Mode; ceiling?: Pick; maxDepth?: number }
 type Issue = NonNullable<Employee['issue']>;
@@ -39,12 +40,15 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // paused: David interrupted, so pending turns wait for his next send or talk.
 // ended: the state the last turn ended in, shown again once a late approval is answered.
 // heldFor: the ceiling and who asked, so the approval can be raised again after a restart.
-interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: string[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string } }
+// wakeups: turns a lead ran on its reports' results since David last spoke to it (runaway bound).
+interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: string[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number }
 
 const HOOKS = join(STATE_DIR, 'hooks');
 const NO_ATTRIBUTION = 'No AI attribution anywhere: no Co-Authored-By trailer, no "Generated with Claude Code" line and no Claude-Session line in commits, pull requests, issues or comments. Everything goes out as the user.';
 const CONTINUE = 'Continue where you left off.';
 const DEFAULT_MODEL = 'sonnet';
+// A lead that has run this many turns on its reports' results without David saying anything is paused.
+const MAX_WAKEUPS = 20;
 
 const emps = new Map<string, Emp>();
 const orgs = new Map<string, ProjectOrg>();
@@ -62,7 +66,7 @@ const settingsFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'settings
 const mcpFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'mcp', `${e.id}.json`);
 const talkPromptFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'talk', `${e.id}.md`);
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'employee';
-const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, ...e }: Emp): Employee => e;
+const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, ...e }: Emp): Employee => e;
 const put = (file: string, data: object) => writePrivate(file, JSON.stringify(data, null, 2));
 const broadcast = (channel: string, ...args: unknown[]) => {
   for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
@@ -117,9 +121,10 @@ function parseRole(file: string, source: Role['source']): (Role & { file: string
   if (!f.name) return null;
   const model = f.model && f.model !== 'inherit' ? f.model : undefined;
   const mode = ['pinned', 'manager', 'auto'].includes(f['myide-mode']) ? f['myide-mode'] as Mode : undefined;
+  const maxTurns = Number(f['myide-max-turns']);
   return {
     name: f.name, description: f.description ?? '', model, effort: f.effort || undefined, mode, account: f['myide-account'] || undefined,
-    shared: f['myide-shared'] === 'true' || undefined, source, file,
+    shared: f['myide-shared'] === 'true' || undefined, maxTurns: Number.isInteger(maxTurns) && maxTurns > 0 ? maxTurns : undefined, source, file,
   };
 }
 
@@ -150,15 +155,16 @@ function systemPrompt(e: Emp): string {
 // ---- turns and the queue ----
 
 type OrgConfig = {
-  caps?: { global?: number; perProject?: number; maxReports?: number; maxDepth?: number };
+  caps?: { global?: number; perProject?: number; maxReports?: number; maxDepth?: number; maxLive?: number };
   auto?: { rules?: AutoRule[]; fallback?: string };
   projects?: { id: string; priority?: number; paused?: boolean }[];
 };
 const orgConfig = (): OrgConfig => readConfig() as OrgConfig;
 
-function caps(): { global: number; perProject: number; maxReports: number; maxDepth: number } {
+// maxLive: reports a lead may keep hired (unfired) at once; more hires wait for David.
+function caps(): { global: number; perProject: number; maxReports: number; maxDepth: number; maxLive: number } {
   const c = orgConfig().caps;
-  return { global: c?.global ?? 3, perProject: c?.perProject ?? 2, maxReports: c?.maxReports ?? 3, maxDepth: c?.maxDepth ?? 3 };
+  return { global: c?.global ?? 3, perProject: c?.perProject ?? 2, maxReports: c?.maxReports ?? 3, maxDepth: c?.maxDepth ?? 3, maxLive: c?.maxLive ?? 6 };
 }
 const projectConf = (id: string) => orgConfig().projects?.find((p) => p.id === id);
 const org = (projectId: string): ProjectOrg => orgs.get(projectId) ?? {};
@@ -210,8 +216,10 @@ function start(e: Emp): void {
   try {
     put(settingsFile(e), employeeSettings());
     put(mcpFile(e), employeeMcpConfig(e.id)); // rewritten each turn: the server's port changes per launch
+    let maxTurns: number | undefined;
+    try { maxTurns = e.roleFile ? parseRole(e.roleFile, 'user')?.maxTurns : undefined; } catch { /* role file gone */ }
     turn = runTurnFor(e, {
-      cwd: e.worktree, prompt, sessionId: e.sessionId, model: e.model, effort: e.effort,
+      cwd: e.worktree, prompt, sessionId: e.sessionId, model: e.model, effort: e.effort, maxTurns,
       settingsPath: settingsFile(e), mcpConfigPath: mcpFile(e), appendSystemPrompt: systemPrompt(e), prevTasks: e.tasks, onEvent,
     });
   } catch (err) {
@@ -246,6 +254,7 @@ function finish(e: Emp, r: Result): void {
   else if (r.interrupted) e.state = 'interrupted';
   else if (r.ok) e.state = e.pending.length ? 'queued' : 'done';
   else { e.state = 'failed'; e.error = r.text || 'The turn failed.'; }
+  if (e.state === 'queued' && e.paused) e.state = 'interrupted'; // its waiting turns wait for David (runaway pause)
   // The CLI gave up waiting (approve answered deny), but David still has to answer it.
   if (e.state !== 'talking' && pendingApprovals().some((a) => a.employeeId === e.id && a.timedOut)) {
     e.ended = e.state;
@@ -256,22 +265,39 @@ function finish(e: Emp, r: Result): void {
   // Interrupts MyIDE asked for are not news; one that came from an error is. Nothing is news at quit.
   if (w === 'quit') return;
   const ended = e.state === 'done' || e.state === 'failed';
-  if (ended && !w && reportBack(e)) {
+  // A turn that ran to its end reports back even if MyIDE asked to interrupt it just too late.
+  if (ended && !r.interrupted && reportBack(e)) {
     // Its lead hears about it, not David. A contractor goes back to the pool once it has reported.
-    if (e.contractor && e.state === 'done') void fire(e.id, { removeWorktree: true }).catch((err) => console.error('contractor fire', err));
+    if (e.contractor && e.state === 'done') void releaseContractor(e);
   } else if (ended || (e.state === 'interrupted' && !w)) notify(e);
   schedule();
 }
 
-/** Pushes a report's final message into its lead's session as the lead's next turn. False if it has no lead. */
+/** Pushes a report's final message into its lead's session as the lead's next turn. False if it has no lead.
+ *  After MAX_WAKEUPS of these without David's input the lead is paused until he sends it something. */
 function reportBack(e: Emp): boolean {
   const lead = e.parentId ? emps.get(e.parentId) : undefined;
   if (!lead) return false;
   const body = e.state === 'failed' ? `failed: ${e.error ?? 'no detail'}` : `finished: ${e.lastText ?? '(no final message)'}`;
-  lead.pending.push(`Report ${e.name} (id ${e.id}, branch ${e.branch}${e.contractor ? ', contractor, now released' : ''}) ${body}`);
+  lead.pending.push(`Report ${e.name} (id ${e.id}, branch ${e.branch}${e.contractor ? ', contractor' : ''}) ${body}`);
   lead.queuedAt ??= Date.now();
+  lead.wakeups = (lead.wakeups ?? 0) + 1;
+  if (lead.wakeups > MAX_WAKEUPS && !lead.paused) {
+    lead.paused = true;
+    lead.error = `Paused after ${MAX_WAKEUPS} report wake-ups without you. Send it a message to continue.`;
+    if (!turns.has(lead.id)) { lead.state = 'interrupted'; emit(lead); }
+    notify(lead, `Paused after ${MAX_WAKEUPS} report wake-ups without you. Send it a message to continue.`);
+  }
   save(lead.projectId);
   return true;
+}
+
+/** A contractor that reported goes back to the pool, unless its worktree holds uncommitted work: then it stays and David hears. */
+async function releaseContractor(e: Emp): Promise<void> {
+  try {
+    if (await git(e.worktree, 'status', '--porcelain')) return notify(e, `${e.name} finished with uncommitted changes in its worktree, so it was kept. Fire it once the work is saved.`);
+    await fire(e.id, { removeWorktree: true });
+  } catch (err) { console.error('contractor fire', err); }
 }
 
 function employeeSettings(): object {
@@ -281,8 +307,14 @@ function employeeSettings(): object {
       deny: [
         // Forge access goes through MyIDE's forge tool only.
         'Bash(gh *)', 'Bash(env gh *)', 'Bash(command gh *)', 'Bash(*/gh *)', 'Bash(tea *)', 'Bash(curl *api.github.com*)',
+        'Bash(* gh *)', 'Bash(bash -c *gh *)', 'Bash(sh -c *gh *)', 'Bash(* tea *)', 'Bash(bash -c *tea *)', 'Bash(sh -c *tea *)',
         // The commit-msg hook strips attribution; skipping hooks would skip that.
         'Bash(git commit --no-verify*)', 'Bash(git commit *--no-verify*)', 'Bash(git commit -n*)', 'Bash(git commit * -n*)',
+        'Bash(git * --no-verify*)', 'Bash(git -c *)',
+        // The keychain (forge tokens) and MyIDE's own state: the issue endpoint token, configs, other employees' settings.
+        // Worktrees live under STATE_DIR too, so the denies name what is not a worktree rather than all of it.
+        'Bash(security *)', 'Bash(*myide/bin/issue*)', 'Bash(*issue-endpoint*)',
+        ...['*.json', '*.md', 'projects/**', 'accounts/**', 'bin/**', 'hooks/**'].flatMap((g) => ['Read', 'Edit', 'Write'].map((t) => `${t}(/${join(STATE_DIR, g)})`)),
       ],
     },
   };
@@ -329,6 +361,17 @@ function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>): void {
   e.pending.push(text);
   e.queuedAt ??= Date.now();
   e.paused = false;
+  if (!by) e.wakeups = 0; // David spoke to it
+  save(e.projectId);
+  schedule();
+}
+
+/** A note for an employee's next turn from MyIDE itself (a dropped forge write, David's answer on an extra hire). */
+export function tell(id: string, text: string): void {
+  const e = emps.get(id);
+  if (!e) return;
+  e.pending.push(text);
+  e.queuedAt ??= Date.now();
   save(e.projectId);
   schedule();
 }
@@ -353,8 +396,11 @@ function autoFor(task: string, e: Pick): Pick {
 /** Sets e's model and effort, unless a lead or auto mode picked something above the ceiling: then David approves first
  *  (NEEDS YOU) and e's turns wait. Deny runs at the ceiling. David's own picks never need approval. */
 function choose(e: Emp, want: Pick, by?: Emp): void {
-  const ceiling = org(e.projectId).ceiling ?? (by ? { model: by.model, effort: by.effort } : undefined);
-  if ((by || e.mode === 'auto') && ceiling && aboveCeiling(want, ceiling)) return hold(e, want, ceiling, by?.name ?? 'Auto mode');
+  // The effective ceiling is the lower of the project's and the lead's own model: whichever `want` goes above.
+  const p = providers()[e.provider] ?? providers().claude;
+  const lists = [p.models.map(([m]) => m), p.efforts.map(([x]) => x)] as const;
+  const ceiling = [org(e.projectId).ceiling, by && { model: by.model, effort: by.effort }].find((c) => c && aboveCeiling(want, c, ...lists));
+  if ((by || e.mode === 'auto') && ceiling) return hold(e, want, ceiling, by?.name ?? 'Auto mode');
   e.model = want.model;
   if (want.effort !== undefined) e.effort = want.effort || undefined;
 }
@@ -364,7 +410,7 @@ function hold(e: Emp, want: Pick, ceiling: Pick, by: string): void {
   e.heldFor = { ceiling, by };
   addApproval({
     employeeId: e.id, tool: 'model', input: { model: want.model, effort: want.effort, ceiling }, kind: 'permission',
-    text: `${by} wants ${e.name} on ${fmt(want)}, above this project's ceiling of ${fmt(ceiling)}. Deny runs it at the ceiling.`,
+    text: `${by} wants ${e.name} on ${fmt(want)}, above its ceiling of ${fmt(ceiling)}. Deny runs it at the ceiling.`,
   }, (allow) => {
     if (emps.get(e.id) !== e) return; // fired meanwhile
     const use = allow ? want : ceiling;
@@ -406,21 +452,22 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   const name = `${base}-${n}`;
   const worktree = join(STATE_DIR, 'worktrees', o.projectId, name);
   await addWorktree(project.path, worktree, `myide/${name}`, HOOKS, by?.branch); // a report starts from its lead's branch
+  // Defaults layer: what this hire asked for, then the project's override, then the role's frontmatter.
   const po = org(o.projectId);
-  const asked = { model: o.model, effort: o.effort, mode: o.mode ?? (by && (o.model || o.effort) ? 'manager' as Mode : undefined), accountId: o.accountId };
-  const l = layered<{ model: string; effort: string; mode: Mode; accountId: string }>(
-    { model: role.model, effort: role.effort, mode: role.mode, accountId: role.account }, { model: po.model, effort: po.effort, mode: po.mode }, asked);
-  const accountId = l.accountId ?? 'claude-default';
+  const mode = o.mode || (by && (o.model || o.effort) ? 'manager' : undefined) || po.mode || role.mode;
+  let accountId = o.accountId || role.account || 'claude-default';
+  // A lead's hire may only land on an account that allows automatic use; otherwise it shares the lead's.
+  if (by && !account(accountId)?.allowAuto) accountId = by.accountId;
   const provider = account(accountId)?.provider ?? o.provider ?? 'claude';
   const e: Emp = {
     id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: `myide/${name}`,
     model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
     depth, parentId: by?.id, lead: !!o.lead || undefined, maxReports: o.lead ? o.maxReports : undefined, contractor: role.shared,
-    mode: l.mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
+    mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
   };
   emps.set(e.id, e);
   // The layered pick is the starting point; auto re-picks from the task. Whatever a lead or auto picks meets the ceiling.
-  const first = { model: l.model ?? DEFAULT_MODEL, effort: l.effort };
+  const first = { model: o.model || po.model || role.model || DEFAULT_MODEL, effort: o.effort || po.effort || role.effort || undefined };
   e.model = first.model;
   e.effort = first.effort;
   if (e.mode === 'auto') choose(e, autoFor(e.task!, first), by);
@@ -448,6 +495,7 @@ async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: 
   await interrupt(id, 'talk');
   e.state = 'talking';
   e.paused = false;
+  e.wakeups = 0;
   emit(e);
   put(settingsFile(e), employeeSettings());
   writePrivate(talkPromptFile(e), systemPrompt(e));
@@ -480,9 +528,6 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
 }
 
 // ---- org: leads, reports, issues, projects ----
-
-// forge.ts imports this module back, so it is loaded on first use, not at startup.
-function forgeMod(): typeof import('./forge') | null { try { return require('./forge'); } catch { return null; } }
 
 const TRIAGE = 'How to read the issue: its title, every comment and its linked PRs together are the issue, and the title alone can be the whole spec. '
   + 'Verify the behaviour it names against the code. Never judge it, close it or call it stale or done by its body. '
@@ -540,7 +585,21 @@ function registerOrgTools(): void {
         && !r.held && (r.state === 'done' || r.state === 'idle'));
       let id: string;
       if (idle) { send(idle.id, a.task.trim(), by, pick); id = idle.id; }
-      else id = (await hire({ projectId: by.projectId, role: a.role, task: a.task.trim(), ...pick, lead: !!a.lead }, by)).id;
+      else {
+        const o = { projectId: by.projectId, role: a.role, task: a.task.trim(), ...pick, lead: !!a.lead };
+        const live = [...emps.values()].filter((r) => r.parentId === by.id).length;
+        if (live >= caps().maxLive) {
+          addApproval({ employeeId: by.id, tool: 'hire', input: o, kind: 'permission',
+            text: `${by.name} already has ${live} reports and wants another ${a.role}: ${o.task.slice(0, 300)}` }, (allow) => {
+            if (emps.get(by.id) !== by) return;
+            if (!allow) return tell(by.id, `David declined the extra ${a.role} hire. Fire a finished report or do the task yourself.`);
+            hire(o, by).then((r) => tell(by.id, `David approved the extra hire: ${r.name} (id ${r.id}) is on it.`),
+              (err) => tell(by.id, `The approved hire failed: ${(err as Error).message}`));
+          });
+          return `You already have ${live} reports (the limit is ${caps().maxLive}), so this hire waits for David's approval. You hear back as a turn; fire finished reports to make room.`;
+        }
+        id = (await hire(o, by)).id;
+      }
       const r = get(id);
       const how = r.held ? `waiting for David to approve ${fmt(r.held)}, above the ceiling`
         : r.state === 'queued' ? 'queued: a cap is full (your max reports, the project, or the account); it starts when a slot frees'
@@ -563,16 +622,7 @@ function registerOrgTools(): void {
     })), isLead);
   registerEmployeeTool('forge', 'Write to the issue you hold: comment, open_pr (put "Closes #N" in the body), set_labels, draft_issue (David files it). There is no close.',
     { type: 'object', properties: { action: { type: 'string', enum: ['comment', 'open_pr', 'set_labels', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
-    async (employeeId, a) => {
-      const f = forgeMod();
-      if (!f) return 'forge not available';
-      return f.forgeAction(view(get(employeeId)), a?.action, a?.args ?? {});
-    }, (id) => !!emps.get(id)?.issue);
-  onIssuePost(async (project, title) => {
-    const f = forgeMod();
-    if (!f) throw new Error('forge not available');
-    return f.quickAddIssue(project, title);
-  });
+    async (employeeId, a) => forgeAction(view(get(employeeId)), a?.action, a?.args ?? {}), (id) => !!emps.get(id)?.issue);
 }
 
 type ProjectPatch = { [K in keyof ProjectOrg]?: ProjectOrg[K] | null } & { priority?: number; paused?: boolean };

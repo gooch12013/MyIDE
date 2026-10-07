@@ -4,7 +4,8 @@ import { activeProject, allProjects } from './projects';
 import { openPanel, registerPanel } from './registry';
 import type { DockviewPanelApi } from 'dockview-core';
 import type { Employee, EmployeeState } from '../main/employees';
-import { rollup, SLOW_AT } from '../main/org';
+import { rollup, SLOW_AT, type Usage } from '../main/org';
+import { draftCard } from './issues';
 import type { OrgState } from '../preload/preload';
 import { fmtPick, MODE_TEXT } from './hire';
 
@@ -28,7 +29,7 @@ export const cap = (s?: string): string => (s ? s[0].toUpperCase() + s.slice(1) 
 export const hasEffort = (model: string): boolean => !/haiku/i.test(model);
 export function chip(e: Pick<Employee, 'model' | 'effort'> & { provider?: string; mode?: Employee['mode'] }): HTMLSpanElement {
   const c = h('span', { className: 'chip', title: 'Model · effort' }, h('span', { className: 'chip-model', textContent: cap(e.model) }));
-  if (e.provider && e.provider !== 'claude') c.append(h('span', { className: 'chip-ai', textContent: e.provider === 'codex' ? 'Codex' : e.provider })); // the AI, so the bill is visible
+  if (e.provider && e.provider !== 'claude') c.append(h('span', { className: 'chip-ai', textContent: cap(e.provider) })); // the AI, so the bill is visible
   if (e.effort && hasEffort(e.model)) c.append(h('span', { className: 'chip-effort', textContent: e.effort === 'xhigh' ? 'XHigh' : cap(e.effort) }));
   // Manager picks and auto show which mode chose the model.
   if (e.mode && e.mode !== 'pinned') c.append(h('span', { className: 'chip-mode', textContent: e.mode === 'auto' ? 'Auto' : 'Mgr', title: MODE_TEXT[e.mode] }));
@@ -108,27 +109,6 @@ function needCard(a: Approval, who: string, colour: string | undefined): HTMLEle
 }
 
 /** One tree row. A lead's cue column is its roll-up; `tag` is 'summary' when it heads a branch. */
-/** A drafted issue (forge draft_issue): nothing was posted; File strips and posts it, Discard drops it. */
-function draftCard(d: { id: string; projectId: string; employeeName: string; title: string; body: string }, p?: { name: string; colour: string }): HTMLElement {
-  const who = `${p?.name ?? '?'} / ${d.employeeName}`;
-  const card = h('article', { className: 'need' });
-  if (p) card.style.setProperty('--proj', p.colour);
-  card.setAttribute('aria-label', `Drafted issue: ${who}`);
-  const busy = (fn: () => Promise<unknown>) => async () => {
-    const all = card.querySelectorAll('button');
-    all.forEach((b) => (b.disabled = true));
-    try { await fn(); } catch { all.forEach((b) => (b.disabled = false)); }
-  };
-  card.append(
-    h('div', { className: 'need-head' }, led('needs-you', 'Drafted issue'), h('span', { className: 'need-who', textContent: who })),
-    h('p', { className: 'need-why', textContent: d.title }),
-    ...(d.body ? [h('pre', { className: 'need-plan', textContent: d.body })] : []),
-    h('div', { className: 'need-keys' },
-      key('File', busy(() => api.forge.fileDraft(d.projectId, d.id)), { className: 'key key--sm key--lit' }),
-      key('Discard', busy(() => api.forge.discardDraft(d.projectId, d.id)))));
-  return card;
-}
-
 function row(e: Employee, everyone: Employee[], tag: 'div' | 'summary' = 'div', maxReports = 3): HTMLElement {
   const r = h(tag, { className: `o-row${e.contractor ? ' is-contractor' : ''}` });
   r.dataset.state = e.state;
@@ -179,20 +159,25 @@ function tree(list: Employee[], closed: Set<string>, maxReports: number): HTMLEl
 }
 
 const pct = (f?: number) => Math.round((f ?? 0) * 100);
-type Usage = { fiveHour?: number; sevenDay?: number; resetsAt?: string };
+
+/** The one segmented meter (usage and slots): `v` is 0 to 100; `now` of `max` is what a screen reader hears. */
+export function meterBar(v: number, label: string, o: { now?: number; max?: number; segs?: number; cls?: string } = {}): HTMLSpanElement {
+  const bar = h('span', { className: `meter${o.cls ? ` ${o.cls}` : ''}` }, h('span', { className: 'meter-fill' }));
+  bar.style.setProperty('--v', String(v));
+  if (o.segs) bar.style.setProperty('--segs', String(o.segs));
+  bar.setAttribute('role', 'meter');
+  bar.setAttribute('aria-label', label);
+  bar.setAttribute('aria-valuemin', '0');
+  bar.setAttribute('aria-valuemax', String(o.max ?? 100));
+  bar.setAttribute('aria-valuenow', String(o.now ?? v));
+  return bar;
+}
 
 /** Five-hour usage per AI account: a segmented meter with the slow-down mark, its value, and an LED once hiring slows. */
 function gauge(a: { id: string; name: string; cap: number; usage?: Usage }): HTMLElement[] {
   const u = a.usage;
   const v = pct(u?.fiveHour);
-  const bar = h('span', { className: 'meter' }, h('span', { className: 'meter-fill' }));
-  bar.style.setProperty('--v', String(v));
-  bar.setAttribute('role', 'meter');
-  bar.setAttribute('aria-valuemin', '0');
-  bar.setAttribute('aria-valuemax', '100');
-  bar.setAttribute('aria-valuenow', String(v));
-  bar.setAttribute('aria-label', `${a.name}, five-hour usage`);
-  const wrap = h('span', { className: 'meter-wrap' }, bar);
+  const wrap = h('span', { className: 'meter-wrap' }, meterBar(v, `${a.name}, five-hour usage`));
   wrap.style.setProperty('--mark', String(SLOW_AT * 100));
   const slow = u?.fiveHour !== undefined && u.fiveHour >= SLOW_AT;
   const title = u?.fiveHour === undefined ? 'No reading yet; it updates after the next turn on this account.'
@@ -213,13 +198,7 @@ function projectLine(p: { id: string; name: string; colour: string }, list: Empl
   const done = list.reduce((n, e) => n + (e.progress ? (e.state === 'done' ? e.progress.total : e.progress.done) : 0), 0);
   const total = list.reduce((n, e) => n + (e.progress?.total ?? 0), 0);
   const slots = o.caps.perProject;
-  const meter = h('span', { className: `meter meter--slots${running >= slots ? ' is-full' : ''}` }, h('span', { className: 'meter-fill' }));
-  meter.style.cssText = `--v:${Math.min(100, (running / slots) * 100)};--segs:${slots}`;
-  meter.setAttribute('role', 'meter');
-  meter.setAttribute('aria-label', `${p.name} slots`);
-  meter.setAttribute('aria-valuemin', '0');
-  meter.setAttribute('aria-valuemax', String(slots));
-  meter.setAttribute('aria-valuenow', String(running));
+  const meter = meterBar(Math.min(100, (running / slots) * 100), `${p.name} slots`, { now: running, max: slots, segs: slots, cls: `meter--slots${running >= slots ? ' is-full' : ''}` });
   const state = po?.paused ? led('interrupted', 'Paused') : needs ? led('needs-you', `${needs} need${needs === 1 ? 's' : ''} you`)
     : running ? led('working', `${running} working`) : queued ? led('queued', `${queued} queued`) : led('idle', 'Idle');
   const prio = po?.priority ?? 0;
@@ -303,13 +282,13 @@ registerPanel('employees', {
       const n = ++seq;
       const [pending, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
       if (n !== seq) return;
-      const drafts = forges.flatMap((f) => f.drafts.map((d) => ({ ...d, projectId: f.projectId })));
+      const drafts = forges.flatMap((f) => f.drafts.map((d) => draftCard(f, d)));
       needs.hidden = !pending.length && !drafts.length;
       needs.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · ${pending.length + drafts.length}` }), ...pending.map((a) => {
         const e = everyone.find((x) => x.id === a.employeeId);
         const p = allProjects().find((x) => x.id === e?.projectId);
         return needCard(a, `${p?.name ?? '?'} / ${e?.name ?? a.employeeId}`, p?.colour);
-      }), ...drafts.map((d) => draftCard(d, allProjects().find((x) => x.id === d.projectId))));
+      }), ...drafts);
     };
 
     void Promise.all([api.employees.list(), api.org.get()]).then(([all, o]) => { org = o; all.forEach((e) => emps.set(e.id, e)); draw(); });

@@ -2,7 +2,7 @@
 // Usage: node scripts/check-acp-map.mjs
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { makeAcpMapper, parseCodexStatus, rpcClient } from '../src/main/acp/client.ts';
+import { hardDenied, makeAcpMapper, parseCodexStatus, rpcClient } from '../src/main/acp/client.ts';
 
 const rec = (f) => readFileSync(`spikes/K/evidence/${f}`, 'utf8').split('\n').filter(Boolean).map((l) => ({ dir: l[0], line: l.slice(2), m: JSON.parse(l.slice(2)) }));
 
@@ -80,5 +80,17 @@ const failed = rpc.call('x', {});
 rpc.close('gone');
 await assert.rejects(failed, /gone/);
 rpc.push('not json');
+
+// Hard-deny list for Codex permission requests.
+for (const c of ['gh pr create --fill', '/opt/homebrew/bin/gh issue list', 'env GH_TOKEN=x gh api user', 'cd x && gh pr create', 'bash -c "gh pr create"',
+  "sh -lc 'tea pr create'", 'tea issues', 'security find-generic-password -s myide-github -w', 'git commit --no-verify -m x', 'git commit -n -m x',
+  'git commit -anm wip', 'git -c core.hooksPath=/dev/null commit -m x', 'git config core.hooksPath .', '~/.myide/bin/issue p "t"',
+  'cat ~/.myide/issue-endpoint.json', 'curl -X POST https://api.github.com/repos/o/r/issues', 'echo $(gh auth token)', 'command gh --version', 'sudo security dump-keychain']) {
+  assert.equal(hardDenied(c), true, c);
+}
+for (const c of ['git commit -m "fix: n items"', 'git push -u origin myide/x', 'grep -r security src/', 'npm test', 'ls ghost', 'git commit -am "x"',
+  'curl https://example.com', 'echo high', 'npx tsc --noEmit']) {
+  assert.equal(hardDenied(c), false, c);
+}
 
 console.log('acp map ok');

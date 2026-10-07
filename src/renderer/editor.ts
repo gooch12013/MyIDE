@@ -1,0 +1,245 @@
+import * as monaco from 'monaco-editor';
+import { errText, h, key } from './dom';
+import { led } from './employees';
+import { activeProject } from './projects';
+import { openPanel, registerPanel } from './registry';
+
+const api = window.myide;
+
+// Monaco's language services run in workers, bundled to /monaco/<name>.worker.js by scripts/build.mjs.
+const WORKER: Record<string, string> = { typescript: 'ts', javascript: 'ts', css: 'css', scss: 'css', less: 'css', json: 'json', html: 'html', handlebars: 'html', razor: 'html' };
+(self as unknown as { MonacoEnvironment: monaco.Environment }).MonacoEnvironment = {
+  getWorker: (_id, label) => new Worker(`/monaco/${WORKER[label] ?? 'editor'}.worker.js`),
+};
+
+monaco.editor.defineTheme('myide', {
+  base: 'vs-dark', inherit: true, rules: [],
+  colors: {
+    'editor.background': '#08090b', 'editor.lineHighlightBackground': '#0e1014', 'editorCursor.foreground': '#ffb21a',
+    'editor.selectionBackground': '#6b4b0c', 'editorLineNumber.activeForeground': '#e7e9ec', 'editorLineNumber.foreground': '#565e68',
+    'diffEditor.insertedTextBackground': '#3ddc8426', 'diffEditor.removedTextBackground': '#ff4d6129',
+    'diffEditor.insertedLineBackground': '#3ddc8414', 'diffEditor.removedLineBackground': '#ff4d6117',
+  },
+});
+export const EDITOR_OPTIONS: monaco.editor.IStandaloneEditorConstructionOptions = {
+  theme: 'myide', automaticLayout: true, minimap: { enabled: false }, fontSize: 13, scrollBeyondLastLine: false,
+  fontFamily: '"JetBrains Mono", ui-monospace, Menlo, monospace',
+};
+
+// Files around embedded projects that Monaco does not map by name. Monaco ships no CMake grammar, so a small one.
+monaco.languages.register({ id: 'ini', filenames: ['sdkconfig', 'sdkconfig.defaults'] });
+monaco.languages.register({ id: 'cpp', extensions: ['.ino'] });
+monaco.languages.register({ id: 'cmake', filenames: ['CMakeLists.txt'], extensions: ['.cmake'] });
+monaco.languages.setMonarchTokensProvider('cmake', {
+  ignoreCase: true,
+  tokenizer: {
+    root: [[/#.*$/, 'comment'], [/"([^"\\]|\\.)*"/, 'string'], [/\$\{[^}]*\}/, 'variable'], [/^\s*\w+(?=\s*\()/, 'keyword'], [/\b[A-Z_][A-Z0-9_]+\b/, 'constant'], [/\d+/, 'number']],
+  },
+});
+
+/** A modal in-app sheet; resolves true when the user picks `ok`. */
+export function ask(title: string, detail: string, ok: string, danger = false): Promise<boolean> {
+  const d = h('dialog', { className: 'sheet' }, h('form', { method: 'dialog' },
+    h('p', { className: 'legend', textContent: title }),
+    h('p', { className: 'pref-hint ask-detail', textContent: detail }),
+    h('div', { className: 'sheet-keys' },
+      h('button', { className: 'btn', value: 'cancel', textContent: 'Cancel' }),
+      h('button', { className: danger ? 'btn rm' : 'btn btn--primary', value: 'ok', textContent: ok }))));
+  d.setAttribute('aria-label', title);
+  document.body.append(d);
+  d.showModal();
+  return new Promise((r) => d.addEventListener('close', () => { r(d.returnValue === 'ok'); d.remove(); }, { once: true }));
+}
+
+// One model per open file, shared by every editor panel. A closed panel keeps its unsaved files;
+// the next editor panel opened picks them up.
+type Doc = { model: monaco.editor.ITextModel; saved: number; root: string; branch: string };
+const docs = new Map<string, Doc>();
+const dirty = (d: Doc): boolean => d.model.getAlternativeVersionId() !== d.saved;
+const base = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
+const rel = (d: Doc, path: string): string => (path.startsWith(d.root + '/') ? path.slice(d.root.length + 1) : path);
+
+async function load(path: string): Promise<Doc> {
+  const have = docs.get(path);
+  if (have) return have;
+  const { text, root, branch } = await api.code.read(path);
+  const uri = monaco.Uri.file(path);
+  const model = monaco.editor.getModel(uri) ?? monaco.editor.createModel(text, undefined, uri);
+  const doc = { model, saved: model.getAlternativeVersionId(), root, branch };
+  docs.set(path, doc);
+  return doc;
+}
+
+type Instance = { open(path: string, line?: number): Promise<void>; has(path: string): boolean };
+const instances: Instance[] = []; // most recently used first
+/** Lets go of a file's model once no editor panel shows it. */
+function release(path: string): void {
+  const d = docs.get(path);
+  if (d && !instances.some((i) => i.has(path))) { docs.delete(path); d.model.dispose(); }
+}
+const ides = api.code.ides().catch(() => [] as string[]);
+
+/** Opens `path` (absolute) in the editor at `line`. With no editor panel open, one opens to the right of panel `beside` (else in the active group). */
+export async function openAt(path: string, line?: number, beside?: string): Promise<void> {
+  if (!instances.length) openPanel('editor', {}, beside ? { position: { referencePanel: beside, direction: 'right' } } : {});
+  await instances[0].open(path, line);
+}
+
+registerPanel('editor', {
+  title: 'Editor',
+  create(el, params, panel) {
+    el.classList.add('ed');
+    let current: string | null = null;
+    const open = new Set<string>();
+
+    const tabs = h('div', { className: 'ed-files', role: 'tablist' });
+    tabs.setAttribute('aria-label', 'Open files');
+    const pathEl = h('span', { className: 'path' });
+    const wt = h('span', { className: 'ed-wt' });
+    const status = h('p', { className: 'ed-status' });
+    status.setAttribute('aria-live', 'polite');
+    const say = (t: string) => { status.textContent = t; };
+    const send = key('Send selection', () => void sendSelection(), { title: 'Send the selected code to an employee (⌘⇧E)', disabled: true });
+    const ideKeys = h('span', { className: 'ed-keys' }, send);
+    void ides.then((list) => ideKeys.append(...list.map((ide) => key(`Open in ${ide}`, () => {
+      if (current) void api.code.openIn(ide, current, editor.getPosition()?.lineNumber ?? 1);
+    }, { title: `Open this file in ${ide} at the cursor line` }))));
+    const body = h('div', { className: 'ed-body' });
+    el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), body, status);
+
+    const editor = monaco.editor.create(body, { ...EDITOR_OPTIONS, model: null });
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void save());
+    editor.addAction({
+      id: 'myide.send-selection', label: 'Send Selection to Employee…', contextMenuGroupId: 'navigation', contextMenuOrder: 0,
+      keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyE],
+      run: () => void sendSelection(),
+    });
+    editor.onDidFocusEditorText(() => { instances.splice(instances.indexOf(self), 1); instances.unshift(self); });
+
+    function remember(): void { panel.updateParameters({ files: [...open], active: current }); }
+
+    function drawTabs(): void {
+      tabs.replaceChildren(...[...open].map((p) => {
+        const d = docs.get(p);
+        const mark = d && dirty(d) ? ' ●' : '';
+        const tab = h('div', { className: `ed-file${p === current ? ' is-active' : ''}` },
+          h('button', { type: 'button', className: 'ed-file-open', textContent: base(p) + mark, title: p, role: 'tab', onclick: () => void show(p) }),
+          h('button', { type: 'button', className: 'ed-file-x', textContent: '×', onclick: () => void close(p) }));
+        (tab.firstChild as HTMLElement).setAttribute('aria-selected', String(p === current));
+        if (mark) (tab.firstChild as HTMLElement).setAttribute('aria-label', `${base(p)}, unsaved changes`);
+        (tab.lastChild as HTMLElement).setAttribute('aria-label', `Close ${base(p)}`);
+        return tab;
+      }));
+      const d = current ? docs.get(current) : undefined;
+      pathEl.textContent = d && current ? rel(d, current) : '';
+      wt.textContent = d?.branch ? `on ${d.branch}` : '';
+      panel.setTitle(current ? `${d && dirty(d) ? '● ' : ''}${base(current)}` : 'Editor');
+      send.disabled = !current;
+    }
+
+    async function show(path: string, line?: number): Promise<void> {
+      let d: Doc;
+      try { d = await load(path); } catch (e) { say(`Could not open ${base(path)}: ${errText(e)}`); return; }
+      open.add(path);
+      if (current !== path) { editor.setModel(d.model); current = path; }
+      if (line) {
+        editor.revealLineInCenter(line);
+        editor.setPosition({ lineNumber: line, column: 1 });
+      }
+      editor.focus();
+      drawTabs();
+      remember();
+    }
+
+    async function save(): Promise<void> {
+      const d = current ? docs.get(current) : undefined;
+      if (!d || !current) return;
+      try {
+        await api.code.write(current, d.model.getValue());
+        d.saved = d.model.getAlternativeVersionId();
+        say(`Saved ${rel(d, current)}`);
+      } catch (e) { say(`Could not save: ${errText(e)}`); }
+      drawTabs();
+    }
+
+    async function close(path: string): Promise<void> {
+      const d = docs.get(path);
+      if (d && dirty(d) && !(await ask(`Close ${base(path)} without saving?`, 'Your changes to this file will be lost.', 'Close without saving', true))) return;
+      open.delete(path);
+      if (d) { d.saved = d.model.getAlternativeVersionId(); release(path); } // its changes were dropped on purpose
+      if (current === path) {
+        current = null;
+        const next = [...open].pop();
+        if (next) await show(next); else editor.setModel(null);
+      }
+      drawTabs();
+      remember();
+    }
+
+    async function sendSelection(): Promise<void> {
+      const d = current ? docs.get(current) : undefined;
+      const sel = editor.getSelection();
+      const project = activeProject();
+      if (!d || !current || !sel || !project) return;
+      const text = d.model.getValueInRange(sel);
+      if (!text.trim()) { say('Select some code first.'); return; }
+      const end = sel.endColumn === 1 && sel.endLineNumber > sel.startLineNumber ? sel.endLineNumber - 1 : sel.endLineNumber; // whole lines selected
+      const lines = sel.startLineNumber === end ? `${end}` : `${sel.startLineNumber}-${end}`;
+      const ref = `${rel(d, current)}:${lines}`;
+      const emps = await api.employees.list(project.id);
+      if (!emps.length) { say('No employees in this project to send to.'); return; }
+      const pick = h('fieldset', { className: 'send-who' }, h('legend', { className: 'field-label legend', textContent: 'To employee' }),
+        ...emps.map((e, i) => {
+          const r = h('input', { type: 'radio', name: 'who', value: e.id, checked: e.worktree === d.root || (i === 0 && !emps.some((x) => x.worktree === d.root)) });
+          return h('label', { className: 'who' }, r, h('span', { className: 'who-name', textContent: e.name }), led(e.state), h('span', { className: 'who-role', textContent: e.role }));
+        }));
+      const note = h('input', { className: 'input', autocomplete: 'off', placeholder: 'A question or instruction (optional)' });
+      note.setAttribute('aria-label', 'Note');
+      const form = h('form', { method: 'dialog' },
+        h('p', { className: 'legend', textContent: `Send ${ref}` }), pick, note,
+        h('p', { className: 'pref-hint', textContent: 'Arrives as its next turn; nothing running is interrupted.' }),
+        h('div', { className: 'sheet-keys' },
+          h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }),
+          h('button', { className: 'btn btn--primary', value: 'send', textContent: 'Send' })));
+      const sheet = h('dialog', { className: 'sheet send-sheet' }, form);
+      sheet.setAttribute('aria-label', 'Send selection to an employee');
+      document.body.append(sheet);
+      sheet.showModal();
+      await new Promise((r) => sheet.addEventListener('close', r, { once: true }));
+      const id = (form.elements.namedItem('who') as RadioNodeList | null)?.value;
+      sheet.remove();
+      if (sheet.returnValue !== 'send' || !id) return;
+      const fence = '```';
+      const message = `${note.value.trim() ? note.value.trim() + '\n\n' : ''}From ${ref}:\n${fence}${d.model.getLanguageId()}\n${text}\n${fence}`;
+      try {
+        await api.employees.send(id, message);
+        say(`Sent ${ref} to ${emps.find((e) => e.id === id)?.name}.`);
+      } catch (e) { say(`Could not send: ${errText(e)}`); }
+    }
+
+    const changed = editor.onDidChangeModelContent(() => drawTabs());
+
+    const self: Instance = { open: show, has: (p) => open.has(p) };
+    instances.unshift(self);
+
+    // Reopen the files this panel had, then any unsaved files a closed panel left behind.
+    const saved = Array.isArray(params.files) ? (params.files as string[]) : [];
+    const orphans = [...docs.keys()].filter((p) => dirty(docs.get(p)!));
+    void (async () => {
+      for (const p of [...saved, ...orphans]) if (!open.has(p)) { try { await load(p); open.add(p); } catch { /* moved or deleted */ } }
+      const active = typeof params.active === 'string' && open.has(params.active) ? params.active : [...open].pop();
+      if (active) await show(active); else drawTabs();
+    })();
+
+    return {
+      onShow: () => editor.layout(),
+      dispose() {
+        instances.splice(instances.indexOf(self), 1);
+        changed.dispose();
+        // Unsaved files stay in memory for the next editor panel; saved ones are let go.
+        for (const p of open) { const d = docs.get(p); if (d && !dirty(d)) release(p); }
+        editor.dispose();
+      },
+    };
+  },
+});

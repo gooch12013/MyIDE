@@ -41,6 +41,21 @@ export function rpcClient(send: (line: string) => void, o: { onNotify(method: st
   };
 }
 
+// A command word at the start of the line, after ; & | ( $( ` or a quote (so `bash -c "gh ..."` is caught), behind
+// optional env/command/exec/sudo wrappers, VAR=value prefixes and a path (/opt/homebrew/bin/gh).
+const AT = String.raw`(?:^|[;&|(\x60'"\n]|\$\()\s*(?:(?:env|command|exec|sudo|nohup|time)\s+(?:-\S+\s+)*)*(?:\w+=\S*\s+)*(?:[^\s;&|'"]*\/)?`;
+const HARD_DENY = [
+  new RegExp(`${AT}(?:gh|tea|security)(?=$|[\\s;&|)'"\\x60])`), // forge CLIs and the keychain
+  new RegExp(`${AT}git\\s[^;&|\\n]*\\bcommit\\b[^;&|\\n]*\\s(?:--no-verify\\b|-[a-zA-Z]*n[a-zA-Z]*(?=$|\\s))`), // skipping the attribution hook
+  /core\.hookspath/i, // git -c core.hooksPath=…, git config core.hooksPath
+  /\.myide\/bin\/issue/, /issue-endpoint\.json/,
+  /api\.github\.com/,
+];
+/** Commands a Codex employee may never run, whatever David would answer: forge access goes through the forge tool,
+ *  commits through the attribution hook. ponytail: regexes over the command text; a deliberately obfuscated command
+ *  (eval, base64) gets past them, and the sandbox's network block is the backstop. */
+export const hardDenied = (command: string): boolean => HARD_DENY.some((r) => r.test(command));
+
 /** Maps `session/update` payloads to ClaudeEvents. Message chunks are joined per message and emitted
  *  as one 'text' when the message ends (a tool call, another message, or flush() at turn end).
  *  Plan updates become 'tasks' (Codex 0.157.1 sends none; the code is ready for when it does). */

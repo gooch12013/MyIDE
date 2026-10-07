@@ -16,10 +16,6 @@ export const DEFAULT_AUTO: { rules: AutoRule[]; fallback: string } = {
 /** Above this five-hour utilization (0 to 1) an account's cap drops by one. */
 export const SLOW_AT = 0.8;
 
-const MODELS = ['haiku', 'sonnet', 'opus'];
-const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
-const rank = (list: string[], v?: string) => list.findIndex((x) => v?.toLowerCase().includes(x));
-
 /** Auto mode: the first rule with a keyword at a word start in the task wins.
  *  ponytail: keyword table; misroutes vague tasks. A one-shot Haiku classifier if that shows up. */
 export function autoPick(task: string, rules: AutoRule[] = DEFAULT_AUTO.rules, fallback = DEFAULT_AUTO.fallback): Pick {
@@ -29,20 +25,25 @@ export function autoPick(task: string, rules: AutoRule[] = DEFAULT_AUTO.rules, f
   return { model: fallback };
 }
 
-/** True when `want` is a stronger model than `ceiling`, or the same model at a higher effort. Unknown names never count as above. */
-export function aboveCeiling(want: Pick, ceiling?: Pick): boolean {
-  if (!ceiling?.model) return false;
-  const w = rank(MODELS, want.model), c = rank(MODELS, ceiling.model);
-  if (w < 0 || c < 0) return false;
-  if (w !== c) return w > c;
-  return !!ceiling.effort && rank(EFFORTS, want.effort) > rank(EFFORTS, ceiling.effort);
-}
+/** The CLIs' own effort when none is passed (spike B: medium). */
+export const DEFAULT_EFFORT = 'medium';
 
-/** Layered defaults: role frontmatter, then the project's override, then what this hire asked for. */
-export function layered<T extends object>(...layers: (Partial<T> | undefined)[]): Partial<T> {
-  const out: Partial<T> = {};
-  for (const l of layers) for (const [k, v] of Object.entries(l ?? {})) if (v !== undefined && v !== '') (out as any)[k] = v;
-  return out;
+/** Position of `v` in `list`: exact first, else the first entry it contains (a full id like claude-opus-4-1 is opus). */
+const rank = (list: string[], v?: string) => {
+  const i = list.findIndex((x) => x === v);
+  return i >= 0 ? i : list.findIndex((x) => !!v && v.toLowerCase().includes(x));
+};
+
+/** True when `want` is above `ceiling`: a stronger model, or the same model at a higher effort. `models` is the
+ *  provider's list strongest first, `efforts` lowest first (providers.json order). A model not in the list counts
+ *  as above, on either side; a missing effort is the CLI default. */
+export function aboveCeiling(want: Pick, ceiling: Pick | undefined, models: string[], efforts: string[]): boolean {
+  if (!ceiling?.model) return false;
+  const w = rank(models, want.model), c = rank(models, ceiling.model);
+  if (w < 0 || c < 0) return true;
+  if (w !== c) return w < c;
+  const we = rank(efforts, want.effort || DEFAULT_EFFORT), ce = rank(efforts, ceiling.effort || DEFAULT_EFFORT);
+  return we < 0 || ce < 0 || we > ce;
 }
 
 export interface QItem { id: string; projectId: string; accountId: string; parentId?: string; queuedAt?: number }

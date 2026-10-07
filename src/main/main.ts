@@ -13,6 +13,12 @@ import { STATE_DIR } from './store';
 import { registerEmployeesIpc, stopAllTurns } from './employees';
 import { registerAiIpc } from './transports';
 import { registerForgeIpc } from './forge';
+import { registerGitIpc } from './git';
+import { registerComponentsIpc } from './components';
+import { registerSpeechIpc, stop as stopSpeech } from './speech';
+import { registerButtonsIpc } from './buttons';
+import { refreshTray, startTray } from './tray';
+import { registerAssetsIpc } from './assets';
 
 // One MyIDE at a time. The lock lives in userData, so a dev or test run with its own MYIDE_HOME
 // gets its own userData and runs beside the installed app.
@@ -90,8 +96,16 @@ app.whenReady().then(() => {
   registerEmployeesIpc(() => mainWindow);
   registerAiIpc();
   registerForgeIpc();
+  registerGitIpc();
+  registerComponentsIpc();
+  registerSpeechIpc();
+  registerButtonsIpc({ onPaused: refreshTray });
+  registerAssetsIpc();
   createMainWindow();
+  const show = () => { mainWindow?.show(); mainWindow?.focus(); };
+  void startTray({ open: show, showNeeds: () => { show(); mainWindow?.webContents.send('command', 'panel:employees'); } });
 });
 
 app.on('before-quit', killAllPtys);
 app.on('before-quit', stopAllTurns);
+app.on('before-quit', stopSpeech);

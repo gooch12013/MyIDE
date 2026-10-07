@@ -60,3 +60,21 @@ export function registerOpenerIpc(): void {
     });
   });
 }
+
+// "Open at line" in an IDE, through its URL scheme; offered only when the IDE is installed.
+const IDES: Record<string, { bundle: string; app: string; url: (file: string, line: number) => string }> = {
+  WebStorm: { bundle: APPS.WebStorm, app: 'WebStorm', url: (f, l) => `webstorm://open?file=${encodeURIComponent(f)}&line=${l}` },
+  'VS Code': { bundle: 'com.microsoft.VSCode', app: 'Visual Studio Code', url: (f, l) => `vscode://file${encodeURI(f)}:${l}` },
+};
+const ideFound = (i: (typeof IDES)[string]): Promise<boolean> =>
+  [`/Applications/${i.app}.app`, join(homedir(), 'Applications', `${i.app}.app`)].some(existsSync)
+    ? Promise.resolve(true)
+    : new Promise((resolve) => execFile('mdfind', [`kMDItemCFBundleIdentifier == "${i.bundle}"`], { timeout: 5000 }, (_err, out) => resolve(!!out?.trim())));
+const ides: Promise<string[]> = Promise.all(Object.entries(IDES).map(async ([n, i]) => ((await ideFound(i)) ? n : ''))).then((a) => a.filter(Boolean));
+
+/** Installed IDEs, and opening an (already path-checked) file at a line in one. */
+export const installedIdes = (): Promise<string[]> => ides;
+export async function openAtLine(ide: string, file: string, line: number): Promise<void> {
+  if (!(await ides).includes(ide) || !isAbsolute(file)) return;
+  await shell.openExternal(IDES[ide].url(file, Math.max(1, Math.floor(line) || 1)));
+}

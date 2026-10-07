@@ -11,6 +11,10 @@ import type { Approval } from '../main/mcp';
 import type { Account, Provider, Usage } from '../main/accounts';
 import type { Providers } from '../main/transports';
 import type { ForgeLink, ForgeSnapshot } from '../main/forge';
+import type { Row as ComponentRow } from '../main/components';
+import type { SpeechSettings, SpeechStatus } from '../main/speech';
+import type { Button, PaletteItem, Schedule } from '../main/buttons';
+import type { AssetRequest, Catalog } from '../main/assets';
 
 export type OrgState = {
   caps: { global: number; perProject: number; maxReports: number; maxDepth: number };
@@ -153,8 +157,97 @@ const api = {
     assign: (o: { projectId: string; number: number; employeeId?: string; role?: string; note?: string }): Promise<{ employeeId: string; warning?: string }> => ipcRenderer.invoke('forge:assign', o),
     fileDraft: (projectId: string, id: string): Promise<{ number: number; url: string; warning?: string }> => ipcRenderer.invoke('forge:file-draft', projectId, id),
     discardDraft: (projectId: string, id: string): Promise<void> => ipcRenderer.invoke('forge:discard-draft', projectId, id),
+    /** Drops the write that stopped the outbox (shown as blocked) and sends the rest. */
+    dropOp: (projectId: string): Promise<void> => ipcRenderer.invoke('forge:drop-op', projectId),
     /** A project's issues, drafts or outbox changed. */
     onChange: (cb: (projectId: string) => void) => on('forge:change', cb),
+  },
+  // Code: the editor's files (inside a project or a MyIDE worktree only), the git tree, review and merge.
+  code: {
+    /** The file's text and the checkout it is in (root, branch). */
+    read: (path: string): Promise<{ text: string; root: string; branch: string }> => ipcRenderer.invoke('code:read', path),
+    write: (path: string, text: string): Promise<void> => ipcRenderer.invoke('code:write', path, text),
+    /** Installed IDEs ('WebStorm', 'VS Code'), and opening a file at a line in one. */
+    ides: (): Promise<string[]> => ipcRenderer.invoke('code:ides'),
+    openIn: (ide: string, path: string, line: number): Promise<void> => ipcRenderer.invoke('code:open-in', ide, path, line),
+  },
+  git: {
+    /** Files under root as [relative path, status letter]; git: false when root is not a repository. */
+    tree: (root: string): Promise<{ git: boolean; files: [string, string][] }> => ipcRenderer.invoke('git:tree', root),
+    /** Watches root; the callback gets the watch id on a (debounced) change. */
+    watch: (root: string): Promise<number> => ipcRenderer.invoke('git:watch', root),
+    unwatch: (id: number): void => ipcRenderer.send('git:unwatch', id),
+    onChanged: (cb: (id: number) => void) => on('git:changed', cb),
+    /** The project's checkouts; the first is the main one. */
+    worktrees: (projectId: string): Promise<{ path: string; branch: string }[]> => ipcRenderer.invoke('git:worktrees', projectId),
+    /** The project's myide/* branches. */
+    branches: (projectId: string): Promise<string[]> => ipcRenderer.invoke('git:branches', projectId),
+    diff: (projectId: string, branch: string): Promise<{ base: string; files: { status: string; path: string; old?: string }[] }> => ipcRenderer.invoke('git:diff', projectId, branch),
+    diffFile: (projectId: string, branch: string, path: string, old?: string): Promise<{ original: string; modified: string }> => ipcRenderer.invoke('git:diff-file', projectId, branch, path, old),
+    /** `git merge --no-ff` into the main checkout; refuses when it has uncommitted changes. */
+    merge: (projectId: string, branch: string): Promise<{ ok: boolean; message: string; conflicts?: string[] }> => ipcRenderer.invoke('git:merge', projectId, branch),
+    /** Deletes the branch; without removeWorktree it refuses (and names the worktree) while one has it checked out. */
+    discard: (projectId: string, branch: string, removeWorktree = false): Promise<{ ok: boolean; worktree?: string; message: string }> => ipcRenderer.invoke('git:discard', projectId, branch, removeWorktree),
+  },
+  // Read-back (macOS say) and dictation (an installed whisper-cli).
+  speech: {
+    get: (): Promise<SpeechStatus> => ipcRenderer.invoke('speech:get'),
+    set: (patch: Partial<SpeechSettings>): Promise<SpeechStatus> => ipcRenderer.invoke('speech:set', patch),
+    voices: (): Promise<{ name: string; lang: string }[]> => ipcRenderer.invoke('speech:voices'),
+    /** Reads a summary aloud (stopping any other); ignored while read-back is off unless force. Resolves when done. */
+    speak: (text: string, force = false): Promise<void> => ipcRenderer.invoke('speech:speak', text, force),
+    stop: (): Promise<void> => ipcRenderer.invoke('speech:stop'),
+    /** A 16 kHz mono WAV to text. */
+    transcribe: (wav: Uint8Array): Promise<string> => ipcRenderer.invoke('speech:transcribe', wav),
+    onChange: (cb: (s: SpeechStatus) => void) => on('speech:change', cb),
+    onSpeaking: (cb: (speaking: boolean) => void) => on('speech:speaking', cb),
+  },
+  // Optional components (feature 23) in ~/.myide/components.
+  components: {
+    list: (): Promise<ComponentRow[]> => ipcRenderer.invoke('components:list'),
+    /** Downloads on this click only; resolves to the installed path. */
+    install: (id: string): Promise<string> => ipcRenderer.invoke('components:install', id),
+    remove: (id: string): Promise<void> => ipcRenderer.invoke('components:remove', id),
+    /** Uses an existing install that detection found. */
+    use: (id: string, path: string): Promise<void> => ipcRenderer.invoke('components:use', id, path),
+    reveal: (): Promise<string> => ipcRenderer.invoke('components:reveal'),
+    onProgress: (cb: (id: string, got: number, total: number) => void) => on('components:progress', cb),
+    onChange: (cb: () => void) => on('components:change', cb),
+  },
+  // Action buttons (global in ~/.myide, project ones in <repo>/.myide) and their schedules.
+  buttons: {
+    /** Global plus that project's buttons, and the installed commands and skills. */
+    list: (projectId?: string): Promise<{ buttons: Button[]; palette: PaletteItem[] }> => ipcRenderer.invoke('buttons:list', projectId),
+    save: (b: Partial<Button> & Pick<Button, 'label' | 'command' | 'target' | 'scope'>): Promise<Button> => ipcRenderer.invoke('buttons:save', b),
+    /** Also deletes its schedules. */
+    delete: (id: string): Promise<void> => ipcRenderer.invoke('buttons:delete', id),
+    /** Sends the command to the target; resolves to the employee id that runs it. */
+    run: (b: Pick<Button, 'command' | 'target' | 'label'>, projectId: string, o: { employeeId?: string; input?: string } = {}): Promise<string> => ipcRenderer.invoke('buttons:run', b, projectId, o),
+  },
+  schedules: {
+    list: (): Promise<{ paused: boolean; awake: boolean; schedules: (Schedule & { next?: number })[] }> => ipcRenderer.invoke('schedules:list'),
+    save: (s: Partial<Schedule> & Pick<Schedule, 'buttonId' | 'projectId' | 'days' | 'time' | 'missed'>): Promise<Schedule> => ipcRenderer.invoke('schedules:save', s),
+    delete: (id: string): Promise<void> => ipcRenderer.invoke('schedules:delete', id),
+    pause: (paused: boolean): Promise<void> => ipcRenderer.invoke('schedules:pause', paused),
+    onChange: (cb: () => void) => on('schedules:change', cb),
+  },
+  // Asset studio (Higgsfield): model list and balance, prompt writing, requests, gallery, save to project.
+  assets: {
+    catalog: (): Promise<{ catalog: Catalog | null; approveAbove: number }> => ipcRenderer.invoke('assets:catalog'),
+    /** One read-only haiku turn: balance and image models. */
+    refresh: (): Promise<Catalog> => ipcRenderer.invoke('assets:refresh'),
+    guide: (model: string): Promise<{ file: string; text: string }> => ipcRenderer.invoke('assets:guide', model),
+    writePrompt: (o: { model: string; type: string; ratio: string; settings?: Record<string, string>; short: string; parentPrompt?: string }): Promise<{ prompt: string; guide: string }> => ipcRenderer.invoke('assets:write-prompt', o),
+    /** Creates the request folder; the returned turn goes to the designer (employees.hire or send). */
+    request: (o: { projectId: string; type: string; model: string; ratio: string; settings?: Record<string, string>; count: number; short: string; prompt: string;
+      parent?: { request: string; version: number }; reference?: { name: string; data: Uint8Array; acceptedWarning: boolean } }): Promise<{ request: AssetRequest; turn: string }> => ipcRenderer.invoke('assets:request', o),
+    list: (projectId: string): Promise<(AssetRequest & { thumbs: string[]; dir: string })[]> => ipcRenderer.invoke('assets:list', projectId),
+    targets: (projectId: string, id: string, version: number): Promise<{ kind: string; note: string; targets: { label: string; rel: string; size?: number; exists: boolean }[] }> => ipcRenderer.invoke('assets:targets', projectId, id, version),
+    save: (projectId: string, id: string, version: number): Promise<string[]> => ipcRenderer.invoke('assets:save', projectId, id, version),
+    reveal: (id: string, version: number): Promise<void> => ipcRenderer.invoke('assets:reveal', id, version),
+    setLine: (credits: number): Promise<void> => ipcRenderer.invoke('assets:set-line', credits),
+    installRole: (): Promise<string> => ipcRenderer.invoke('assets:install-role'),
+    onChange: (cb: (projectId: string) => void) => on('assets:change', cb),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

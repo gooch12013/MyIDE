@@ -33,6 +33,10 @@ function preset(name: string): void {
     openPanel('files', {}, { position: { referencePanel: term.id, direction: 'left' }, initialWidth: 260 });
     term.api.setActive();
   }
+  if (name === 'review') {
+    openPanel('diff', {}, { position: { referencePanel: term.id, direction: 'above' } });
+    openPanel('files', {}, { position: { direction: 'left' }, initialWidth: 260 });
+  }
 }
 
 // A named layout can be restored in any project: panels get fresh ids (so no terminal reattaches

@@ -9,6 +9,7 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 export interface TurnOpts {
   cwd: string; prompt: string; sessionId?: string; model: string; effort?: string;
   settingsPath: string; mcpConfigPath: string; appendSystemPrompt?: string; prevTasks?: TaskState;
+  maxTurns?: number; // the role's myide-max-turns; Claude only
   onEvent?(e: ClaudeEvent): void;
   env?: Record<string, string>; // the account's env (CLAUDE_CONFIG_DIR for extra accounts; empty for the default)
 }
@@ -20,7 +21,7 @@ export function runTurn(o: TurnOpts): Turn {
     '-p', o.prompt.startsWith('-') ? ' ' + o.prompt : o.prompt, // a leading dash would read as a flag
     '--output-format', 'stream-json', '--verbose',
     ...(o.sessionId ? ['--resume', o.sessionId] : []),
-    '--model', o.model, ...(o.effort ? ['--effort', o.effort] : []),
+    '--model', o.model, ...(o.effort ? ['--effort', o.effort] : []), ...(o.maxTurns ? ['--max-turns', String(o.maxTurns)] : []),
     '--settings', o.settingsPath, '--mcp-config', o.mcpConfigPath,
     '--permission-prompt-tool', 'mcp__myide__approve',
     ...(o.appendSystemPrompt ? ['--append-system-prompt', o.appendSystemPrompt] : []),

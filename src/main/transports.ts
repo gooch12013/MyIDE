@@ -17,9 +17,11 @@ export { onAcpPermission, type AcpPermission };
 type Emp = { id?: string; provider?: string; accountId?: string };
 
 /** Capability table shipped with the app (build/providers.json). */
-export type Providers = Record<string, { label: string; chip: string; models: string[][]; efforts: string[][]; testModel: string } & Record<string, unknown>>;
+export type Providers = Record<string, { label: string; models: string[][]; efforts: string[][]; testModel: string } & Record<string, unknown>>;
 let providerTable: Providers | undefined;
 export const providers = (): Providers => (providerTable ??= JSON.parse(readFileSync(join(__dirname, 'providers.json'), 'utf8')));
+/** `v` if it is one of the provider's listed values, else undefined. */
+const known = (list: string[][], v?: string) => (list.some(([m]) => m === v) ? v : undefined);
 
 function accountFor(emp: Emp): Account {
   const a = account(emp.accountId || DEFAULT_ACCOUNT);
@@ -38,7 +40,6 @@ export function runTurnFor(emp: Emp, o: TurnOpts): Turn {
   if (a.provider === 'claude') return runTurn({ ...o, onEvent, env: a.env });
   if (a.provider === 'codex') {
     // A Claude model name (a role default, a lead's pick) means nothing to Codex: use Codex's own default instead of failing.
-    const known = (list: string[][], v?: string) => (list.some(([m]) => m === v) ? v : undefined);
     const p = providers().codex;
     return runCodexTurn({ ...o, model: known(p.models, o.model) ?? '', effort: known(p.efforts, o.effort), onEvent, env: a.env, employeeId: emp.id });
   }
@@ -60,8 +61,11 @@ const envPrefix = (name: string, value?: string) => (value ? `env ${name}=${shq(
 export function talkCommandFor(emp: Emp, base: { sessionId: string; model: string; effort?: string; settingsPath: string; promptFile: string }): string {
   const a = accountFor(emp);
   if (a.provider === 'codex') {
-    return ['exec', envPrefix('CODEX_HOME', a.env.CODEX_HOME), 'codex resume', shq(base.sessionId), '-m', shq(base.model),
-      ...(base.effort ? ['-c', shq(`model_reasoning_effort="${base.effort}"`)] : [])].join(' ');
+    // Only listed values reach the command line: a Claude model name means nothing to Codex, and the effort goes into a TOML string.
+    const p = providers().codex;
+    const model = known(p.models, base.model), effort = known(p.efforts, base.effort);
+    return ['exec', envPrefix('CODEX_HOME', a.env.CODEX_HOME), 'codex resume', shq(base.sessionId), ...(model ? ['-m', shq(model)] : []),
+      ...(effort ? ['-c', shq(`model_reasoning_effort="${effort}"`)] : [])].join(' ');
   }
   if (a.provider !== 'claude') throw new Error(`Talk is not available for ${a.provider} yet.`);
   return ['exec', envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR), 'claude --resume', shq(base.sessionId), '--settings', shq(base.settingsPath),

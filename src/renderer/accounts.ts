@@ -1,7 +1,7 @@
 // AI accounts: Preferences > AI accounts, the account picker on hire, and capability greying.
 import type { Account, Usage } from '../main/accounts';
 import { errText, h, key } from './dom';
-import { led } from './employees';
+import { led, meterBar } from './employees';
 import { openCommandTerminal } from './terminal';
 
 const api = window.myide;
@@ -15,14 +15,9 @@ const CAPS = [['voice', 'Voice input'], ['planMode', 'Plan mode'], ['liveModel',
   ['todos', 'To-do progress'], ['resume', 'Session resume'], ['images', 'Image input'], ['computerUse', 'Computer use']] as const;
 export type CapName = (typeof CAPS)[number][0];
 
-/** Whether a provider supports a capability, and why (from providers.json). */
-export async function capability(provider: string, cap: CapName): Promise<Cap> {
-  return ((await providers())[provider]?.[cap] as Cap | undefined) ?? ['unknown', 'Unknown AI.'];
-}
-
-/** Greys `el` with the reason as its tooltip when the employee's AI lacks `cap`. */
+/** Greys `el` with the reason as its tooltip when the employee's AI lacks `cap` (providers.json). */
 export async function greyUnless(el: HTMLButtonElement | HTMLSelectElement, provider: string | undefined, cap: CapName): Promise<void> {
-  const [ok, why] = await capability(provider ?? 'claude', cap);
+  const [ok, why] = ((await providers())[provider ?? 'claude']?.[cap] as Cap | undefined) ?? ['unknown', 'Unknown AI.'];
   if (ok === true) return;
   el.disabled = true;
   el.title = `Not available for this AI: ${why}`;
@@ -31,13 +26,7 @@ export async function greyUnless(el: HTMLButtonElement | HTMLSelectElement, prov
 const pct = (f?: number) => (typeof f === 'number' ? Math.round(f * 100) : undefined);
 function meter(id: string, u?: Usage): HTMLElement {
   const five = pct(u?.fiveHour);
-  const bar = h('span', { className: 'acct-meter' });
-  bar.style.setProperty('--v', String(five ?? 0));
-  bar.setAttribute('role', 'meter');
-  bar.setAttribute('aria-valuemin', '0');
-  bar.setAttribute('aria-valuemax', '100');
-  bar.setAttribute('aria-valuenow', String(five ?? 0));
-  bar.setAttribute('aria-label', 'Five-hour usage');
+  const bar = meterBar(five ?? 0, 'Five-hour usage');
   const week = pct(u?.sevenDay);
   const text = five === undefined ? 'No reading yet' : `${five}% · 5 h${week === undefined ? '' : ` · ${week}% · 7 d`}`;
   const el = h('span', { className: 'acct-use', title: u?.resetsAt ? `Five-hour window resets ${new Date(u.resetsAt).toLocaleString()}` : 'Updates after the next turn on this account' },

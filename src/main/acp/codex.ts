@@ -11,7 +11,8 @@ import { promisify } from 'node:util';
 import type { ClaudeEvent } from '../claude/parse';
 import type { Turn, TurnOpts } from '../claude/transport';
 import { spawnEnv } from '../pty';
-import { makeAcpMapper, parseCodexStatus, rpcClient } from './client';
+import { MCP_TOOL_TIMEOUT_MS, ownTool } from '../mcp';
+import { hardDenied, makeAcpMapper, parseCodexStatus, rpcClient } from './client';
 
 type Result = Extract<ClaudeEvent, { type: 'result' }>;
 const ADAPTER = join(__dirname, '..', 'node_modules', '@agentclientprotocol', 'codex-acp', 'dist', 'index.js');
@@ -44,10 +45,12 @@ export function codexInfo(): NonNullable<typeof info> {
   })());
 }
 
-/** The http entries of a --mcp-config file, in ACP's shape. */
-function mcpServers(file: string): { type: 'http'; name: string; url: string; headers: [] }[] {
+/** The http entries of a --mcp-config file, as Codex config: given to the adapter as CODEX_CONFIG rather than as
+ *  ACP mcpServers, because ACP has no field for tool_timeout_sec and Codex otherwise drops an MCP call (an
+ *  approval or ask_human waiting on David) after 60 s. The user's own ~/.codex/config.toml is never edited. */
+function mcpServers(file: string): Record<string, { url: string; tool_timeout_sec: number }> {
   const servers = JSON.parse(readFileSync(file, 'utf8')).mcpServers ?? {};
-  return Object.entries(servers).map(([name, s]: [string, any]) => ({ type: 'http' as const, name, url: String(s.url), headers: [] as [] }));
+  return Object.fromEntries(Object.entries(servers).map(([name, s]: [string, any]) => [name, { url: String(s.url), tool_timeout_sec: MCP_TOOL_TIMEOUT_MS / 1000 }]));
 }
 
 export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employeeId?: string }): Turn {
@@ -59,10 +62,14 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
   let phase: 'start' | 'prompt' | 'status' | 'done' = 'start';
   let cancelled = false;
   let statusText = '';
-  const asking = new Set<() => void>(); // permission prompts waiting on David; answered "cancelled" on interrupt
+  let refused = ''; // a command MyIDE turned down; Codex offers no "decline" for an escalation, so refusing ends the turn
+  const asking = new Set<() => void>();
+  const mcpCalls = new Map<string, { server?: string; tool?: string }>(); // tool call id -> MCP server and tool, for its approval // permission prompts waiting on David; answered "cancelled" on interrupt
 
   const onNotify = (method: string, p: any) => {
     if (method !== 'session/update' || p?.sessionId !== sessionId) return;
+    const u = p.update;
+    if (u?.sessionUpdate === 'tool_call' && u.rawInput?.server) mcpCalls.set(u.toolCallId, { server: String(u.rawInput.server), tool: String(u.rawInput.tool ?? '') });
     if (phase === 'prompt') mapper.push(p.update).forEach(emit); // session/load replays history before this: ignored
     else if (phase === 'status' && p.update?.sessionUpdate === 'agent_message_chunk') statusText += p.update.content?.text ?? '';
   };
@@ -74,7 +81,25 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
     const cancel = { outcome: { outcome: 'cancelled' } };
     if (!approver || phase !== 'prompt' || cancelled) return cancel;
     const plan = tc.kind === 'switch_mode';
-    const ask = { employeeId: o.employeeId ?? '', kind: plan ? 'plan' as const : 'permission' as const, title: String(tc.title ?? 'Permission'),
+    // Codex offers two reject_once options: "decline" (carry on without it) and "cancel" (which ends the turn). Deny means decline.
+    const pickOf = (want: 'allow' | 'reject') => (want === 'reject' ? options.find((x) => x.optionId === 'decline') : undefined)
+      ?? options.find((x) => x.kind === `${want}_once`) ?? options.find((x) => x.kind.startsWith(want));
+    const cmd = tc.rawInput?.command;
+    const command = Array.isArray(cmd) ? cmd.join(' ') : typeof cmd === 'string' ? cmd : '';
+    // Never asked: the forge goes through MyIDE's forge tool, commits through the attribution hook.
+    if (command && hardDenied(command)) {
+      console.warn(`Codex employee ${o.employeeId}: refused ${command.slice(0, 200)}`);
+      refused = command.slice(0, 200);
+      const no = pickOf('reject');
+      return no ? { outcome: { outcome: 'selected', optionId: no.optionId } } : cancel;
+    }
+    // In workspace-write Codex asks before every MCP tool call; MyIDE's own tools (exact names) never need David.
+    const mcp = p?._meta?.is_mcp_tool_approval ? mcpCalls.get(tc.toolCallId) : undefined;
+    if (mcp?.server === 'myide' && ownTool(mcp.tool ?? '')) {
+      const yes = options.find((x) => x.optionId === 'allow_once') ?? pickOf('allow');
+      return yes ? { outcome: { outcome: 'selected', optionId: yes.optionId } } : cancel;
+    }
+    const ask = { employeeId: o.employeeId ?? '', kind: plan ? 'plan' as const : 'permission' as const, title: String(tc.title ?? (mcp ? `mcp.${mcp.server}.${mcp.tool}` : 'Permission')),
       text: plan ? String(tc.rawInput?.plan ?? tc.title ?? '') : String(tc.rawInput?.command ?? tc.title ?? ''), input: tc.rawInput ?? {} };
     const abort = new AbortController();
     const answer = await new Promise<{ allow: boolean } | null>((resolve) => {
@@ -83,8 +108,7 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
       approver!({ ...ask, signal: abort.signal }).then(resolve, () => resolve({ allow: false })).finally(() => asking.delete(stop));
     });
     if (!answer || cancelled) return cancel;
-    const want = answer.allow ? 'allow' : 'reject';
-    const pick = options.find((x) => x.kind === `${want}_once`) ?? options.find((x) => x.kind.startsWith(want));
+    const pick = pickOf(answer.allow ? 'allow' : 'reject');
     return pick ? { outcome: { outcome: 'selected', optionId: pick.optionId } } : cancel;
   };
 
@@ -95,7 +119,10 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
       const codex = findCodex(env.PATH);
       if (!codex) throw new Error('Codex is not installed (no codex on your PATH).');
       if (cancelled) throw new Error('Interrupted before start');
-      child = utilityProcess.fork(HOST, [ADAPTER], { env: { ...env, CODEX_PATH: codex }, cwd: o.cwd, stdio: ['ignore', 'ignore', 'pipe'], serviceName: 'Codex ACP' });
+      const servers = mcpServers(o.mcpConfigPath);
+      // workspace-write: on-request approvals reviewed by the user (David, via NEEDS YOU), not Codex's own auto review.
+      const adapterEnv = { ...env, CODEX_PATH: codex, INITIAL_AGENT_MODE: 'workspace-write', CODEX_CONFIG: JSON.stringify({ mcp_servers: servers }) };
+      child = utilityProcess.fork(HOST, [ADAPTER], { env: adapterEnv, cwd: o.cwd, stdio: ['ignore', 'ignore', 'pipe'], serviceName: 'Codex ACP' });
       child.stderr?.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
       const exited = new Promise<never>((_, reject) => child!.once('exit', (code) => {
         rpc?.close('exited');
@@ -111,12 +138,11 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
       const call = (method: string, params: unknown) => Promise.race([rpc!.call(method, params), exited]);
 
       await call('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: 'MyIDE', version: '0' } });
-      const servers = mcpServers(o.mcpConfigPath);
-      if (o.sessionId) await call('session/load', { sessionId, cwd: o.cwd, mcpServers: servers });
-      else sessionId = (await call('session/new', { cwd: o.cwd, mcpServers: servers })).sessionId;
+      if (o.sessionId) await call('session/load', { sessionId, cwd: o.cwd, mcpServers: [] });
+      else sessionId = (await call('session/new', { cwd: o.cwd, mcpServers: [] })).sessionId;
       if (o.model) await call('session/set_config_option', { sessionId, configId: 'model', value: o.model }); // '' keeps Codex's own default
       if (o.effort) await call('session/set_config_option', { sessionId, configId: 'reasoning_effort', value: o.effort });
-      emit({ type: 'init', sessionId, model: o.model, tools: [], mcpServers: servers.map((s) => ({ name: s.name, status: 'connected' })) });
+      emit({ type: 'init', sessionId, model: o.model, tools: [], mcpServers: Object.keys(servers).map((name) => ({ name, status: 'connected' })) });
       if (cancelled) throw new Error('Interrupted');
 
       // The role prompt goes in as the start of the first turn; resumed sessions already have it.
@@ -136,6 +162,9 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
         } catch { /* the gauge just stays where it was */ }
       }
       const ok = stop === 'end_turn';
+      if (stop === 'cancelled' && refused && !cancelled) {
+        return { type: 'result', ok: false, interrupted: false, sessionId, text: `MyIDE refused \`${refused}\` (forge writes go through the forge tool, commits through the hook), and Codex ends its turn on a refusal. Send it a message to continue.` };
+      }
       return { type: 'result', ok, interrupted: stop === 'cancelled', sessionId, text: mapper.lastText() || (ok ? '' : `Codex stopped: ${stop || 'no reason given'}`) };
     } catch (err) {
       return { type: 'result', ok: false, interrupted: cancelled, sessionId, text: (err as Error).message };

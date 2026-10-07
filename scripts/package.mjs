@@ -28,7 +28,10 @@ const [dir] = await packager({
     !(p === '' || p === '/package.json' || p.startsWith('/dist') || p.startsWith('/node_modules')) ||
     /^\/node_modules\/node-pty\/(deps|third_party|prebuilds\/(?!darwin-arm64))/.test(p) ||
     // Never ship a codex binary: the Codex ACP adapter's dependency carries one; MyIDE runs the user's own (CODEX_PATH).
-    p.startsWith('/node_modules/@openai/'),
+    p.startsWith('/node_modules/@openai/') ||
+    // Monaco is bundled into dist/renderer (app.js and the /monaco workers) with its own copies of marked and
+    // dompurify; none of the three packages is loaded at runtime. Nor is the 20 MB renderer source map.
+    /^\/node_modules\/(monaco-editor|marked|dompurify)(\/|$)/.test(p) || p === '/dist/renderer/app.js.map',
 });
 const app = `${dir}/MyIDE.app`;
 
