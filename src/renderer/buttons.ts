@@ -75,7 +75,7 @@ async function buttonForm(b: Partial<Button>, palette: PaletteItem[], onSaved: (
   label.focus();
 }
 
-function scheduleForm(s: Partial<Schedule>, buttons: Button[], onSaved: () => void): void {
+export function scheduleForm(s: Partial<Schedule>, buttons: Button[], onSaved: () => void): void {
   const usable = buttons.filter((b) => b.target !== 'selected');
   const button = h('select', { className: 'input select' }, ...usable.map((b) => new Option(`${b.label} · ${b.command}`, b.id)));
   if (s.buttonId) button.value = s.buttonId;

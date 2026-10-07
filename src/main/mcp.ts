@@ -26,7 +26,8 @@ const pending = new Map<string, { a: Approval; answer(allow: boolean, message?: 
 let onNew: (a: Approval) => void = () => {};
 let onGone: (id: string) => void = () => {};
 // Late allows: the next `approve` for the same employee, tool and input is allowed at once, then forgotten.
-const grants: { employeeId: string; tool: string; input: unknown }[] = [];
+// `cmd`: a GO on a This Mac plan; matches a Bash call by its command alone (the description the model adds varies).
+const grants: { employeeId: string; tool: string; input: unknown; cmd?: boolean }[] = [];
 const control = new Map<string, Tool>();
 // Org tools (assign_task, forge, ...): `show` decides per employee whether tools/list offers it.
 const extra = new Map<string, { description: string; inputSchema: object; run(employeeId: string, args: any): Promise<unknown>; show(employeeId: string): boolean }>();
@@ -46,6 +47,27 @@ export function resolveApproval(id: string, allow: boolean, message?: string): v
   if (p.a.timedOut && allow && p.a.kind !== 'question') grants.push({ employeeId: p.a.employeeId, tool: p.a.tool, input: p.a.input });
   p.answer(allow, message);
 }
+
+/** A GO on a plan: each command is allowed once, exactly as written; anything else still reaches David. */
+export function grantCommands(employeeId: string, commands: string[]): void {
+  for (const command of commands) grants.push({ employeeId, tool: 'Bash', input: { command }, cmd: true });
+}
+/** Drops a GO's unused commands once its turn ends. */
+export function clearGrants(employeeId: string): void {
+  for (let i = grants.length - 1; i >= 0; i--) if (grants[i].employeeId === employeeId && grants[i].cmd) grants.splice(i, 1);
+}
+
+// Claude Code hooks in an employee's settings POST their JSON to /hook/<employeeId>?token=… (This Mac's change journal).
+let onHook: (employeeId: string, body: any) => Promise<void> | void = () => {};
+export function onEmployeeHook(fn: (employeeId: string, body: any) => Promise<void> | void): void { onHook = fn; }
+export function hookUrl(employeeId: string): string {
+  let t = tokens.get(employeeId);
+  if (!t) tokens.set(employeeId, (t = randomBytes(24).toString('hex')));
+  return `http://127.0.0.1:${port}/hook/${encodeURIComponent(employeeId)}?token=${t}`;
+}
+// POST /todo from ~/.myide/bin/todo, same token as /issue; answers the text the script prints.
+let onTodo: (text: string) => Promise<string> = async () => { throw new Error('to-dos not available'); };
+export function onTodoPost(fn: (text: string) => Promise<string>): void { onTodo = fn; }
 
 export function registerEmployeeTool(name: string, description: string, schema: object,
   run: (employeeId: string, args: any) => Promise<unknown>, show: (employeeId: string) => boolean = () => true): void {
@@ -111,7 +133,8 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
         const tool = String(args?.tool_name ?? '');
         const input = args?.input ?? {};
         const plan = tool === 'ExitPlanMode';
-        const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool && isDeepStrictEqual(x.input, input));
+        const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool
+          && (x.cmd ? (x.input as { command: string }).command === input.command : isDeepStrictEqual(x.input, input)));
         // MyIDE's own tools enforce their own caps and approvals; asking David about each assign_task is noise.
         // Exact names only: approve itself, or anything else under mcp__myide__, still asks.
         const own = tool.startsWith('mcp__myide__') && ownTool(tool.slice('mcp__myide__'.length));
@@ -168,6 +191,9 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
   if (req.headers.origin !== undefined || req.headers.host !== `127.0.0.1:${port}`) return reply(res, 403);
   const url = new URL(req.url ?? '/', 'http://127.0.0.1');
   if (url.pathname === '/issue') return postIssue(req, res);
+  if (url.pathname === '/todo') return postIssue(req, res, true);
+  const hook = /^\/hook\/([^/]+)$/.exec(url.pathname)?.[1];
+  if (hook) return postHook(req, res, hook, url.searchParams.get('token'));
   const id = /^\/mcp\/([^/]+)$/.exec(url.pathname)?.[1];
   let key: string | undefined;
   try { key = id && decodeURIComponent(id); } catch { return reply(res, 400); }
@@ -193,7 +219,7 @@ function handle(req: IncomingMessage, res: ServerResponse): void {
 }
 
 /** `issue <project> "title"`: JSON { project, title, token } in (the token in the body, never in argv), plain text out. */
-function postIssue(req: IncomingMessage, res: ServerResponse): void {
+function postIssue(req: IncomingMessage, res: ServerResponse, todo = false): void {
   if (req.method !== 'POST') return reply(res, 405);
   let body = '';
   req.on('error', () => {});
@@ -203,11 +229,30 @@ function postIssue(req: IncomingMessage, res: ServerResponse): void {
     let m: any;
     try { m = JSON.parse(body); } catch { return send(400, 'MyIDE refused the request (restart it if this persists).'); }
     if (!sameToken(typeof m?.token === 'string' ? m.token : null, issueToken)) return send(401, 'MyIDE refused the request (restart it if this persists).');
+    if (todo) {
+      if (typeof m.text !== 'string' || !m.text.trim()) return send(400, 'usage: todo "what to do" [@role]');
+      try { return send(200, await onTodo(m.text.trim())); } catch (e) { return send(400, (e as Error).message); }
+    }
     if (typeof m.project !== 'string' || typeof m.title !== 'string' || !m.title.trim()) return send(400, 'Give a project and a title');
     try {
       const r = await onIssue(m.project, m.title.trim());
       send(200, r.number ? `#${r.number} ${r.url}` : 'Queued: the forge is unreachable; MyIDE files it when it is back.');
     } catch (e) { send(400, (e as Error).message); }
+  });
+}
+
+/** A hook's JSON in; 200 once MyIDE has handled it (a PreToolUse snapshot is on disk), 500 with the reason otherwise. */
+function postHook(req: IncomingMessage, res: ServerResponse, id: string, tok: string | null): void {
+  let key: string;
+  try { key = decodeURIComponent(id); } catch { return reply(res, 400); }
+  if (!sameToken(tok, tokens.get(key))) return reply(res, 401);
+  if (req.method !== 'POST') return reply(res, 405);
+  let body = '';
+  req.on('error', () => {});
+  req.on('data', (c) => { body += c; if (body.length > 4e6) req.destroy(); });
+  req.on('end', async () => {
+    try { await onHook(key, JSON.parse(body)); reply(res, 200); }
+    catch (e) { if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain' }).end(String((e as Error).message) + '\n'); }
   });
 }
 

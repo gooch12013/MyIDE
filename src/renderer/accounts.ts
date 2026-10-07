@@ -40,8 +40,14 @@ const label = (a: Account, p: Providers) => `${a.name} · ${p[a.provider]?.label
 
 /** Preferences > AI accounts. `again` re-renders the section. */
 export async function accountsSection(say: (t: string) => void, again: () => void): Promise<Node[]> {
-  const [list, p, staff, codex] = await Promise.all([api.accounts.list(), providers(), api.employees.list(), api.accounts.codexInfo()]);
+  const [list, p, staff, codex, gemini] = await Promise.all([api.accounts.list(), providers(), api.employees.list(), api.accounts.codexInfo(), api.accounts.geminiInfo()]);
   const act = (fn: () => Promise<unknown>) => async () => { try { await fn(); } catch (e) { say(errText(e)); } };
+  // Gemini accounts are API-key only: the key goes straight to the Keychain and is never shown again.
+  const keyField = (label: string) => {
+    const k = h('input', { className: 'input', type: 'password', placeholder: label, autocomplete: 'off', spellcheck: false });
+    k.setAttribute('aria-label', label);
+    return k;
+  };
 
   const rows = list.map((a) => {
     const users = staff.filter((e) => (e.accountId ?? 'claude-default') === a.id).length;
@@ -55,7 +61,10 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
     auto.onchange = act(() => api.accounts.update(a.id, { allowAuto: auto.checked }));
     const signin = led('idle', 'Checking…');
     void api.accounts.status(a.id).then((s) => signin.replaceWith(Object.assign(led(s.loggedIn ? 'working' : 'failed', s.loggedIn ? 'Signed in' : 'Not signed in'), { title: s.detail })));
-    const where = a.env.CLAUDE_CONFIG_DIR ?? a.env.CODEX_HOME ?? (a.provider === 'codex' ? '~/.codex' : '~/.claude');
+    const where = a.env.CLAUDE_CONFIG_DIR ?? a.env.CODEX_HOME ?? a.env.GEMINI_CLI_HOME ?? (a.provider === 'codex' ? '~/.codex' : '~/.claude');
+    const newKey = keyField(`Replace API key of ${a.name}`);
+    newKey.placeholder = 'Replace API key';
+    newKey.onchange = act(async () => { await api.accounts.setKey(a.id, newKey.value); newKey.value = ''; say(`${a.name}: key saved in the Keychain.`); again(); });
     const td = (l: string, ...kids: Node[]) => { const c = h('td', {}, ...kids); c.dataset.l = l; return c; };
     return h('tr', {},
       h('th', { scope: 'row' }, name, h('span', { className: 'acct-sub', textContent: `${p[a.provider]?.label ?? a.provider} · ${where}`, title: where })),
@@ -65,7 +74,7 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
       td('Cap', cap),
       td('Auto may use', h('label', { className: 'toggle' }, auto, 'Allowed')),
       td('Actions', h('span', { className: 'acct-keys' },
-        key('Log in', act(async () => { openCommandTerminal(undefined, (await api.accounts.login(a.id)).command); say(`${a.name}: finish the login in the terminal, then press Test.`); }),
+        a.provider === 'gemini' ? newKey : key('Log in', act(async () => { openCommandTerminal(undefined, (await api.accounts.login(a.id)).command); say(`${a.name}: finish the login in the terminal, then press Test.`); }),
           { title: 'Opens the AI\'s own login in a terminal, with this account\'s folder. MyIDE never sees the credentials.' }),
         key('Test', act(async () => { say(`Testing ${a.name}…`); const r = await api.accounts.test(a.id); say(`${a.name}: ${r.ok ? 'works' : 'failed'}. ${r.detail}`); }),
           { title: 'Runs one tiny turn on this account' }),
@@ -81,19 +90,22 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
 
   // Add: provider, name, and for Codex whether it uses ~/.codex or a login of its own.
   const prov = h('select', { className: 'input select' }, new Option('Claude Code', 'claude'), new Option('OpenAI Codex', 'codex'),
-    Object.assign(new Option('Gemini CLI (not yet)', 'gemini'), { disabled: true }));
+    new Option('Gemini CLI (API key)', 'gemini'));
   prov.setAttribute('aria-label', 'Provider');
   const nm = h('input', { className: 'input', placeholder: 'Name, e.g. Work', maxLength: 40 });
   nm.setAttribute('aria-label', 'Account name');
   const own = h('input', { type: 'checkbox', className: 'switch', checked: list.some((a) => a.provider === 'codex' && !a.env.CODEX_HOME) });
   const ownLbl = h('label', { className: 'toggle' }, own, 'Own login (not ~/.codex)');
-  const sync = () => { ownLbl.hidden = prov.value !== 'codex'; };
+  const apiKey = keyField('Gemini API key');
+  const sync = () => { ownLbl.hidden = prov.value !== 'codex'; apiKey.hidden = prov.value !== 'gemini'; };
   prov.onchange = sync;
   sync();
   const add = key('+ Add account', act(async () => {
-    const a = await api.accounts.add({ provider: prov.value as Account['provider'], name: nm.value, ownLogin: own.checked });
+    if (prov.value === 'gemini' && !apiKey.value.trim()) throw new Error('Paste the Gemini API key first (aistudio.google.com, API keys).');
+    const a = await api.accounts.add({ provider: prov.value as Account['provider'], name: nm.value, ownLogin: own.checked, key: prov.value === 'gemini' ? apiKey.value : undefined });
+    apiKey.value = '';
     again();
-    say(`Added ${a.name}. Press Log in to sign it in${a.provider === 'claude' ? ' (use a private browser window if the browser is signed in to your other account)' : ''}.`);
+    say(a.provider === 'gemini' ? `Added ${a.name}; its key is in the Keychain. Press Test to try it.` : `Added ${a.name}. Press Log in to sign it in${a.provider === 'claude' ? ' (use a private browser window if the browser is signed in to your other account)' : ''}.`);
   }));
 
   // Capability table, straight from providers.json.
@@ -111,13 +123,18 @@ export async function accountsSection(say: (t: string) => void, again: () => voi
   return [
     h('p', { className: 'psec-lede', textContent: 'Each account is one login of an AI\'s own CLI, with its own cap and usage gauge. An employee stays on the account it was hired on; when that account is at its limit its work waits. MyIDE never moves work to another account and never sees your credentials.' }),
     tbl,
-    h('div', { className: 'pref-ctl acct-add' }, prov, nm, ownLbl, add),
+    h('div', { className: 'pref-ctl acct-add' }, prov, nm, ownLbl, apiKey, add),
     h('h3', { className: 'legend psec-sub', textContent: 'What each AI can do' }),
     caps,
     h('div', { className: 'pref' },
       h('div', { className: 'pref-label' }, h('span', { className: 'pref-name', textContent: 'Codex CLI' }),
         h('span', { className: 'pref-hint', textContent: codex.version ? (codex.tested ? 'The version MyIDE is tested with.' : `MyIDE is tested with ${codex.testedVersion}.`) : 'Install OpenAI Codex to hire Codex employees.' })),
       h('div', { className: 'pref-ctl' }, h('span', { className: 'path', textContent: codex.path ?? 'none' }), codexState)),
+    h('div', { className: 'pref' },
+      h('div', { className: 'pref-label' }, h('span', { className: 'pref-name', textContent: 'Gemini CLI' }),
+        h('span', { className: 'pref-hint', textContent: gemini.path ? 'Not yet tested with MyIDE: written from its docs.' : 'Install Gemini CLI to use this (npm install -g @google/gemini-cli), then restart MyIDE.' })),
+      h('div', { className: 'pref-ctl' }, h('span', { className: 'path', textContent: gemini.path ?? 'none' }),
+        gemini.path ? led('interrupted', gemini.version ? `Untested (${gemini.version})` : 'Untested') : led('idle', 'Not installed'))),
   ];
 }
 
@@ -147,10 +164,29 @@ export async function accountPicker(pickEl: HTMLElement): Promise<{ el: HTMLElem
   const usable = list.filter((a) => p[a.provider]?.models.length);
   const s = h('select', { className: 'input select', id: 'hire-account' }, ...usable.map((a) => new Option(label(a, p), a.id)));
   const provider = () => usable.find((a) => a.id === s.value)?.provider ?? 'claude';
-  const sync = async () => { if (await modelsFor(pickEl, provider())) pickEl.querySelector('select')?.dispatchEvent(new Event('change')); };
+  // What the picked AI cannot do, with the reasons, and whether its CLI is installed at all.
+  const note = h('p', { className: 'pref-hint', id: 'hire-ai-note' });
+  const warn = h('p', { className: 'pref-warn', id: 'hire-ai-warn' });
+  const [model, effort] = pickEl.querySelectorAll('select');
+  const grey = () => {
+    if (!effort) return;
+    effort.title = '';
+    const [ok, why] = (p[provider()]?.effort as Cap | undefined) ?? [true, ''];
+    if (ok !== true) { effort.disabled = true; effort.title = `Not available for this AI: ${why}`; }
+  };
+  model?.addEventListener('change', grey); // the model picker re-enables effort on every model change
+  const sync = async () => {
+    const ai = provider();
+    if (await modelsFor(pickEl, ai)) model?.dispatchEvent(new Event('change'));
+    grey();
+    const missing = ai === 'claude' ? [] : CAPS.filter(([c]) => (p[ai]?.[c] as Cap | undefined)?.[0] !== true);
+    note.textContent = missing.length ? `Not on ${p[ai]?.label ?? ai}: ${missing.map(([, t]) => t).join(', ')}.` : '';
+    note.title = missing.map(([c, t]) => `${t}: ${(p[ai][c] as Cap)[1]}`).join('\n'); // the reasons
+    warn.textContent = ai === 'gemini' && !(await api.accounts.geminiInfo()).path ? 'Install Gemini CLI to use this: no gemini on your login PATH.' : '';
+  };
   s.onchange = () => void sync();
   return {
-    el: h('label', { className: 'field', htmlFor: 'hire-account' }, h('span', { className: 'legend', textContent: 'AI account' }), s),
+    el: h('div', {}, h('label', { className: 'field', htmlFor: 'hire-account' }, h('span', { className: 'legend', textContent: 'AI account' }), s), note, warn),
     get: () => ({ accountId: s.value, provider: provider() }),
     sync,
   };

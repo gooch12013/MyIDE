@@ -1,4 +1,5 @@
 import type { ForgeSnapshot } from '../main/forge';
+import { attachBox } from './attach';
 import { errText, h, key } from './dom';
 import { led, openEmployee, type Employee } from './employees';
 import { activeProject, allProjects } from './projects';
@@ -78,18 +79,19 @@ async function openAssign(s: ForgeSnapshot, i: Issue): Promise<void> {
 }
 
 /** The New issue sheet. `projectId` preselects a project. */
-export async function openNewIssue(projectId?: string): Promise<void> {
+/** `prefill` fills the title (a promoted to-do). */
+export async function openNewIssue(projectId?: string, prefill = ''): Promise<void> {
   const linked = await api.forge.issues();
   if (!linked.length) { alert('No project links a forge yet. Link one in Preferences > Forges.'); return; }
   const project = h('select', { className: 'input select' }, ...linked.map((s) => new Option(`${proj(s.projectId)?.name ?? s.projectId} · ${FORGE[s.provider]} ${s.repo}`, s.projectId)));
   project.value = linked.some((s) => s.projectId === projectId) ? projectId! : linked[0].projectId;
-  const title = h('input', { className: 'input', required: true, autocomplete: 'off', placeholder: 'Leaderboard flickers when a match ends' });
+  const title = h('input', { className: 'input', required: true, autocomplete: 'off', placeholder: 'Leaderboard flickers when a match ends', value: prefill });
   const body = h('textarea', { className: 'input', rows: 5, placeholder: 'Steps, logs, or paste a screenshot (optional)' });
   const labels = h('input', { className: 'input', autocomplete: 'off', placeholder: 'bug, sync' });
-  const thumbs = h('div', { className: 'iss-thumbs' });
+  const attach = attachBox(body, (t) => say(t), () => void sync()); // say is set once the form exists
+  const images = attach.images;
   const as = h('p', { className: 'pref-hint' });
   const whoBox = h('div', { className: 'field' });
-  const images: { name: string; type: string; data: Uint8Array; url: string }[] = [];
   const file = h('button', { className: 'btn btn--primary', value: 'file', textContent: 'File issue' });
   let who: HTMLSelectElement;
 
@@ -103,17 +105,6 @@ export async function openNewIssue(projectId?: string): Promise<void> {
     who.disabled = github && images.length > 0;
     whoBox.replaceChildren(h('span', { className: 'legend', textContent: 'Assign now' }), who);
   };
-  const drawThumbs = () => thumbs.replaceChildren(...images.map((img, n) => h('span', { className: 'iss-thumb' },
-    h('img', { src: img.url, alt: img.name }),
-    key('×', () => { URL.revokeObjectURL(img.url); images.splice(n, 1); drawThumbs(); void sync(); }, { title: `Remove ${img.name}`, ariaLabel: `Remove ${img.name}` }))));
-  body.onpaste = async (ev) => {
-    const files = [...(ev.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'));
-    if (!files.length) return;
-    ev.preventDefault();
-    for (const f of files) images.push({ name: f.name || `pasted-${images.length + 1}.png`, type: f.type, data: new Uint8Array(await f.arrayBuffer()), url: URL.createObjectURL(f) });
-    drawThumbs();
-    void sync();
-  };
   project.onchange = () => void sync();
   await sync();
 
@@ -122,7 +113,7 @@ export async function openNewIssue(projectId?: string): Promise<void> {
     h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Project' }), project),
     h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Title' }), title,
       h('span', { className: 'pref-hint', textContent: 'The title can be the whole spec. Employees verify it against the code.' })),
-    h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Body (optional)' }), body), thumbs,
+    h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Body (optional)' }), body), attach.el,
     h('div', { className: 'iss-form-row' },
       h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Labels' }), labels), whoBox),
     as,
@@ -130,7 +121,6 @@ export async function openNewIssue(projectId?: string): Promise<void> {
   const say = sheetText(form);
   form.append(h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), file));
   const d = sheet('New issue', form);
-  d.addEventListener('close', () => images.forEach((i) => URL.revokeObjectURL(i.url)));
   title.focus();
   form.onsubmit = async (ev) => {
     if (ev.submitter !== file) return;

@@ -11,6 +11,7 @@ import './employee';
 import './issues';
 import './buttons';
 import './assets';
+import './todos';
 import { startWorkspace } from './layouts';
 import { activeProject } from './projects';
 

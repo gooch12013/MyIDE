@@ -29,7 +29,7 @@ export function readJSON<T>(name: string, fallback: T): T {
 }
 
 /** Writes a file only its owner can read, creating owner-only folders. ~/.myide holds session ids and MCP tokens. */
-export function writePrivate(file: string, text: string): void {
+export function writePrivate(file: string, text: string | Uint8Array): void {
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   writeFileSync(file, text, { mode: 0o600 });
   chmodSync(file, 0o600); // mode only applies when the file is created

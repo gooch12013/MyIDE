@@ -1,4 +1,4 @@
-// Codex employees: one turn = one run of the Codex ACP adapter (@agentclientprotocol/codex-acp) driving
+// ACP employees (Codex here, Gemini in gemini.ts) share runAcpTurn. Codex: one turn = one run of the Codex ACP adapter (@agentclientprotocol/codex-acp) driving
 // the user's own `codex` (CODEX_PATH), in an Electron utility process. The ACP session id is the codex
 // thread id, so the next turn loads it, and `codex resume <id>` opens the same session in a terminal.
 // ponytail: a fresh adapter process per turn (start-up plus a session/load replay each time). Keep one
@@ -8,11 +8,12 @@ import { execFile } from 'node:child_process';
 import { accessSync, constants, readFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { promisify } from 'node:util';
+import { readImage } from '../attach';
 import type { ClaudeEvent } from '../claude/parse';
 import type { Turn, TurnOpts } from '../claude/transport';
 import { spawnEnv } from '../pty';
 import { MCP_TOOL_TIMEOUT_MS, ownTool } from '../mcp';
-import { hardDenied, makeAcpMapper, parseCodexStatus, rpcClient } from './client';
+import { hardDenied, makeAcpMapper, parseCodexStatus, permissionCommand, pickOption, rpcClient } from './client';
 
 type Result = Extract<ClaudeEvent, { type: 'result' }>;
 const ADAPTER = join(__dirname, '..', 'node_modules', '@agentclientprotocol', 'codex-acp', 'dist', 'index.js');
@@ -53,10 +54,53 @@ function mcpServers(file: string): Record<string, { url: string; tool_timeout_se
   return Object.fromEntries(Object.entries(servers).map(([name, s]: [string, any]) => [name, { url: String(s.url), tool_timeout_sec: MCP_TOOL_TIMEOUT_MS / 1000 }]));
 }
 
-export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employeeId?: string }): Turn {
+/** A running ACP agent process: `send` writes one JSON-RPC line to its stdin. */
+export type AcpProc = { send(line: string): void; kill(): void };
+/** What differs between ACP agents; the session runner below is shared. */
+export interface AcpLaunch {
+  name: string; // in messages: "Codex", "Gemini"
+  /** Starts the agent in o.cwd. Feed each stdout chunk to `data`, and call `exit` once when it ends. Throws if it cannot start. */
+  spawn(o: AcpTurnOpts, io: { data(chunk: string): void; stderr(chunk: string): void; exit(code: number | null): void }): Promise<{ proc: AcpProc; servers: string[] }>;
+  /** After session/new or session/load, before the prompt (model, effort). */
+  configure?(call: (method: string, params: unknown) => Promise<any>, sessionId: string, o: AcpTurnOpts): Promise<void>;
+  /** After the prompt: `ask` sends a prompt and returns the agent's reply text (Codex's /status). */
+  after?(ask: (text: string) => Promise<string>, emit: (e: ClaudeEvent) => void): Promise<void>;
+}
+export type AcpTurnOpts = TurnOpts & { env: Record<string, string>; employeeId?: string; accountId?: string };
+
+const codexLaunch: AcpLaunch = {
+  name: 'Codex',
+  async spawn(o, io) {
+    const env = { ...(await spawnEnv()), ...o.env };
+    const codex = findCodex(env.PATH);
+    if (!codex) throw new Error('Codex is not installed (no codex on your PATH).');
+    const servers = mcpServers(o.mcpConfigPath);
+    // workspace-write: on-request approvals reviewed by the user (David, via NEEDS YOU), not Codex's own auto review.
+    const adapterEnv = { ...env, CODEX_PATH: codex, INITIAL_AGENT_MODE: 'workspace-write', CODEX_CONFIG: JSON.stringify({ mcp_servers: servers }) };
+    const child: UtilityProcess = utilityProcess.fork(HOST, [ADAPTER], { env: adapterEnv, cwd: o.cwd, stdio: ['ignore', 'ignore', 'pipe'], serviceName: 'Codex ACP' });
+    child.stderr?.on('data', (d) => io.stderr(String(d)));
+    child.once('exit', (code) => io.exit(code));
+    child.on('message', (chunk: unknown) => io.data(String(chunk)));
+    return { proc: { send: (line) => child.postMessage(line), kill: () => child.kill() }, servers: Object.keys(servers) };
+  },
+  async configure(call, sessionId, o) {
+    if (o.model) await call('session/set_config_option', { sessionId, configId: 'model', value: o.model }); // '' keeps Codex's own default
+    if (o.effort) await call('session/set_config_option', { sessionId, configId: 'reasoning_effort', value: o.effort });
+  },
+  // Rate limits only arrive as /status text; it makes no model call.
+  async after(ask, emit) {
+    const u = parseCodexStatus(await Promise.race([ask('/status'), new Promise<string>((ok) => setTimeout(() => ok(''), 15_000))]));
+    if (u) emit({ type: 'rate', ...u });
+  },
+};
+
+export const runCodexTurn = (o: AcpTurnOpts): Turn => runAcpTurn(o, codexLaunch);
+
+/** One turn of any ACP agent: initialize, session/new or session/load, the prompt, then the launch's `after`. */
+export function runAcpTurn(o: AcpTurnOpts, launch: AcpLaunch): Turn {
   const emit = (e: ClaudeEvent) => { try { o.onEvent?.(e); } catch (err) { console.error(err); } };
   const mapper = makeAcpMapper();
-  let child: UtilityProcess | undefined;
+  let child: AcpProc | undefined;
   let rpc: ReturnType<typeof rpcClient> | undefined;
   let sessionId = o.sessionId ?? '';
   let phase: 'start' | 'prompt' | 'status' | 'done' = 'start';
@@ -66,8 +110,10 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
   const asking = new Set<() => void>();
   const mcpCalls = new Map<string, { server?: string; tool?: string }>(); // tool call id -> MCP server and tool, for its approval // permission prompts waiting on David; answered "cancelled" on interrupt
 
+  let lastUpdate = 0; // when the last session/update arrived (Gemini replays a loaded session after answering session/load)
   const onNotify = (method: string, p: any) => {
     if (method !== 'session/update' || p?.sessionId !== sessionId) return;
+    lastUpdate = Date.now();
     const u = p.update;
     if (u?.sessionUpdate === 'tool_call' && u.rawInput?.server) mcpCalls.set(u.toolCallId, { server: String(u.rawInput.server), tool: String(u.rawInput.tool ?? '') });
     if (phase === 'prompt') mapper.push(p.update).forEach(emit); // session/load replays history before this: ignored
@@ -81,14 +127,11 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
     const cancel = { outcome: { outcome: 'cancelled' } };
     if (!approver || phase !== 'prompt' || cancelled) return cancel;
     const plan = tc.kind === 'switch_mode';
-    // Codex offers two reject_once options: "decline" (carry on without it) and "cancel" (which ends the turn). Deny means decline.
-    const pickOf = (want: 'allow' | 'reject') => (want === 'reject' ? options.find((x) => x.optionId === 'decline') : undefined)
-      ?? options.find((x) => x.kind === `${want}_once`) ?? options.find((x) => x.kind.startsWith(want));
-    const cmd = tc.rawInput?.command;
-    const command = Array.isArray(cmd) ? cmd.join(' ') : typeof cmd === 'string' ? cmd : '';
+    const pickOf = (want: 'allow' | 'reject') => pickOption(options, want);
+    const command = permissionCommand(tc);
     // Never asked: the forge goes through MyIDE's forge tool, commits through the attribution hook.
     if (command && hardDenied(command)) {
-      console.warn(`Codex employee ${o.employeeId}: refused ${command.slice(0, 200)}`);
+      console.warn(`${launch.name} employee ${o.employeeId}: refused ${command.slice(0, 200)}`);
       refused = command.slice(0, 200);
       const no = pickOf('reject');
       return no ? { outcome: { outcome: 'selected', optionId: no.optionId } } : cancel;
@@ -115,57 +158,57 @@ export function runCodexTurn(o: TurnOpts & { env: Record<string, string>; employ
   const done = (async (): Promise<Result> => {
     let stderr = '';
     try {
-      const env = { ...(await spawnEnv()), ...o.env };
-      const codex = findCodex(env.PATH);
-      if (!codex) throw new Error('Codex is not installed (no codex on your PATH).');
       if (cancelled) throw new Error('Interrupted before start');
-      const servers = mcpServers(o.mcpConfigPath);
-      // workspace-write: on-request approvals reviewed by the user (David, via NEEDS YOU), not Codex's own auto review.
-      const adapterEnv = { ...env, CODEX_PATH: codex, INITIAL_AGENT_MODE: 'workspace-write', CODEX_CONFIG: JSON.stringify({ mcp_servers: servers }) };
-      child = utilityProcess.fork(HOST, [ADAPTER], { env: adapterEnv, cwd: o.cwd, stdio: ['ignore', 'ignore', 'pipe'], serviceName: 'Codex ACP' });
-      child.stderr?.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
-      const exited = new Promise<never>((_, reject) => child!.once('exit', (code) => {
-        rpc?.close('exited');
-        reject(new Error(cancelled ? 'Interrupted' : stderr.trim().split('\n').slice(-5).join('\n') || `The Codex adapter exited (${code}).`));
-      }));
-      exited.catch(() => {});
-      rpc = rpcClient((line) => child!.postMessage(line), { onNotify, onRequest });
       let buf = '';
-      child.on('message', (chunk: unknown) => {
-        buf += String(chunk);
-        for (let i; (i = buf.indexOf('\n')) >= 0;) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) rpc!.push(line); }
+      let onExit: (code: number | null) => void = () => {};
+      const exited = new Promise<never>((_, reject) => { onExit = (code) => {
+        rpc?.close('exited');
+        reject(new Error(cancelled ? 'Interrupted' : stderr.trim().split('\n').slice(-5).join('\n') || `The ${launch.name} agent exited (${code}).`));
+      }; });
+      exited.catch(() => {});
+      const started = await launch.spawn(o, {
+        data: (chunk) => {
+          buf += chunk;
+          for (let i; (i = buf.indexOf('\n')) >= 0;) { const line = buf.slice(0, i); buf = buf.slice(i + 1); if (line.trim()) rpc?.push(line); }
+        },
+        stderr: (d) => { stderr = (stderr + d).slice(-4000); },
+        exit: (code) => onExit(code),
       });
+      child = started.proc;
+      if (cancelled) throw new Error('Interrupted before start');
+      rpc = rpcClient((line) => child!.send(line), { onNotify, onRequest });
       const call = (method: string, params: unknown) => Promise.race([rpc!.call(method, params), exited]);
 
       await call('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: 'MyIDE', version: '0' } });
-      if (o.sessionId) await call('session/load', { sessionId, cwd: o.cwd, mcpServers: [] });
-      else sessionId = (await call('session/new', { cwd: o.cwd, mcpServers: [] })).sessionId;
-      if (o.model) await call('session/set_config_option', { sessionId, configId: 'model', value: o.model }); // '' keeps Codex's own default
-      if (o.effort) await call('session/set_config_option', { sessionId, configId: 'reasoning_effort', value: o.effort });
-      emit({ type: 'init', sessionId, model: o.model, tools: [], mcpServers: Object.keys(servers).map((name) => ({ name, status: 'connected' })) });
+      if (o.sessionId) {
+        await call('session/load', { sessionId, cwd: o.cwd, mcpServers: [] });
+        // ponytail: replayed history is told apart from the new turn by timing (quiet for 300 ms). Gemini streams the replay
+        // after answering session/load; Codex before. Ceiling: a replay that stalls longer leaks old lines into the turn.
+        lastUpdate = Date.now();
+        while (Date.now() - lastUpdate < 300) await new Promise((ok) => setTimeout(ok, 100));
+      } else sessionId = (await call('session/new', { cwd: o.cwd, mcpServers: [] })).sessionId;
+      await launch.configure?.(call, sessionId, o);
+      emit({ type: 'init', sessionId, model: o.model, tools: [], mcpServers: started.servers.map((name) => ({ name, status: 'connected' })) });
       if (cancelled) throw new Error('Interrupted');
 
       // The role prompt goes in as the start of the first turn; resumed sessions already have it.
       const text = !o.sessionId && o.appendSystemPrompt ? `${o.appendSystemPrompt}\n\n---\n\n${o.prompt}` : o.prompt;
       phase = 'prompt';
-      const r = await call('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
+      const images = (o.images ?? []).map((f) => { const i = readImage(f); return { type: 'image', mimeType: i.mediaType, data: i.data }; });
+      const r = await call('session/prompt', { sessionId, prompt: [...images, { type: 'text', text }] });
       mapper.flush().forEach(emit);
       const stop = String(r?.stopReason ?? '');
 
-      // Rate limits only arrive as /status text; it makes no model call.
-      if (!cancelled) {
+      if (!cancelled && launch.after) {
         phase = 'status';
-        try {
-          await Promise.race([call('session/prompt', { sessionId, prompt: [{ type: 'text', text: '/status' }] }), new Promise((ok) => setTimeout(ok, 15_000))]);
-          const u = parseCodexStatus(statusText);
-          if (u) emit({ type: 'rate', ...u });
-        } catch { /* the gauge just stays where it was */ }
+        const ask = async (q: string) => { statusText = ''; await call('session/prompt', { sessionId, prompt: [{ type: 'text', text: q }] }); return statusText; };
+        try { await launch.after(ask, emit); } catch { /* e.g. the gauge just stays where it was */ }
       }
       const ok = stop === 'end_turn';
       if (stop === 'cancelled' && refused && !cancelled) {
-        return { type: 'result', ok: false, interrupted: false, sessionId, text: `MyIDE refused \`${refused}\` (forge writes go through the forge tool, commits through the hook), and Codex ends its turn on a refusal. Send it a message to continue.` };
+        return { type: 'result', ok: false, interrupted: false, sessionId, text: `MyIDE refused \`${refused}\` (forge writes go through the forge tool, commits through the hook), and ${launch.name} ends its turn on a refusal. Send it a message to continue.` };
       }
-      return { type: 'result', ok, interrupted: stop === 'cancelled', sessionId, text: mapper.lastText() || (ok ? '' : `Codex stopped: ${stop || 'no reason given'}`) };
+      return { type: 'result', ok, interrupted: stop === 'cancelled', sessionId, text: mapper.lastText() || (ok ? '' : `${launch.name} stopped: ${stop || 'no reason given'}`) };
     } catch (err) {
       return { type: 'result', ok: false, interrupted: cancelled, sessionId, text: (err as Error).message };
     } finally {

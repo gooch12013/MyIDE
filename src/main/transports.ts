@@ -1,4 +1,4 @@
-// One entry point for a turn on any AI: Claude through `claude -p`, Codex through ACP. Both take the
+// One entry point for a turn on any AI: Claude through `claude -p`, Codex and Gemini through ACP. Both take the
 // same TurnOpts and report the same ClaudeEvents; the account decides the env (which login is used).
 import { ipcMain } from 'electron';
 import { execFile } from 'node:child_process';
@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { account, DEFAULT_ACCOUNT, registerAccountsIpc, reportUsage, type Account } from './accounts';
 import { codexInfo, onAcpPermission, runCodexTurn, type AcpPermission } from './acp/codex';
+import { geminiInfo, KEY_SERVICE, runGeminiTurn } from './acp/gemini';
+import { getToken } from './keychain';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
 import { addApproval, employeeMcpConfig, resolveApproval } from './mcp';
 import { spawnEnv } from './pty';
@@ -43,6 +45,10 @@ export function runTurnFor(emp: Emp, o: TurnOpts): Turn {
     const p = providers().codex;
     return runCodexTurn({ ...o, model: known(p.models, o.model) ?? '', effort: known(p.efforts, o.effort), onEvent, env: a.env, employeeId: emp.id });
   }
+  if (a.provider === 'gemini') {
+    // Same rule as Codex: a model name Gemini does not list ('auto', 'pro', ...) leaves its own default.
+    return runGeminiTurn({ ...o, model: known(providers().gemini.models, o.model) ?? '', effort: undefined, onEvent, env: a.env, employeeId: emp.id, accountId: a.id });
+  }
   throw new Error(`${providers()[a.provider]?.label ?? a.provider} employees are not supported yet.`);
 }
 
@@ -67,6 +73,13 @@ export function talkCommandFor(emp: Emp, base: { sessionId: string; model: strin
     return ['exec', envPrefix('CODEX_HOME', a.env.CODEX_HOME), 'codex resume', shq(base.sessionId), ...(model ? ['-m', shq(model)] : []),
       ...(effort ? ['-c', shq(`model_reasoning_effort="${effort}"`)] : [])].join(' ');
   }
+  if (a.provider === 'gemini') {
+    // The key comes from the Keychain inside the terminal's own shell, so it is never on a command line or in a file.
+    const kc = process.env.MYIDE_KEYCHAIN ? ` ${shq(process.env.MYIDE_KEYCHAIN)}` : '';
+    const model = known(providers().gemini.models, base.model);
+    return [`GEMINI_CLI_HOME=${shq(a.env.GEMINI_CLI_HOME ?? '')}`, `GEMINI_API_KEY="$(/usr/bin/security find-generic-password -s ${KEY_SERVICE} -a ${shq(a.id)} -w${kc})"`,
+      'exec gemini --resume', shq(base.sessionId), ...(model ? ['--model', shq(model)] : [])].join(' ');
+  }
   if (a.provider !== 'claude') throw new Error(`Talk is not available for ${a.provider} yet.`);
   return ['exec', envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR), 'claude --resume', shq(base.sessionId), '--settings', shq(base.settingsPath),
     '--model', shq(base.model), ...(base.effort ? ['--effort', shq(base.effort)] : []),
@@ -76,11 +89,16 @@ export function talkCommandFor(emp: Emp, base: { sessionId: string; model: strin
 /** The CLI's own login, in a terminal, with the account's env. */
 function loginCommand(a: Account): string {
   if (a.provider === 'codex') return `${envPrefix('CODEX_HOME', a.env.CODEX_HOME)} codex login`;
+  if (a.provider === 'gemini') throw new Error('Gemini accounts use an API key: paste it into the key field instead.');
   return `${envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR)} claude auth login`;
 }
 
 /** What the CLI itself says about its login; MyIDE reads no credential. */
 async function loginStatus(a: Account): Promise<{ loggedIn: boolean; detail: string }> {
+  if (a.provider === 'gemini') { // API key only: "signed in" means a key is in the Keychain
+    const has = !!(await getToken(KEY_SERVICE, a.id));
+    return { loggedIn: has, detail: has ? 'API key in the Keychain' : 'No API key yet' };
+  }
   const env = { ...(await spawnEnv()), ...a.env };
   const run = promisify(execFile);
   try {
@@ -131,4 +149,5 @@ export function registerAiIpc(): void {
   ipcMain.handle('accounts:status', (_e, id: string) => { const a = account(id); return a ? loginStatus(a) : { loggedIn: false, detail: 'No such account' }; });
   ipcMain.handle('accounts:test', (_e, id: string) => testAccount(id));
   ipcMain.handle('codex:info', () => codexInfo());
+  ipcMain.handle('gemini:info', () => geminiInfo());
 }

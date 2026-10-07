@@ -287,7 +287,7 @@ registerPanel('employees', {
       needs.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · ${pending.length + drafts.length}` }), ...pending.map((a) => {
         const e = everyone.find((x) => x.id === a.employeeId);
         const p = allProjects().find((x) => x.id === e?.projectId);
-        return needCard(a, `${p?.name ?? '?'} / ${e?.name ?? a.employeeId}`, p?.colour);
+        return needCard(a, `${p?.name ?? (e?.projectId === 'mac' ? 'This Mac' : '?')} / ${e?.name ?? a.employeeId}`, p?.colour);
       }), ...drafts);
     };
 

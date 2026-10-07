@@ -15,6 +15,7 @@ import type { Row as ComponentRow } from '../main/components';
 import type { SpeechSettings, SpeechStatus } from '../main/speech';
 import type { Button, PaletteItem, Schedule } from '../main/buttons';
 import type { AssetRequest, Catalog } from '../main/assets';
+import type { Todo } from '../main/todos';
 
 export type OrgState = {
   caps: { global: number; perProject: number; maxReports: number; maxDepth: number };
@@ -93,16 +94,20 @@ const api = {
   employees: {
     list: (projectId?: string): Promise<Employee[]> => ipcRenderer.invoke('employees:list', projectId),
     roles: (projectId: string): Promise<Role[]> => ipcRenderer.invoke('employees:roles', projectId),
-    hire: (o: { projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; accountId?: string }): Promise<Employee> => ipcRenderer.invoke('employees:hire', o),
+    hire: (o: { projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; accountId?: string; images?: { type: string; data: Uint8Array }[] }): Promise<Employee> => ipcRenderer.invoke('employees:hire', o),
     /** Next turn; queued if busy, talking or over the caps. */
-    send: (id: string, text: string): Promise<void> => ipcRenderer.invoke('employees:send', id, text),
+    send: (id: string, text: string, images?: { type: string; data: Uint8Array }[]): Promise<void> => ipcRenderer.invoke('employees:send', id, text, images),
+    /** An image file inside the employee's worktree as a data URL, or null if it is not one. */
+    image: (id: string, path: string): Promise<string | null> => ipcRenderer.invoke('employees:image', id, path),
     /** Applies on the next turn; now: interrupt and resume with the new model/effort. */
     setModel: (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }): Promise<void> => ipcRenderer.invoke('employees:set-model', id, o),
     interrupt: (id: string): Promise<void> => ipcRenderer.invoke('employees:interrupt', id),
     /** Pauses the employee; open terminal ptyId in cwd running command. Talk ends when that PTY exits. */
     talk: (id: string): Promise<{ cwd: string; command: string; ptyId: string }> => ipcRenderer.invoke('employees:talk', id),
     fire: (id: string, o: { removeWorktree: boolean }): Promise<void> => ipcRenderer.invoke('employees:fire', id, o),
-    transcript: (id: string): Promise<{ role: 'user' | 'assistant' | 'tool'; text: string; at?: string }[]> => ipcRenderer.invoke('employees:transcript', id),
+    /** GO on a This Mac employee's plan: its next turn runs exactly the planned commands. */
+    go: (id: string): Promise<void> => ipcRenderer.invoke('employees:go', id),
+    transcript: (id: string): Promise<{ role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[]> => ipcRenderer.invoke('employees:transcript', id),
     onChange: (cb: (e: Employee) => void) => on('employees:change', cb),
     onRemoved: (cb: (id: string) => void) => on('employees:removed', cb),
     /** A notification was clicked: show this employee. */
@@ -129,7 +134,9 @@ const api = {
   // AI accounts (feature 22): which login each employee runs on, its usage gauge, and the capability table.
   accounts: {
     list: (): Promise<(Account & { usage?: Usage })[]> => ipcRenderer.invoke('accounts:list'),
-    add: (o: { name?: string; provider: Provider; ownLogin?: boolean }): Promise<Account> => ipcRenderer.invoke('accounts:add', o),
+    add: (o: { name?: string; provider: Provider; ownLogin?: boolean; key?: string }): Promise<Account> => ipcRenderer.invoke('accounts:add', o),
+    /** A Gemini account's API key, into the Keychain. */
+    setKey: (id: string, key: string): Promise<void> => ipcRenderer.invoke('accounts:set-key', id, key),
     update: (id: string, patch: { name?: string; cap?: number; allowAuto?: boolean }): Promise<void> => ipcRenderer.invoke('accounts:update', id, patch),
     remove: (id: string): Promise<void> => ipcRenderer.invoke('accounts:remove', id),
     /** The command that runs the CLI's own login with the account's env, for a terminal. */
@@ -139,6 +146,7 @@ const api = {
     test: (id: string): Promise<{ ok: boolean; detail: string }> => ipcRenderer.invoke('accounts:test', id),
     providers: (): Promise<Providers> => ipcRenderer.invoke('providers:get'),
     codexInfo: (): Promise<{ path: string | null; version: string | null; tested: boolean; testedVersion: string }> => ipcRenderer.invoke('codex:info'),
+    geminiInfo: (): Promise<{ path: string | null; version: string | null }> => ipcRenderer.invoke('gemini:info'),
     onUsage: (cb: (id: string, u: Usage) => void) => on('accounts:usage', cb),
   },
   // Forge issues: GitHub and Forgejo links, tokens (kept in the Keychain, never sent here), issues, drafts.
@@ -248,6 +256,23 @@ const api = {
     setLine: (credits: number): Promise<void> => ipcRenderer.invoke('assets:set-line', credits),
     installRole: (): Promise<string> => ipcRenderer.invoke('assets:install-role'),
     onChange: (cb: (projectId: string) => void) => on('assets:change', cb),
+  },
+  // Personal to-dos (~/.myide/todos.json) and This Mac's change journal.
+  todos: {
+    list: (): Promise<Todo[]> => ipcRenderer.invoke('todos:list'),
+    /** "text #tag @role": an @role also hires that This Mac employee; error says why it was not assigned. */
+    add: (text: string): Promise<{ todo: Todo; error?: string }> => ipcRenderer.invoke('todos:add', text),
+    update: (id: string, patch: Partial<Pick<Todo, 'text' | 'done' | 'due' | 'priority' | 'tags' | 'role' | 'employeeId'>>): Promise<Todo> => ipcRenderer.invoke('todos:update', id, patch),
+    remove: (id: string): Promise<void> => ipcRenderer.invoke('todos:remove', id),
+    /** Hires a This Mac employee with that role for the to-do. */
+    assign: (id: string, role: string): Promise<Todo> => ipcRenderer.invoke('todos:assign', id, role),
+    /** Its commands with their output, and its snapshots. */
+    log: (id: string): Promise<string> => ipcRenderer.invoke('todos:log', id),
+    diff: (id: string, path: string): Promise<string> => ipcRenderer.invoke('todos:diff', id, path),
+    rollback: (id: string, path: string): Promise<void> => ipcRenderer.invoke('todos:rollback', id, path),
+    /** Copies the This Mac roles into ~/.claude/agents (never over an existing file). */
+    installRoles: (): Promise<string> => ipcRenderer.invoke('todos:install-roles'),
+    onChange: (cb: () => void) => on('todos:change', cb),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

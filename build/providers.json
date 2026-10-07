@@ -29,16 +29,16 @@
   },
   "gemini": {
     "label": "Gemini CLI",
-    "models": [],
+    "models": [["auto", "Auto"], ["pro", "Pro"], ["flash", "Flash"], ["flash-lite", "Flash Lite"]],
     "efforts": [],
-    "testModel": "",
-    "voice": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "planMode": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "liveModel": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "effort": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "todos": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "resume": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "images": ["unknown", "Untested: Gemini CLI is not wired up yet."],
-    "computerUse": ["unknown", "Untested: Gemini CLI is not wired up yet."]
+    "testModel": "flash-lite",
+    "voice": [false, "Gemini CLI has no voice command; use macOS dictation in the message box."],
+    "planMode": ["unknown", "Gemini CLI has a read-only plan mode (ACP session mode \"plan\"); MyIDE does not drive it yet. Needs checking."],
+    "liveModel": [true, "From the next turn (--model on each turn's launch). From the docs, not run yet: needs checking."],
+    "effort": [false, "Gemini CLI has no effort or thinking level setting in ACP mode or on its command line."],
+    "todos": [false, "Gemini CLI's ACP mode sends no plan updates (source, v0.63.0), so there is no cue list; the last tool shows instead."],
+    "resume": [true, "gemini --resume with the ACP session id (docs). Not run yet: needs checking."],
+    "images": [true, "ACP image blocks (promptCapabilities.image in the source). Not run yet: needs checking."],
+    "computerUse": [false, "Gemini CLI has no computer use tool."]
   }
 }

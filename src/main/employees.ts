@@ -1,8 +1,9 @@
 import { BrowserWindow, ipcMain, Notification } from 'electron';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { saveAttachments, worktreeImage } from './attach';
 import { installHooks } from './attribution';
 import type { ClaudeEvent, TaskState } from './claude/parse';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
@@ -10,7 +11,8 @@ import { account, claudeConfigDir, listAccounts, usageOf } from './accounts';
 import { forgeAction } from './forge';
 import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
-import { addApproval, employeeMcpConfig, onApproval, onApprovalGone, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
+import { planCommands } from './mac';
+import { addApproval, clearGrants, employeeMcpConfig, grantCommands, hookUrl, onApproval, onApprovalGone, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
 import { aboveCeiling, autoPick, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
 import { listProjects, readConfig, writeConfig } from './projects';
 import { onPtyExit } from './pty';
@@ -30,8 +32,10 @@ export interface Employee {
   accountId: string; provider: 'claude' | 'codex' | 'gemini';
   /** A model above the ceiling, waiting on David's approval; the next turn waits with it. */
   held?: Pick;
+  /** This Mac: the plan from its last ExitPlanMode, the commands in it, and when David hit GO. */
+  plan?: { text: string; commands: string[]; approvedAt?: number };
 }
-export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; source: 'user' | 'project' }
+export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; addDirs?: string[]; source: 'user' | 'project' }
 /** Per-project org settings, kept in that project's state.json. Priority and pause live in config.json projects[]. */
 export interface ProjectOrg { model?: string; effort?: string; mode?: Mode; ceiling?: Pick; maxDepth?: number }
 type Issue = NonNullable<Employee['issue']>;
@@ -41,7 +45,10 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // ended: the state the last turn ended in, shown again once a late approval is answered.
 // heldFor: the ceiling and who asked, so the approval can be raised again after a restart.
 // wakeups: turns a lead ran on its reports' results since David last spoke to it (runaway bound).
-interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: string[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number }
+// A pending turn with images David attached carries their stored paths.
+type Pending = string | { text: string; images: string[] };
+// go: This Mac's next turn runs the approved plan (permission mode default, these commands granted once).
+interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
 
 const HOOKS = join(STATE_DIR, 'hooks');
 const NO_ATTRIBUTION = 'No AI attribution anywhere: no Co-Authored-By trailer, no "Generated with Claude Code" line and no Claude-Session line in commits, pull requests, issues or comments. Everything goes out as the user.';
@@ -66,11 +73,53 @@ const settingsFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'settings
 const mcpFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'mcp', `${e.id}.json`);
 const talkPromptFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'talk', `${e.id}.md`);
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'employee';
-const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, ...e }: Emp): Employee => e;
+const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, go, ...e }: Emp): Employee => e;
 const put = (file: string, data: object) => writePrivate(file, JSON.stringify(data, null, 2));
 const broadcast = (channel: string, ...args: unknown[]) => {
   for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
 };
+
+// ---- This Mac: a built-in pseudo-project, no repo and no worktrees; its employees plan read-only, then run on GO ----
+
+export const MAC = { id: 'mac', name: 'This Mac', path: join(STATE_DIR, 'mac'), colour: '#8fa3b8' };
+const isMac = (e: { projectId: string }) => e.projectId === MAC.id;
+const goTurns = new Set<string>(); // This Mac employees whose running turn is a GO
+const MAC_RULES = 'You work on David\'s Mac itself (shell, files, settings, his servers and services), not in a code repository. '
+  + 'Every task starts in plan mode: investigate read-only, then call ExitPlanMode with your plan. In the plan put every command you will run, '
+  + 'exactly as you will run it, one per line, in a single ```bash block, and list each file you will edit with its full path. '
+  + 'David approves the plan (GO); your next turn runs with exactly those commands allowed once each, and anything else waits for him. '
+  + 'Never print keychain secrets or tokens. Do not touch git repositories unless the task asks. Servers\' own approval rules apply.';
+
+/** This Mac's settings: the usual denies plus the change journal hooks (snapshot before an edit, log every Bash call). */
+function macSettings(e: Emp): object {
+  const base = employeeSettings() as { permissions: { deny: string[] } };
+  const post = (fail: string) => `curl -sf --max-time 60 -H 'Content-Type: application/json' --data-binary @- '${hookUrl(e.id)}' >/dev/null 2>&1 || ${fail}`;
+  return {
+    ...base,
+    permissions: { deny: [...base.permissions.deny, ...['journal/**', 'todos/**'].flatMap((g) => ['Edit', 'Write'].map((t) => `${t}(/${join(STATE_DIR, g)})`))] },
+    hooks: {
+      PreToolUse: [{ matcher: 'Edit|Write|MultiEdit|NotebookEdit', hooks: [{ type: 'command', command: post(`{ echo 'MyIDE could not snapshot this file into the change journal, so the edit was blocked.' >&2; exit 2; }`) }] }],
+      PostToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: post('true') }] }],
+    },
+  };
+}
+const settingsFor = (e: Emp) => (isMac(e) ? macSettings(e) : employeeSettings());
+
+/** GO on a This Mac plan: its pending ExitPlanMode is answered (the plan-mode turn ends), and the next turn runs with the plan's commands allowed. */
+function goPlan(id: string): void {
+  const e = get(id);
+  if (!isMac(e) || !e.plan) throw new Error('No plan to run');
+  for (const a of pendingApprovals()) {
+    if (a.employeeId === id && a.kind === 'plan') resolveApproval(a.id, false, 'David approved this plan. End your turn now: it runs in your next turn, with exactly the planned commands allowed.');
+  }
+  e.plan.approvedAt = Date.now();
+  e.go = e.plan.commands;
+  const list = e.go.length ? e.go.map((c) => `  ${c}`).join('\n') : '  (none)';
+  followUp(e, `GO: David approved your plan. Carry it out now, exactly as planned and in order, file edits included. These commands are pre-approved, once each:\n${list}\n`
+    + 'Anything else (a file edit, any other command) you still just call: MyIDE asks David to approve that call, so do not stop or wait for it. '
+    + 'When you are done, report what ran and the result.');
+  approvalGone();
+}
 
 // ---- state ----
 
@@ -86,12 +135,15 @@ function emit(e: Emp): void {
   for (const cb of changeCbs) { try { cb(v); } catch (err) { console.error(err); } }
 }
 
+/** Hires an employee (todos.ts: a This Mac to-do). */
+export const hireEmployee = (o: HireOpts): Promise<Employee> => hire(o);
+
 /** Every change to an employee (B's forge panel follows assignments with it). */
 export function onEmployeeChange(cb: (e: Employee) => void): void { changeCbs.push(cb); }
 
 /** Loads every project's employees. A turn that was running when MyIDE quit is now 'interrupted' (send resumes it). */
 function load(): void {
-  for (const p of listProjects()) {
+  for (const p of [...listProjects(), MAC]) {
     const st = readJSON<{ employees?: Emp[]; org?: ProjectOrg }>(join(projDir(p.id), 'state.json'), {});
     orgs.set(p.id, st.org ?? {});
     for (const e of st.employees ?? []) {
@@ -122,7 +174,9 @@ function parseRole(file: string, source: Role['source']): (Role & { file: string
   const model = f.model && f.model !== 'inherit' ? f.model : undefined;
   const mode = ['pinned', 'manager', 'auto'].includes(f['myide-mode']) ? f['myide-mode'] as Mode : undefined;
   const maxTurns = Number(f['myide-max-turns']);
+  const addDirs = f['myide-add-dir']?.split(',').map((d) => d.trim().replace(/^~(?=\/|$)/, homedir())).filter(Boolean);
   return {
+    addDirs: addDirs?.length ? addDirs : undefined,
     name: f.name, description: f.description ?? '', model, effort: f.effort || undefined, mode, account: f['myide-account'] || undefined,
     shared: f['myide-shared'] === 'true' || undefined, maxTurns: Number.isInteger(maxTurns) && maxTurns > 0 ? maxTurns : undefined, source, file,
   };
@@ -130,7 +184,7 @@ function parseRole(file: string, source: Role['source']): (Role & { file: string
 
 /** Roles from ~/.claude/agents and <project>/.claude/agents; a project role overrides a user role of the same name. */
 function roles(projectId: string): (Role & { file: string })[] {
-  const project = listProjects().find((p) => p.id === projectId);
+  const project = [...listProjects(), MAC].find((p) => p.id === projectId);
   const out = new Map<string, Role & { file: string }>();
   const dirs: [string, Role['source']][] = [[join(homedir(), '.claude', 'agents'), 'user']];
   if (project) dirs.push([join(project.path, '.claude', 'agents'), 'project']);
@@ -149,7 +203,7 @@ function systemPrompt(e: Emp): string {
   try { body = readFileSync(e.roleFile!, 'utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim(); } catch { /* role file gone */ }
   let voice = '';
   try { voice = readFileSync(join(STATE_DIR, 'voice.md'), 'utf8').trim(); } catch { /* optional */ }
-  return [body, NO_ATTRIBUTION, voice].filter(Boolean).join('\n\n');
+  return [body, isMac(e) ? MAC_RULES : '', NO_ATTRIBUTION, voice].filter(Boolean).join('\n\n');
 }
 
 // ---- turns and the queue ----
@@ -200,7 +254,8 @@ function setProgress(e: Emp, tasks: TaskState): void {
 }
 
 function start(e: Emp): void {
-  const prompt = e.pending.shift()!;
+  const next = e.pending.shift()!;
+  const prompt = typeof next === 'string' ? next : next.text;
   const queuedAt = e.queuedAt;
   if (!e.pending.length) e.queuedAt = undefined;
   let turn: Turn;
@@ -214,17 +269,22 @@ function start(e: Emp): void {
     else if (ev.type === 'text' && ev.text.trim()) { e.lastText = ev.text.trim().slice(-2000); emit(e); }
   };
   try {
-    put(settingsFile(e), employeeSettings());
+    put(settingsFile(e), settingsFor(e));
     put(mcpFile(e), employeeMcpConfig(e.id)); // rewritten each turn: the server's port changes per launch
     let maxTurns: number | undefined;
-    try { maxTurns = e.roleFile ? parseRole(e.roleFile, 'user')?.maxTurns : undefined; } catch { /* role file gone */ }
+    let addDirs: string[] | undefined;
+    try { const r = e.roleFile ? parseRole(e.roleFile, 'user') : null; maxTurns = r?.maxTurns; addDirs = r?.addDirs; } catch { /* role file gone */ }
+    const go = e.go; // taken by this turn only; the plan turn still ending when David hit GO must not clear it
+    if (go) { grantCommands(e.id, go); goTurns.add(e.id); e.go = undefined; }
     turn = runTurnFor(e, {
-      cwd: e.worktree, prompt, sessionId: e.sessionId, model: e.model, effort: e.effort, maxTurns,
+      ...(isMac(e) ? { permissionMode: go ? 'default' as const : 'plan' as const, addDirs } : {}),
+      cwd: e.worktree, prompt, images: typeof next === 'string' ? undefined : next.images, sessionId: e.sessionId, model: e.model, effort: e.effort, maxTurns,
       settingsPath: settingsFile(e), mcpConfigPath: mcpFile(e), appendSystemPrompt: systemPrompt(e), prevTasks: e.tasks, onEvent,
     });
   } catch (err) {
-    // Keep the prompt; it runs when David next sends or talks.
-    e.pending.unshift(prompt);
+    // Keep the prompt (and a GO with it); it runs when David next sends or talks.
+    if (goTurns.delete(e.id)) { clearGrants(e.id); e.go = e.plan?.commands; }
+    e.pending.unshift(next);
     e.queuedAt = queuedAt;
     e.paused = true;
     e.state = 'failed';
@@ -243,6 +303,7 @@ function start(e: Emp): void {
 
 function finish(e: Emp, r: Result): void {
   turns.delete(e.id);
+  if (goTurns.delete(e.id)) clearGrants(e.id); // a GO covers one turn; the next one plans again
   const w = why.get(e.id);
   why.delete(e.id);
   if (!emps.has(e.id)) return schedule(); // fired
@@ -353,12 +414,13 @@ function get(id: string): Emp {
 }
 
 /** A new task for `e` (from David, or from lead `by`): auto mode re-picks from it; a lead's pick applies in manager mode. */
-function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>): void {
+function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>, images?: unknown): void {
   const e = get(id);
   if (typeof text !== 'string' || !text.trim()) throw new Error('Nothing to send');
   if (e.mode === 'auto') choose(e, autoFor(text, e), by);
   else if (pick?.model || pick?.effort) choose(e, { model: pick.model || e.model, effort: pick.effort ?? e.effort }, by);
-  e.pending.push(text);
+  const paths = saveAttachments(e.projectId, e.name, images);
+  e.pending.push(paths.length ? { text, images: paths } : text);
   e.queuedAt ??= Date.now();
   e.paused = false;
   if (!by) e.wakeups = 0; // David spoke to it
@@ -424,7 +486,7 @@ function hold(e: Emp, want: Pick, ceiling: Pick, by: string): void {
 
 interface HireOpts {
   projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; maxReports?: number;
-  accountId?: string; provider?: Employee['provider']; issue?: Issue;
+  accountId?: string; provider?: Employee['provider']; issue?: Issue; images?: unknown;
 }
 
 // One hire at a time: a lead's parallel assign_task calls would otherwise pick the same free name.
@@ -436,9 +498,10 @@ function hire(o: HireOpts, by?: Emp): Promise<Employee> {
 }
 
 async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
-  const project = listProjects().find((p) => p.id === o.projectId);
+  const mac = o.projectId === MAC.id;
+  const project = mac ? MAC : listProjects().find((p) => p.id === o.projectId);
   if (!project) throw new Error('No such project');
-  await checkRepo(project.path, project.name);
+  if (!mac) await checkRepo(project.path, project.name);
   const role = roles(o.projectId).find((r) => r.name === o.role);
   if (!role) throw new Error(`No role named ${o.role}`);
   if (typeof o.task !== 'string' || !o.task.trim()) throw new Error('Give the employee a task');
@@ -448,10 +511,12 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   const taken = (name: string) => [...emps.values()].some((e) => e.projectId === o.projectId && e.name === name)
     || existsSync(join(STATE_DIR, 'worktrees', o.projectId, name));
   let n = 1;
-  while (taken(`${base}-${n}`) || await branchExists(project.path, `myide/${base}-${n}`)) n++;
+  while (taken(`${base}-${n}`) || (!mac && await branchExists(project.path, `myide/${base}-${n}`))) n++;
   const name = `${base}-${n}`;
-  const worktree = join(STATE_DIR, 'worktrees', o.projectId, name);
-  await addWorktree(project.path, worktree, `myide/${name}`, HOOKS, by?.branch); // a report starts from its lead's branch
+  const worktree = mac ? MAC.path : join(STATE_DIR, 'worktrees', o.projectId, name);
+  const images = saveAttachments(o.projectId, name, o.images); // checked before the worktree exists
+  if (mac) mkdirSync(MAC.path, { recursive: true, mode: 0o700 }); // This Mac's staff share one plain folder
+  else await addWorktree(project.path, worktree, `myide/${name}`, HOOKS, by?.branch); // a report starts from its lead's branch
   // Defaults layer: what this hire asked for, then the project's override, then the role's frontmatter.
   const po = org(o.projectId);
   const mode = o.mode || (by && (o.model || o.effort) ? 'manager' : undefined) || po.mode || role.mode;
@@ -460,7 +525,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   if (by && !account(accountId)?.allowAuto) accountId = by.accountId;
   const provider = account(accountId)?.provider ?? o.provider ?? 'claude';
   const e: Emp = {
-    id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: `myide/${name}`,
+    id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: mac ? '' : `myide/${name}`,
     model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
     depth, parentId: by?.id, lead: !!o.lead || undefined, maxReports: o.lead ? o.maxReports : undefined, contractor: role.shared,
     mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
@@ -473,7 +538,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   if (e.mode === 'auto') choose(e, autoFor(e.task!, first), by);
   else if (by) choose(e, first, by);
   emit(e);
-  e.pending.push(e.task!);
+  e.pending.push(images.length ? { text: e.task!, images } : e.task!);
   e.queuedAt = Date.now();
   save(e.projectId);
   schedule();
@@ -497,7 +562,7 @@ async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: 
   e.paused = false;
   e.wakeups = 0;
   emit(e);
-  put(settingsFile(e), employeeSettings());
+  put(settingsFile(e), settingsFor(e));
   writePrivate(talkPromptFile(e), systemPrompt(e));
   const ptyId = `terminal-${randomUUID().slice(0, 8)}`;
   talkPtys.set(ptyId, e.id);
@@ -665,9 +730,9 @@ async function setProject(id: string, patch: ProjectPatch): Promise<void> {
 }
 
 /** The session transcript Claude Code itself wrote, as plain lines with tool names. */
-function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: string; at?: string }[] {
+function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[] {
   const e = get(id);
-  if (e.provider === 'codex') return [{ role: 'tool', text: 'Transcript not available for Codex yet.' }];
+  if (e.provider === 'codex' || e.provider === 'gemini') return [{ role: 'tool', text: `Transcript not available for ${e.provider === 'codex' ? 'Codex' : 'Gemini'} yet.` }];
   if (!e.sessionId) return [];
   const CLAUDE_PROJECTS = join(claudeConfigDir(e.accountId), 'projects'); // the account's own store
   const name = `${e.sessionId}.jsonl`;
@@ -680,7 +745,7 @@ function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: st
     if (!d) return [];
     file = join(CLAUDE_PROJECTS, d, name);
   }
-  const out: { role: 'user' | 'assistant' | 'tool'; text: string; at?: string }[] = [];
+  const out: { role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[] = [];
   const short = (s: string) => (s.length > 500 ? s.slice(0, 500) + '…' : s);
   for (const line of readFileSync(file, 'utf8').split('\n')) {
     let d: any;
@@ -689,7 +754,12 @@ function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: st
     const at = d.timestamp;
     const c = d.message.content;
     if (typeof c === 'string') { out.push({ role: d.type, text: c, at }); continue; }
-    for (const b of Array.isArray(c) ? c : []) {
+    const blocks = Array.isArray(c) ? c : [];
+    // Images David attached, kept with the message they went with (the CLI also adds an "[Image: source: ...]" note).
+    const images = blocks.filter((b: any) => b.type === 'image' && b.source?.type === 'base64').map((b: any) => `data:${b.source.media_type};base64,${b.source.data}`);
+    if (images.length) out.push({ role: d.type, text: '', at, images });
+    for (const b of blocks) {
+      if (b.type === 'text' && /^\[Image: source: /.test(b.text ?? '')) continue;
       if (b.type === 'text' && b.text?.trim()) out.push({ role: d.type, text: b.text, at });
       else if (b.type === 'tool_use') out.push({ role: 'tool', text: `${b.name} ${short(JSON.stringify(b.input ?? {}))}`, at });
       else if (b.type === 'tool_result') {
@@ -725,6 +795,7 @@ function onNewApproval(a: Approval): void {
   broadcast('approvals:change', pendingApprovals());
   const e = emps.get(a.employeeId);
   if (!e) return;
+  if (isMac(e) && a.kind === 'plan') e.plan = { text: a.text ?? '', commands: planCommands(a.text ?? '') };
   e.state = 'needs-you';
   emit(e);
   notify(e, a.text ?? a.tool);
@@ -772,7 +843,8 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   h('employees:list', (projectId?: string) => [...emps.values()].filter((e) => !projectId || e.projectId === projectId).map(view));
   h('employees:roles', (projectId: string) => roles(projectId).map(({ file, ...r }) => r));
   h('employees:hire', hire);
-  h('employees:send', send);
+  h('employees:send', (id: string, text: string, images?: unknown) => send(id, text, undefined, undefined, images));
+  h('employees:image', (id: string, path: string) => worktreeImage(get(id).worktree, String(path)));
   h('employees:set-model', async (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }) => {
     const e = get(id);
     if (o.mode && ['pinned', 'manager', 'auto'].includes(o.mode)) e.mode = o.mode;
@@ -790,9 +862,16 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   h('employees:talk', talk);
   h('employees:fire', fire);
   h('employees:transcript', transcript);
+  h('employees:go', goPlan);
   h('approvals:list', () => pendingApprovals());
   h('approvals:resolve', (id: string, allow: boolean, message?: string) => {
     const a = pendingApprovals().find((x) => x.id === id);
+    const mac = a?.kind === 'plan' ? emps.get(a.employeeId) : undefined;
+    if (mac && isMac(mac)) {
+      if (allow) return goPlan(mac.id);
+      mac.plan = undefined; // rejected: the to-do stops offering it
+      emit(mac);
+    }
     resolveApproval(id, !!allow, message);
     if (a?.timedOut && allow) allowedLate(a, message); // deny of a timed-out item just clears it
     approvalGone();

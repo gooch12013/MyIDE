@@ -5,6 +5,8 @@ import { BrowserWindow, ipcMain } from 'electron';
 import { existsSync, mkdirSync, readFileSync, symlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { geminiHome, KEY_SERVICE } from './acp/gemini';
+import { removeToken, setToken } from './keychain';
 import type { Usage } from './org';
 import { readConfig, writeConfig } from './projects';
 import { STATE_DIR, writePrivate } from './store';
@@ -72,19 +74,19 @@ function claudeDir(dir: string): void {
 }
 
 export function addAccount(o: { name?: string; provider: Provider; ownLogin?: boolean }): Account {
-  if (o.provider === 'gemini') throw new Error('Gemini CLI is not supported yet.');
-  if (o.provider !== 'claude' && o.provider !== 'codex') throw new Error('Unknown provider');
+  if (!PROVIDERS.includes(o.provider)) throw new Error('Unknown provider');
   const all = listAccounts();
-  const name = (o.name ?? '').trim().slice(0, 40) || (o.provider === 'claude' ? 'Claude' : 'Codex');
+  const name = (o.name ?? '').trim().slice(0, 40) || { claude: 'Claude', codex: 'Codex', gemini: 'Gemini' }[o.provider];
   let id = slug(`${o.provider}-${name}`);
   for (let n = 2; all.some((a) => a.id === id); n++) id = slug(`${o.provider}-${name}-${n}`);
   const env: Record<string, string> = {};
   // Claude: the default login is already account one, so every extra account gets its own dir.
   // Codex: the login in ~/.codex (CODEX_HOME unset) or a dir of its own.
-  if (o.provider === 'claude' || o.ownLogin) {
+  // Gemini: API key only (features.md #24), and always its own home, so the user's Google login in ~/.gemini is never used.
+  if (o.provider === 'claude' || o.provider === 'gemini' || o.ownLogin) {
     const dir = join(STATE_DIR, 'accounts', id);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    if (o.provider === 'claude') { claudeDir(dir); env.CLAUDE_CONFIG_DIR = dir; } else env.CODEX_HOME = dir;
+    if (o.provider === 'claude') { claudeDir(dir); env.CLAUDE_CONFIG_DIR = dir; } else if (o.provider === 'gemini') { geminiHome(dir); env.GEMINI_CLI_HOME = dir; } else env.CODEX_HOME = dir;
   } else if (all.some((a) => a.provider === 'codex' && !a.env.CODEX_HOME)) {
     throw new Error('An account already uses the login in ~/.codex. Give this one its own login.');
   }
@@ -106,13 +108,26 @@ export function updateAccount(id: string, patch: { name?: unknown; cap?: unknown
 /** Forgets the account. Its folder (and the CLI's login in it) stays on disk until David deletes it. */
 export function removeAccount(id: string): void {
   if (id === DEFAULT_ACCOUNT) throw new Error('The default Claude account cannot be removed.');
+  if (account(id)?.provider === 'gemini') void removeToken(KEY_SERVICE, id);
   save(stored().filter((a) => a.id !== id));
   usage.delete(id);
 }
 
+/** A Gemini account's API key, into the Keychain only (never a file); the CLI gets it as GEMINI_API_KEY at spawn. */
+export async function setApiKey(id: string, key: unknown): Promise<void> {
+  if (account(id)?.provider !== 'gemini') throw new Error('Only Gemini accounts take an API key.');
+  if (typeof key !== 'string' || !key.trim()) throw new Error('Paste the API key first.');
+  await setToken(KEY_SERVICE, id, key.trim());
+}
+
 export function registerAccountsIpc(): void {
   ipcMain.handle('accounts:list', () => listAccounts().map((a) => ({ ...a, usage: usage.get(a.id) })));
-  ipcMain.handle('accounts:add', (_e, o) => addAccount(o));
+  ipcMain.handle('accounts:add', async (_e, o) => {
+    const a = addAccount(o);
+    if (a.provider === 'gemini' && o?.key) await setApiKey(a.id, o.key).catch((e) => { removeAccount(a.id); throw e; });
+    return a;
+  });
+  ipcMain.handle('accounts:set-key', (_e, id: string, key: unknown) => setApiKey(id, key));
   ipcMain.handle('accounts:update', (_e, id: string, patch) => updateAccount(id, patch ?? {}));
   ipcMain.handle('accounts:remove', (_e, id: string) => removeAccount(id));
 }

@@ -56,6 +56,20 @@ const HARD_DENY = [
  *  (eval, base64) gets past them, and the sandbox's network block is the backstop. */
 export const hardDenied = (command: string): boolean => HARD_DENY.some((r) => r.test(command));
 
+/** The command line a permission prompt is about: Codex sends it as rawInput.command (string or argv); Gemini sends
+ *  no rawInput, and a shell call's title is its command line. '' for anything that is not a command. */
+export function permissionCommand(tc: any): string {
+  const cmd = tc?.rawInput?.command;
+  return Array.isArray(cmd) ? cmd.join(' ') : typeof cmd === 'string' ? cmd : tc?.kind === 'execute' ? String(tc.title ?? '') : '';
+}
+
+/** The option that means allow-once or deny. Codex offers two reject_once options: "decline" (carry on without it)
+ *  and "cancel" (which ends the turn), and deny means decline. Gemini's only reject is "cancel" (the tool fails, the turn goes on). */
+export function pickOption<T extends { optionId: string; kind: string }>(options: T[], want: 'allow' | 'reject'): T | undefined {
+  return (want === 'reject' ? options.find((x) => x.optionId === 'decline') : undefined)
+    ?? options.find((x) => x.kind === `${want}_once`) ?? options.find((x) => x.kind.startsWith(want));
+}
+
 /** Maps `session/update` payloads to ClaudeEvents. Message chunks are joined per message and emitted
  *  as one 'text' when the message ends (a tool call, another message, or flush() at turn end).
  *  Plan updates become 'tasks' (Codex 0.157.1 sends none; the code is ready for when it does). */

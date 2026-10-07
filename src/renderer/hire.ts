@@ -1,5 +1,6 @@
 import type { Mode, Pick } from '../main/org';
 import { accountPicker } from './accounts';
+import { attachBox } from './attach';
 import { h } from './dom';
 import { activeProject } from './projects';
 
@@ -72,7 +73,8 @@ export function modePicker(mode: Mode, onchange?: () => void) {
 let sheet: HTMLDialogElement | undefined;
 
 /** The hire sheet: role, task, model and effort (defaults from the role). */
-export async function openHire(): Promise<void> {
+/** `o.task` prefills the task (a promoted to-do); `o.onHired` hears the new employee. */
+export async function openHire(o: { task?: string; onHired?: (e: { id: string; role: string }) => void } = {}): Promise<void> {
   const project = activeProject();
   if (!project) return;
   sheet?.remove();
@@ -81,7 +83,7 @@ export async function openHire(): Promise<void> {
   const role = select(roles.map((r) => [r.name, `${r.name}${r.source === 'project' ? ' (project)' : ''}`]), roles[0]?.name ?? '');
   role.id = 'hire-role';
   const desc = h('p', { className: 'pref-hint' });
-  const task = h('textarea', { id: 'hire-task', className: 'input', rows: 4, required: true, placeholder: 'What should this employee do?' });
+  const task = h('textarea', { id: 'hire-task', className: 'input', rows: 4, required: true, placeholder: 'What should this employee do?', value: o.task ?? '' });
   const pick = modelPicker('', '');
   const acct = await accountPicker(pick.el); // the AI account is fixed at hire
   const mode = modePicker('pinned', () => { pick.el.hidden = mode.get() === 'auto'; });
@@ -90,6 +92,7 @@ export async function openHire(): Promise<void> {
   const ceiling = h('p', { className: 'pref-hint', textContent: ceilingNote(po?.ceiling) });
   const status = h('p', { className: 'pref-warn' });
   status.setAttribute('aria-live', 'polite');
+  const attach = attachBox(task, (t) => { status.textContent = t; });
   const fromRole = () => {
     const r = roles.find((x) => x.name === role.value);
     desc.textContent = r?.description ?? '';
@@ -108,6 +111,7 @@ export async function openHire(): Promise<void> {
       : h('p', { className: 'pref-hint', textContent: 'No roles found. A role is an agent file in ~/.claude/agents or this project\'s .claude/agents.' }),
     desc,
     h('label', { className: 'field', htmlFor: 'hire-task' }, h('span', { className: 'legend', textContent: 'Task' }), task),
+    attach.el,
     acct.el,
     mode.el,
     pick.el,
@@ -121,7 +125,9 @@ export async function openHire(): Promise<void> {
     ev.preventDefault();
     hire.disabled = true;
     try {
-      await api.employees.hire({ projectId: project.id, role: role.value, task: task.value.trim(), ...acct.get(), mode: mode.get(), lead: lead.checked, ...(mode.get() === 'auto' ? {} : pick.get()) });
+      const hired = await api.employees.hire({ projectId: project.id, role: role.value, task: task.value.trim(), ...acct.get(), mode: mode.get(), lead: lead.checked, ...(mode.get() === 'auto' ? {} : pick.get()), images: attach.payload() });
+      attach.clear();
+      o.onHired?.(hired);
       sheet?.close();
     } catch (e) {
       status.textContent = (e as Error).message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');

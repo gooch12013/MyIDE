@@ -2,7 +2,7 @@
 // Usage: node scripts/check-acp-map.mjs
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { hardDenied, makeAcpMapper, parseCodexStatus, rpcClient } from '../src/main/acp/client.ts';
+import { hardDenied, makeAcpMapper, parseCodexStatus, permissionCommand, pickOption, rpcClient } from '../src/main/acp/client.ts';
 
 const rec = (f) => readFileSync(`spikes/K/evidence/${f}`, 'utf8').split('\n').filter(Boolean).map((l) => ({ dir: l[0], line: l.slice(2), m: JSON.parse(l.slice(2)) }));
 
@@ -92,5 +92,48 @@ for (const c of ['git commit -m "fix: n items"', 'git push -u origin myide/x', '
   'curl https://example.com', 'echo high', 'npx tsc --noEmit']) {
   assert.equal(hardDenied(c), false, c);
 }
+
+// Gemini CLI (`gemini --acp`, v0.63.0): no recording (not installed), so these are built from the shapes in its source,
+// packages/cli/src/acp/acpSession.ts and acpUtils.ts. Message chunks carry no messageId; thoughts, usage and
+// command lists are not shown; a shell call's title is its command and there is no rawInput.
+const gem = [
+  { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'memory', description: 'Manage memory' }] },
+  { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: '**Planning** the change' } },
+  { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Let me look ' } },
+  { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'at the file.' } },
+  { sessionUpdate: 'tool_call', toolCallId: 'read_file-1', status: 'in_progress', title: 'README.md', content: [], locations: [{ path: '/w/README.md' }], kind: 'read' },
+  { sessionUpdate: 'tool_call_update', toolCallId: 'read_file-1', status: 'completed', title: 'README.md', content: [], locations: [], kind: 'read' },
+  { sessionUpdate: 'tool_call', toolCallId: 'run_shell_command-2', status: 'pending', title: 'npm test', content: [{ type: 'content', content: { type: 'text', text: 'Run the tests' } }], locations: [], kind: 'execute' },
+  { sessionUpdate: 'usage_update', used: 1234, size: 1048576 },
+  { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Tests pass.' } },
+];
+({ evs, last } = mapAll(gem));
+assert.deepEqual(evs.map((e) => e.type), ['text', 'tool', 'tool', 'text'], 'thoughts, usage and command lists are dropped');
+assert.deepEqual(evs.filter((e) => e.type === 'tool').map((e) => e.name), ['README.md', 'npm test']);
+assert.equal(evs[0].text, 'Let me look at the file.', 'chunks without a messageId join until the next tool call');
+assert.equal(last, 'Tests pass.');
+// Prompt result: stopReason plus usage and Gemini's _meta.quota; only stopReason is read.
+const gemResult = { stopReason: 'end_turn', usage: { inputTokens: 900, outputTokens: 40, totalTokens: 940 }, _meta: { quota: { token_count: { input_tokens: 900, output_tokens: 40 }, model_usage: [] } } };
+assert.equal(gemResult.stopReason, 'end_turn');
+
+// Gemini permission requests (toPermissionOptions for an exec confirmation): the command is the title.
+const execOpts = [{ optionId: 'proceed_always', name: 'Allow for this session', kind: 'allow_always' },
+  { optionId: 'proceed_once', name: 'Allow', kind: 'allow_once' }, { optionId: 'cancel', name: 'Reject', kind: 'reject_once' }];
+const gemAsk = (title, kind = 'execute') => ({ sessionId: 's', options: execOpts, toolCall: { toolCallId: 'run_shell_command-3', status: 'pending', title, content: [], locations: [], kind } });
+let req = gemAsk('gh pr create --fill');
+assert.equal(permissionCommand(req.toolCall), 'gh pr create --fill');
+assert.equal(hardDenied(permissionCommand(req.toolCall)), true);
+assert.equal(pickOption(req.options, 'reject').optionId, 'cancel', 'Gemini has no "decline"; deny is its reject_once');
+req = gemAsk('git commit --no-verify -m wip');
+assert.equal(hardDenied(permissionCommand(req.toolCall)), true);
+req = gemAsk('npm test');
+assert.equal(hardDenied(permissionCommand(req.toolCall)), false);
+assert.equal(pickOption(req.options, 'allow').optionId, 'proceed_once', 'allow once, never "for this session"');
+// An edit or an MCP call is not a command, whatever its title says.
+assert.equal(permissionCommand(gemAsk('gh.md', 'edit').toolCall), '');
+assert.equal(permissionCommand(gemAsk('ask_human (myide MCP Server)', 'other').toolCall), '');
+// Codex shapes still win: rawInput.command as argv or string; "decline" over "cancel".
+assert.equal(permissionCommand({ kind: 'execute', title: 'Run gh', rawInput: { command: ['bash', '-lc', 'gh pr list'] } }), 'bash -lc gh pr list');
+assert.equal(pickOption([{ optionId: 'cancel', kind: 'reject_once' }, { optionId: 'decline', kind: 'reject_once' }], 'reject').optionId, 'decline');
 
 console.log('acp map ok');
