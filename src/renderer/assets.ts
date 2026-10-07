@@ -339,7 +339,7 @@ export async function higgsfieldSection(say: (t: string) => void): Promise<Node[
     if (document.activeElement !== line) line.value = String(approveAbove);
     root.replaceChildren(
       row('Connector', `From the last refresh. Last checked ${when(c?.checkedAt ?? c?.fetchedAt)}.`, led(state, label),
-        key('Manage connector on claude.ai', () => void api.terminal.openUrl('https://claude.ai/settings/connectors'))),
+        key('Manage in claude.ai Customize', () => void api.terminal.openUrl('https://claude.ai/customize'))),
       row('Plan and credits', 'Refresh uses one small Claude turn and only reads; it never generates.',
         h('span', { className: 'pref-value', textContent: c?.plan ? `${c.plan} plan` : 'Plan ?' }), h('span', { className: 'pref-value', textContent: `${c?.credits ?? '?'} credits` }), refreshKey('Refresh')),
       row('Approval line', 'Above this many credits a request waits for you. The asset studio uses the same setting.', line, h('span', { className: 'pref-unit', textContent: 'credits' })),
