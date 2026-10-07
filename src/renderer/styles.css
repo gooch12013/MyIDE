@@ -764,3 +764,10 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .sp-opt .led { font-size: var(--fs-2xs); }
 .seg input:checked + .sp-opt .led { color: var(--accent-ink); }
 .comp-tbl tbody tr.comp-hit :is(th, td) { box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }
+
+/* Cloned voices (Preferences > Voice & read-back) */
+.sp-voice .pref-hint { overflow-wrap: anywhere; }
+.sp-snip { flex: 1 1 16rem; min-width: 0; font-size: var(--fs-sm); color: var(--ink-3); font-style: italic; overflow-wrap: anywhere; }
+.sp-path { overflow-wrap: anywhere; font-family: var(--font-mono); }
+.sp-sheet { width: min(32rem, 92vw); }
+.sp-sheet textarea { resize: vertical; }

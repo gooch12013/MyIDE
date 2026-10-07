@@ -2,13 +2,14 @@
 // stop (written to an AIFF with `say -o`, so nothing plays aloud), read-back engines (voice lists per
 // engine, cloned voices, refusing an engine that is not installed, "use existing Python", the helper
 // protocol through a fake Python (models per voice, speed, one long-lived process, stop, crash and
-// restart, honest fallback to `say`)), settings migration, dictation engine and model choice, the components manifest, detection
+// restart, honest fallback to `say`)), cloned voices (names, Spotlight ranking, adding with afconvert, sibling
+// transcripts, rename, remove, voice design through the fake helper), settings migration, dictation engine and model choice, the components manifest, detection
 // of existing installs, "use existing", dictation through a fake whisper-cli, and one real install
 // and removal of the GitHub CLI (about 14 MB) plus a checksum failure, all in a temp MYIDE_HOME.
 // Usage: node scripts/check-speech.mjs   (add --offline to skip the downloads)
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, chmodSync, constants, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -210,6 +211,99 @@ assert.deepEqual(q('clone:David'), { model: 'mlx-community/Qwen3-TTS-12Hz-1.7B-B
 mkdirSync(join(comp.COMPONENTS_DIR, 'kokoro', 'voices'), { recursive: true });
 writeFileSync(join(comp.COMPONENTS_DIR, 'kokoro', 'voices', 'Me.wav'), 'x');
 assert.ok(!(await speech.engineVoices('kokoro')).some((v) => v.id.startsWith('clone:')), 'Kokoro cannot clone');
+// ---- cloned voices: names, finding clips, adding (copy or afconvert), transcripts, rename, remove, design ----
+// A 16-bit mono WAV of silence; `list` puts a LIST chunk before the data, as many recorders do.
+const wav = (f, secs, list = false, rate = 24000) => {
+  const n = Math.round(secs * rate), extra = list ? 8 + 10 : 0, b = Buffer.alloc(44 + extra + n * 2);
+  b.write('RIFF', 0); b.writeUInt32LE(36 + extra + n * 2, 4); b.write('WAVE', 8);
+  b.write('fmt ', 12); b.writeUInt32LE(16, 16); b.writeUInt16LE(1, 20); b.writeUInt16LE(1, 22); b.writeUInt32LE(rate, 24); b.writeUInt32LE(rate * 2, 28); b.writeUInt16LE(2, 32); b.writeUInt16LE(16, 34);
+  if (list) { b.write('LIST', 36); b.writeUInt32LE(10, 40); }
+  b.write('data', 36 + extra); b.writeUInt32LE(n * 2, 40 + extra);
+  mkdirSync(join(f, '..'), { recursive: true });
+  writeFileSync(f, b);
+};
+assert.equal(speech.cloneName('David'), 'David');
+assert.equal(speech.cloneName('  My voice.wav '), 'My voice');
+assert.equal(speech.cloneName('../../etc/passwd'), 'etc passwd', 'no path in a name');
+assert.equal(speech.cloneName('a/b\\c:d'), 'a b c d');
+assert.equal(speech.cloneName('Zoë_2-x'), 'Zoë_2-x');
+assert.equal(speech.cloneName('x'.repeat(80)).length, 40);
+for (const bad of ['', '...', '../', '/', '  ']) assert.throws(() => speech.cloneName(bad), /Give the voice a name/, JSON.stringify(bad));
+const H = fakeHome, clips = join(H, 'Recordings');
+wav(join(clips, 'ref_me.wav'), 5, true); writeFileSync(join(clips, 'ref_me.txt'), ' This is what I said in the clip. \n');
+wav(join(clips, 'talk.wav'), 6);
+wav(join(clips, 'my-voice.wav'), 4);
+wav(join(clips, 'voice_long.wav'), 60);
+wav(join(clips, 'blip.wav'), 1);
+writeFileSync(join(clips, 'odd.wav'), 'not a wav');
+for (const d of ['Library/Sounds', 'proj/node_modules/pkg', '.Trash', '.myide/components/qwen3-tts/voices']) wav(join(H, d, 'voice.wav'), 5);
+assert.ok(Math.abs(speech.wavSeconds(join(clips, 'ref_me.wav')) - 5) < 0.01, 'WAV length past a LIST chunk');
+assert.equal(speech.wavSeconds(join(clips, 'odd.wav')), undefined);
+const hits = [...['ref_me', 'talk', 'my-voice', 'voice_long', 'blip', 'odd'].map((n) => join(clips, `${n}.wav`)),
+  ...['Library/Sounds', 'proj/node_modules/pkg', '.Trash', '.myide/components/qwen3-tts/voices'].map((d) => join(H, d, 'voice.wav')), '/tmp/elsewhere.wav', join(home, 'components', 'x.wav')];
+const ranked = speech.rankClips(hits, H);
+assert.deepEqual(ranked.map((c) => c.path.slice(clips.length + 1)), ['ref_me.wav', 'my-voice.wav', 'odd.wav', 'talk.wav'],
+  'transcript first, then voice-like names; Library, node_modules, .Trash, ~/.myide, outside home, under 3 s and over 30 s left out; unknown length kept');
+assert.equal(ranked[0].transcript, 'This is what I said in the clip.');
+assert.equal(ranked[0].name, 'ref_me');
+assert.equal(speech.rankClips(Array.from({ length: 300 }, (_, i) => join(clips, `${i}.wav`)), H).length, 100, 'capped at 100');
+// adding: only offered clips; the original is copied (0600), never changed; its sibling transcript comes along
+await assert.rejects(speech.addClone(join(clips, 'blip.wav'), 'Blip'), /Pick the clip/);
+await assert.rejects(speech.preview(join(clips, 'blip.wav')), /did not offer/);
+const before = readFileSync(join(clips, 'ref_me.wav'));
+const picked = speech.clipInfo(join(clips, 'ref_me.wav'));
+assert.equal(picked.transcript, 'This is what I said in the clip.', 'sibling transcript picked up');
+let added = await speech.addClone(picked.path, '../Me', picked.transcript);
+assert.equal(added.name, 'Me', 'a traversal name is sanitised into the voices folder');
+assert.deepEqual(readFileSync(join(vdir, 'Me.wav')), before);
+assert.deepEqual(readFileSync(join(clips, 'ref_me.wav')), before, 'original untouched');
+assert.ok(existsSync(join(clips, 'ref_me.wav')) && existsSync(join(clips, 'ref_me.txt')));
+assert.equal(statSync(join(vdir, 'Me.wav')).mode & 0o777, 0o600);
+assert.equal(statSync(join(vdir, 'Me.txt')).mode & 0o777, 0o600);
+assert.equal(readFileSync(join(vdir, 'Me.txt'), 'utf8'), 'This is what I said in the clip.\n');
+await assert.rejects(speech.addClone(picked.path, 'me'), /already a voice called me/);
+assert.ok((await speech.engineVoices('qwen3-tts')).some((v) => v.id === 'clone:Me'), 'the voice list has it');
+// other formats: converted to a 24 kHz mono WAV with afconvert (argument list, no shell)
+assert.deepEqual(speech.afconvertArgs('/a b.m4a', '/v/X.wav'), ['-f', 'WAVE', '-d', 'LEI16@24000', '-c', '1', '/a b.m4a', '/v/X.wav']);
+execFileSync('/usr/bin/say', ['-o', join(clips, 'spoken.aiff'), 'Hello there, this is a converted clip of speech for the test.']);
+execFileSync('/usr/bin/afconvert', ['-f', 'm4af', '-d', 'aac', join(clips, 'spoken.aiff'), join(clips, 'spoken.m4a')]);
+added = await speech.addClone(speech.clipInfo(join(clips, 'spoken.m4a')).path, 'Spoken', '');
+const hdr = readFileSync(join(vdir, 'Spoken.wav'));
+assert.equal(hdr.subarray(0, 4).toString(), 'RIFF');
+assert.deepEqual([hdr.readUInt16LE(22), hdr.readUInt32LE(24)], [1, 24000], 'mono, 24 kHz');
+assert.ok(added.duration > 2 && added.transcript === '' && !existsSync(join(vdir, 'Spoken.txt')));
+assert.ok(!readdirSync(vdir).some((n) => n.includes('partial')));
+// transcripts, rename (read-back follows), remove (only MyIDE's copy)
+speech.setTranscript('Spoken', 'Hello there.');
+assert.equal(speech.clones().find((c) => c.name === 'Spoken').transcript, 'Hello there.');
+speech.setTranscript('Spoken', '  ');
+assert.ok(!existsSync(join(vdir, 'Spoken.txt')));
+assert.throws(() => speech.setTranscript('../config', 'x'), /no cloned voice/);
+writeCfg({ ...readCfg(), speech: { on: false, engine: 'qwen3-tts', voice: 'clone:Me', rate: 0 } });
+assert.equal(speech.renameClone('Me', 'Me Again!'), 'Me Again');
+assert.ok(existsSync(join(vdir, 'Me Again.wav')) && existsSync(join(vdir, 'Me Again.txt')) && !existsSync(join(vdir, 'Me.wav')));
+assert.equal(readCfg().speech.voice, 'clone:Me Again', 'the chosen voice follows a rename');
+assert.throws(() => speech.renameClone('Me Again', 'spoken'), /already a voice called spoken/);
+assert.throws(() => speech.renameClone('Nobody', 'X'), /no cloned voice called Nobody/);
+assert.throws(() => speech.removeClone('../qwen3-tts'), /no cloned voice/);
+speech.removeClone('Me Again');
+assert.ok(!existsSync(join(vdir, 'Me Again.wav')) && !existsSync(join(vdir, 'Me Again.txt')));
+assert.deepEqual(readFileSync(join(clips, 'ref_me.wav')), before, 'removing leaves the original');
+assert.equal(readCfg().speech.voice, '', 'a removed voice is no longer chosen');
+speech.removeClone('Spoken');
+// design: a VoiceDesign request through the helper (the fake Python writes the request where the WAV would go)
+await assert.rejects(speech.design('warm', 'Hi.'), /Install Qwen3-TTS first/);
+await comp.usePython('qwen3-tts', py);
+await assert.rejects(speech.design('  ', 'Hi.'), /Describe the voice/);
+const designedWav = await speech.design('warm older British man, calm,\n slightly gravelly', 'Hello, this is my new voice.');
+req = said(designedWav);
+assert.deepEqual([req.model, req.instruct, req.text], ['mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16', 'warm older British man, calm, slightly gravelly', 'Hello, this is my new voice.']);
+assert.equal(speech.speaking(), false);
+added = await speech.addClone(designedWav, 'Gravel', 'Hello, this is my new voice.');
+assert.ok(existsSync(join(vdir, 'Gravel.wav')) && readFileSync(join(vdir, 'Gravel.txt'), 'utf8').startsWith('Hello, this is my new voice.'));
+assert.deepEqual(q('clone:Gravel'), { model: 'mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16', ref: join(vdir, 'Gravel.wav'), ref_text: 'Hello, this is my new voice.', rate: 1 }, 'a designed voice is reused through the Base model');
+speech.removeClone('Gravel');
+writeCfg({ ...readCfg(), speech: undefined });
 // Removing our own Python engine deletes its venv but keeps the voice samples
 mkdirSync(join(comp.COMPONENTS_DIR, 'qwen3-tts', 'venv', 'bin'), { recursive: true });
 cpSync(py, join(comp.COMPONENTS_DIR, 'qwen3-tts', 'venv', 'bin', 'python'));

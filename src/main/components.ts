@@ -30,8 +30,10 @@ export interface Entry {
   /** A Python engine: Install makes ~/.myide/components/<id>/venv with uv and pip-installs these; the
    *  component's path is then that venv's python. `check` is the Python that proves an interpreter works. */
   pip?: string[]; check?: string;
-  /** Hugging Face models the engine loads (fetched into the normal cache on first use): presets, and clones. */
+  /** Hugging Face models the engine loads (fetched into the normal cache on first use): presets, clones and designed voices. */
   model?: string; cloneModel?: string;
+  /** A model that makes a voice from a description in words (Qwen3-TTS VoiceDesign). */
+  designModel?: string;
 }
 export interface Choice { path: string; version?: string; existing?: boolean }
 export interface Row extends Entry { state: 'installed' | 'existing' | 'missing'; path?: string; installedVersion?: string; disk?: number; found: string[] }

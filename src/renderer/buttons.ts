@@ -1,18 +1,17 @@
 // Buttons panel: saved buttons as keys, the installed commands and skills, the button and schedule forms, and the schedules list.
 import type { Button, PaletteItem, Schedule, Target } from '../main/buttons';
 import { describe, nextRun, WEEKDAYS } from '../main/schedules';
-import { errText, h, key, sheet as modal } from './dom';
+import { errText, field, formSheet, h, key } from './dom';
 import { activeProject, allProjects } from './projects';
 import { registerPanel } from './registry';
 import { micButton, speakButton } from './speech';
 
 const api = window.myide;
+const sheet = (title: string, body: HTMLElement[], submit: () => Promise<string>, ok = 'Save') => formSheet(title, body, submit, ok, 'btn-sheet');
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const ORDER = [1, 2, 3, 4, 5, 6, 0];
 
 const targetText = (t: Target) => (t === 'lead' ? 'project lead' : t === 'selected' ? 'selected employee' : `new ${t.role}`);
-const field = (label: string, ctl: HTMLElement, hint?: string) =>
-  h('label', { className: 'field' }, h('span', { className: 'legend', textContent: label }), ctl, ...(hint ? [h('span', { className: 'pref-hint', textContent: hint })] : []));
 /** A delete key that acts on the second press. */
 const sure = (label: string, act: () => void) => {
   const k = key(label, () => { if (k.dataset.armed) act(); else { k.dataset.armed = '1'; k.textContent = 'Press again'; } }, { className: 'key key--sm rm' });
@@ -20,25 +19,6 @@ const sure = (label: string, act: () => void) => {
   return k;
 };
 const when = (ms?: number) => (ms ? new Date(ms).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
-
-/** A modal sheet; `submit` returns an error message or '' to close. */
-function sheet(title: string, body: HTMLElement[], submit: () => Promise<string>, ok = 'Save'): HTMLDialogElement {
-  const status = h('p', { className: 'pref-warn' });
-  status.setAttribute('aria-live', 'polite');
-  const go = h('button', { className: 'btn btn--primary', value: 'ok', textContent: ok });
-  const form = h('form', { method: 'dialog' }, h('h2', { className: 'legend', textContent: title }), ...body, status,
-    h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), go));
-  const dlg = modal(title, form, 'btn-sheet');
-  form.onsubmit = async (ev) => {
-    if (ev.submitter !== go) return;
-    ev.preventDefault();
-    go.disabled = true;
-    status.textContent = await submit().catch(errText);
-    go.disabled = false;
-    if (!status.textContent) dlg.close();
-  };
-  return dlg;
-}
 
 async function buttonForm(b: Partial<Button>, palette: PaletteItem[], onSaved: () => void): Promise<void> {
   const project = activeProject();

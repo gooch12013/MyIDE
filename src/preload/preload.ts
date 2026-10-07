@@ -12,7 +12,7 @@ import type { Account, Provider, Usage } from '../main/accounts';
 import type { Providers } from '../main/transports';
 import type { ForgeLink, ForgeSnapshot } from '../main/forge';
 import type { Row as ComponentRow } from '../main/components';
-import type { SpeechOptions, SpeechPatch, SpeechStatus } from '../main/speech';
+import type { Clip, Clone, SpeechOptions, SpeechPatch, SpeechStatus } from '../main/speech';
 import type { Button, PaletteItem, Schedule } from '../main/buttons';
 import type { AssetRequest, Catalog } from '../main/assets';
 import type { Todo } from '../main/todos';
@@ -207,7 +207,7 @@ const api = {
     /** Read-back engines with their voices, and the installed Whisper models. */
     options: (): Promise<SpeechOptions> => ipcRenderer.invoke('speech:options'),
     /** Reads a summary aloud (stopping any other); ignored while read-back is off unless force. Resolves when done, with a note if it fell back to the macOS voice. */
-    speak: (text: string, force = false): Promise<string> => ipcRenderer.invoke('speech:speak', text, force),
+    speak: (text: string, force = false, voice = ''): Promise<string> => ipcRenderer.invoke('speech:speak', text, force, voice),
     stop: (): Promise<void> => ipcRenderer.invoke('speech:stop'),
     /** A 16 kHz mono WAV to text. */
     transcribe: (wav: Uint8Array): Promise<string> => ipcRenderer.invoke('speech:transcribe', wav),
@@ -215,6 +215,20 @@ const api = {
     onSpeaking: (cb: (speaking: boolean) => void) => on('speech:speaking', cb),
     /** An engine's helper changed state (starting, downloading or loading a model, ready, error). */
     onEngine: (cb: (id: string) => void) => on('speech:engine', cb),
+    // Cloned voices (Qwen3-TTS): MyIDE's copies in ~/.myide/components/qwen3-tts/voices.
+    clones: (): Promise<Clone[]> => ipcRenderer.invoke('speech:clones'),
+    /** The native file picker; null when cancelled. */
+    pickClip: (): Promise<Clip | null> => ipcRenderer.invoke('speech:pick-clip'),
+    /** Spotlight search of the home folder for voice clips, best first, at most 100. */
+    findClips: (): Promise<Clip[]> => ipcRenderer.invoke('speech:find-clips'),
+    /** Plays an offered clip (speech.stop ends it). */
+    preview: (path: string): Promise<string> => ipcRenderer.invoke('speech:preview', path),
+    /** A sample in a voice described in words; resolves to the WAV to preview or save. */
+    design: (description: string, text: string): Promise<string> => ipcRenderer.invoke('speech:design', description, text),
+    addClone: (path: string, name: string, transcript: string): Promise<Clone> => ipcRenderer.invoke('speech:add-clone', path, name, transcript),
+    renameClone: (from: string, to: string): Promise<string> => ipcRenderer.invoke('speech:rename-clone', from, to),
+    removeClone: (name: string): Promise<void> => ipcRenderer.invoke('speech:remove-clone', name),
+    setCloneText: (name: string, text: string): Promise<void> => ipcRenderer.invoke('speech:clone-text', name, text),
   },
   // Optional components (feature 23) in ~/.myide/components.
   components: {

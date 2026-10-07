@@ -1,12 +1,13 @@
-import { ipcMain } from 'electron';
+import { BrowserWindow, dialog, ipcMain } from 'electron';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { chmodSync, closeSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { basename, dirname, extname, join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { promisify } from 'node:util';
 import { COMPONENTS_DIR, componentPath, detect, MANIFEST, rows, type Entry, type Row } from './components';
 import { readConfig, writeConfig } from './projects';
-import { broadcast } from './store';
+import { broadcast, STATE_DIR } from './store';
 
 // Read-back (feature 14), off by default, one utterance at a time, through an engine: macOS `say`
 // (built in) or a manifest component of kind "tts". Dictation: macOS dictation (built in) or an
@@ -238,7 +239,8 @@ export function helperRequest(id: string, voice = '', rate = 0): Record<string, 
   return { model: e.cloneModel, ref: `${base}.wav`, ...(refText ? { ref_text: refText } : {}), rate: factor(rate) };
 }
 
-async function viaHelper(id: string, python: string, words: string, o: { voice?: string; rate?: number; out?: string }): Promise<string> {
+/** Sends one request to the engine's helper as the current utterance; null when it was stopped or replaced. */
+async function ask(id: string, python: string, req: Record<string, unknown>): Promise<Reply | null> {
   let finish!: (r: Reply) => void;
   const replied = new Promise<Reply>((r) => { finish = r; });
   const h = helper(id, python), n = ++nextId;
@@ -252,13 +254,187 @@ async function viaHelper(id: string, python: string, words: string, o: { voice?:
     await Promise.race([h.ready, replied]);
     if (current === t) {
       h.waiting.set(n, finish);
-      h.child.stdin!.write(`${JSON.stringify({ id: n, ...helperRequest(id, o.voice, o.rate), text: words, ...(o.out ? { out: o.out } : {}) })}\n`);
+      h.child.stdin!.write(`${JSON.stringify({ id: n, ...req })}\n`);
     }
     r = await replied;
   } catch (err) { r = { ok: false, error: (err as Error).message }; }
-  if (current !== t) return ''; // stopped, or replaced by the next line
+  if (current !== t) return null; // stopped, or replaced by the next line
   end(t);
-  return r.ok === false ? viaSay(words, '', o.rate, o.out, `${engineName(id)} failed (${r.error}), so this used the macOS system voice.`) : '';
+  return r;
+}
+
+async function viaHelper(id: string, python: string, words: string, o: { voice?: string; rate?: number; out?: string }): Promise<string> {
+  const r = await ask(id, python, { ...helperRequest(id, o.voice, o.rate), text: words, ...(o.out ? { out: o.out } : {}) });
+  return r?.ok === false ? viaSay(words, '', o.rate, o.out, `${engineName(id)} failed (${r.error}), so this used the macOS system voice.`) : '';
+}
+
+// ---- cloned voices: <qwen3-tts>/voices/<Name>.wav plus an optional <Name>.txt transcript. Clips are
+// copied in (never moved or changed), found with Spotlight, or designed from a description. ----
+
+const CLONER = 'qwen3-tts';
+export const voicesDir = (): string => join(COMPONENTS_DIR, CLONER, 'voices');
+export interface Clone { name: string; duration?: number; transcript: string }
+export interface Clip { path: string; name: string; duration?: number; transcript: string; score: number }
+const AUDIO = /\.(wav|m4a|mp3|aiff?)$/i;
+
+/** A voice name that is safe as a file name: letters, digits, spaces, _ and -, at most 40 characters. */
+export function cloneName(raw: string): string {
+  const n = String(raw ?? '').normalize('NFC').trim().replace(AUDIO, '').replace(/[^\p{L}\p{N} _-]+/gu, ' ').replace(/\s+/g, ' ').trim().slice(0, 40).trim();
+  if (!n) throw new Error('Give the voice a name (letters, digits, spaces, - or _).');
+  return n;
+}
+
+/** A WAV's length in seconds from its header, or undefined when it is not a readable WAV. */
+export function wavSeconds(file: string): number | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(file, 'r');
+    const b = Buffer.alloc(4096), n = readSync(fd, b, 0, 4096, 0);
+    if (n < 12 || b.toString('latin1', 0, 4) !== 'RIFF' || b.toString('latin1', 8, 12) !== 'WAVE') return undefined;
+    let rate = 0;
+    for (let at = 12; at + 8 <= n;) {
+      const id = b.toString('latin1', at, at + 4), size = b.readUInt32LE(at + 4);
+      if (id === 'fmt ' && at + 20 <= n) rate = b.readUInt32LE(at + 16); // byte rate
+      if (id === 'data') return rate ? Math.min(size, statSync(file).size - at - 8) / rate : undefined;
+      at += 8 + size + (size & 1);
+    }
+  } catch { /* unreadable */ } finally { if (fd !== undefined) closeSync(fd); }
+  return undefined;
+}
+
+const readText = (f: string) => { try { return readFileSync(f, 'utf8').trim().slice(0, 2000); } catch { return ''; } };
+/** The transcript next to a clip: same folder, same base name, .txt. */
+export const siblingText = (clip: string): string => readText(join(dirname(clip), `${basename(clip, extname(clip))}.txt`));
+const suggest = (clip: string) => { try { return cloneName(basename(clip)); } catch { return ''; } };
+
+/** The cloned voices MyIDE has, by name. */
+export function clones(): Clone[] {
+  let names: string[] = [];
+  try { names = readdirSync(voicesDir()).filter((n) => /\.wav$/i.test(n) && !n.startsWith('.')).map((n) => n.slice(0, -4)); } catch { /* none yet */ }
+  return names.sort((a, b) => a.localeCompare(b)).map((name) => ({ name, duration: wavSeconds(join(voicesDir(), `${name}.wav`)), transcript: readText(join(voicesDir(), `${name}.txt`)) }));
+}
+/** The path (without extension) of a voice that exists; anything else, including a path, is refused. */
+function known(name: string): string {
+  if (!clones().some((c) => c.name === name)) throw new Error(`There is no cloned voice called ${name}.`);
+  return join(voicesDir(), name);
+}
+
+// Only clips MyIDE itself offered (picked, found or designed) can be added or previewed.
+const offered = new Set<string>();
+const info = (path: string): Clip => ({ path, name: suggest(path), duration: /\.wav$/i.test(path) ? wavSeconds(path) : undefined, transcript: siblingText(path), score: 0 });
+/** A clip the user picked: offered, with a suggested name and the transcript next to it. */
+export function clipInfo(path: string): Clip { offered.add(path); return info(path); }
+
+/** Spotlight results to candidate clips: in the home folder but not Library, .Trash, node_modules or MyIDE's own
+ *  folder; 3 to 30 s where the length is known; ones with a transcript next to them, then voice-like names, first. */
+export function rankClips(paths: string[], home = homedir()): Clip[] {
+  const skip = [join(home, 'Library'), join(home, '.Trash'), join(home, '.myide'), STATE_DIR].map((d) => `${d}/`);
+  const out: Clip[] = [];
+  for (const path of paths.slice(0, 5000)) { // ponytail: header reads for the first 5000 hits only; enough for one home folder
+    if (!path.startsWith(`${home}/`) || skip.some((d) => path.startsWith(d)) || path.includes('/node_modules/') || !AUDIO.test(path)) continue;
+    const c = info(path);
+    if (c.duration !== undefined && (c.duration < 3 || c.duration > 30)) continue;
+    c.score = (c.transcript ? 2 : 0) + (/ref|reference|voice|clone/i.test(basename(path)) ? 1 : 0);
+    out.push(c);
+  }
+  const top = out.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path)).slice(0, 100);
+  for (const c of top) offered.add(c.path);
+  return top;
+}
+
+/** WAV clips on this Mac, through Spotlight. */
+export async function findClips(): Promise<Clip[]> {
+  const home = homedir();
+  const out = await new Promise<string>((resolve, reject) =>
+    execFile('/usr/bin/mdfind', ['-onlyin', home, 'kMDItemContentType == "com.microsoft.waveform-audio"'], { timeout: 30_000, maxBuffer: 32 * 1024 * 1024 },
+      (err, so) => (err ? reject(new Error(`Spotlight search failed: ${err.message}`)) : resolve(so))));
+  return rankClips(out.split('\n').filter(Boolean), home);
+}
+
+/** afconvert to a 24 kHz mono 16-bit WAV, the format the cloning model reads. */
+export const afconvertArgs = (src: string, dest: string): string[] => ['-f', 'WAVE', '-d', 'LEI16@24000', '-c', '1', src, dest];
+
+/** Copies a clip into the voices folder as <name>.wav (other formats converted), with its transcript. The original is untouched. */
+export async function addClone(src: string, rawName: string, transcript = ''): Promise<Clone> {
+  if (!offered.has(src)) throw new Error('Pick the clip with Add voice, Find voices or Design a voice first.');
+  if (!AUDIO.test(src) || !statSync(src).isFile()) throw new Error(`${basename(src)} is not a WAV, M4A, MP3 or AIFF file.`);
+  if (statSync(src).size > 200 * 1024 * 1024) throw new Error(`${basename(src)} is too long for a voice sample; use 3 to 30 seconds.`);
+  const name = cloneName(rawName), dir = voicesDir(), dest = join(dir, `${name}.wav`);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (existsSync(dest)) throw new Error(`There is already a voice called ${name}.`);
+  if (/\.wav$/i.test(src)) copyFileSync(src, dest, constants.COPYFILE_EXCL);
+  else {
+    const tmp = join(dir, `.${name}.partial.wav`);
+    try {
+      await promisify(execFile)('/usr/bin/afconvert', afconvertArgs(src, tmp), { timeout: 120_000 });
+      renameSync(tmp, dest);
+    } catch (err) {
+      rmSync(tmp, { force: true });
+      throw new Error(`Could not convert ${basename(src)}: ${((err as { stderr?: string }).stderr || (err as Error).message).trim()}`);
+    }
+  }
+  chmodSync(dest, 0o600);
+  setTranscript(name, transcript);
+  return clones().find((c) => c.name === name)!;
+}
+
+/** What is said in a voice's clip; empty removes it (the voice is then cloned from the sound alone). */
+export function setTranscript(name: string, text: string): void {
+  const base = known(name), t = String(text ?? '').trim().slice(0, 2000);
+  if (!t) { rmSync(`${base}.txt`, { force: true }); return; }
+  writeFileSync(`${base}.txt`, `${t}\n`, { mode: 0o600 });
+  chmodSync(`${base}.txt`, 0o600);
+}
+
+/** Read-back follows a renamed voice, and goes back to the first preset when its voice is removed. */
+function retarget(from: string, to: string): void {
+  const c = readConfig() as { speech?: SpeechSettings };
+  if (c.speech?.voice === `clone:${from}`) writeConfig({ ...c, speech: { ...c.speech, voice: to ? `clone:${to}` : '' } } as ReturnType<typeof readConfig>);
+}
+
+export function renameClone(from: string, to: string): string {
+  const a = known(from), name = cloneName(to), b = join(voicesDir(), name);
+  if (name === from) return name;
+  if (name.toLowerCase() !== from.toLowerCase() && existsSync(`${b}.wav`)) throw new Error(`There is already a voice called ${name}.`);
+  renameSync(`${a}.wav`, `${b}.wav`);
+  if (existsSync(`${a}.txt`)) renameSync(`${a}.txt`, `${b}.txt`);
+  retarget(from, name);
+  return name;
+}
+
+/** Deletes MyIDE's copy of the voice (and its transcript); the clip it came from is not touched. */
+export function removeClone(name: string): void {
+  const base = known(name);
+  rmSync(`${base}.wav`, { force: true });
+  rmSync(`${base}.txt`, { force: true });
+  retarget(name, '');
+}
+
+/** Plays a clip MyIDE offered, as the current utterance (stop() ends it). */
+export async function preview(path: string): Promise<string> {
+  if (!offered.has(path)) throw new Error('MyIDE did not offer that clip.');
+  stop();
+  const child = spawn('/usr/bin/afplay', [path], { stdio: 'ignore' });
+  const t = begin(() => child.kill());
+  return new Promise((resolve) => { child.on('error', () => {}); child.on('close', () => { end(t); resolve(''); }); });
+}
+
+let designDir = '', designN = 0;
+/** Generates `text` in a voice described in words (Qwen3-TTS VoiceDesign model, fetched on first use) into a
+ *  temp WAV, offered for preview and for saving as a cloned voice. */
+export async function design(description: string, text: string): Promise<string> {
+  const e = tts(CLONER)!, python = componentPath(CLONER);
+  if (!python) throw new Error(`Install ${e.name} first.`);
+  const d = String(description ?? '').replace(/\s+/g, ' ').trim().slice(0, 500), words = speakable(String(text ?? '')).slice(0, 300);
+  if (!d || !words) throw new Error('Describe the voice and give a sentence for it to say.');
+  stop();
+  designDir ||= mkdtempSync(join(tmpdir(), 'myide-design-'));
+  const out = join(designDir, `design-${++designN}.wav`);
+  const r = await ask(CLONER, python, { model: e.designModel, instruct: d, text: words, out });
+  if (!r) throw new Error('Stopped.');
+  if (r.ok === false || !existsSync(out)) throw new Error(`${e.name} could not design the voice: ${r.error ?? 'no audio'}`);
+  offered.add(out);
+  return out;
 }
 
 /** Transcribes a 16 kHz mono WAV with the installed whisper-cli and model. */
@@ -287,12 +463,30 @@ export function registerSpeechIpc(): void {
     broadcast('speech:change', st);
     return st;
   });
-  // force: the Test voice key works while read-back is off.
-  ipcMain.handle('speech:speak', async (_e, text: string, force = false) => {
+  // force: the Test voice key works while read-back is off. voice: one of the engine's voices instead of the chosen one (a clone's Test key).
+  ipcMain.handle('speech:speak', async (_e, text: string, force = false, voice = '') => {
     const s = settings();
     if (!s.on && !force) return '';
-    return speak(String(text ?? ''), { engine: s.engine, voice: s.voice, rate: s.rate, out: process.env.MYIDE_SAY_OUT }); // MYIDE_SAY_OUT: tests write audio to a file instead of playing it
+    if (voice && !(await engineVoices(s.engine)).some((v) => v.id === voice)) throw new Error(`${engineName(s.engine)} has no voice ${voice}.`);
+    return speak(String(text ?? ''), { engine: s.engine, voice: voice || s.voice, rate: s.rate, out: process.env.MYIDE_SAY_OUT }); // MYIDE_SAY_OUT: tests write audio to a file instead of playing it
   });
+  // Cloned voices. Each change tells every window, so voice lists refresh.
+  const changed = <T>(v: T): T => { broadcast('speech:change', status()); return v; };
+  ipcMain.handle('speech:clones', () => clones());
+  ipcMain.handle('speech:pick-clip', async (ev) => {
+    const r = await dialog.showOpenDialog(BrowserWindow.fromWebContents(ev.sender)!, {
+      title: 'Add a voice', message: 'Choose a short, clear clip of the voice: 3 to 30 seconds of speech. MyIDE copies it; the original stays where it is.',
+      properties: ['openFile'], filters: [{ name: 'Audio', extensions: ['wav', 'm4a', 'mp3', 'aiff', 'aif'] }],
+    });
+    return r.canceled || !r.filePaths[0] ? null : clipInfo(r.filePaths[0]);
+  });
+  ipcMain.handle('speech:find-clips', () => findClips());
+  ipcMain.handle('speech:preview', (_e, path: string) => preview(String(path)));
+  ipcMain.handle('speech:design', (_e, description: string, text: string) => design(description, text));
+  ipcMain.handle('speech:add-clone', async (_e, path: string, name: string, transcript: string) => changed(await addClone(String(path), name, transcript)));
+  ipcMain.handle('speech:rename-clone', (_e, from: string, to: string) => changed(renameClone(String(from), to)));
+  ipcMain.handle('speech:remove-clone', (_e, name: string) => changed(removeClone(String(name))));
+  ipcMain.handle('speech:clone-text', (_e, name: string, text: string) => setTranscript(String(name), text));
   ipcMain.handle('speech:stop', () => stop());
   ipcMain.handle('speech:transcribe', (_e, wav: Uint8Array) => transcribe(wav));
 }

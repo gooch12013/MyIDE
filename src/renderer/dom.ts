@@ -22,6 +22,29 @@ export function sheet(label: string, form: HTMLFormElement, className = ''): HTM
   return d;
 }
 
+/** A modal form sheet with Cancel and `ok`; `submit` returns an error message to show, or '' to close. */
+export function formSheet(title: string, body: HTMLElement[], submit: () => Promise<string>, ok = 'Save', className = ''): HTMLDialogElement {
+  const status = h('p', { className: 'pref-warn' });
+  status.setAttribute('aria-live', 'polite');
+  const go = h('button', { className: 'btn btn--primary', value: 'ok', textContent: ok });
+  const form = h('form', { method: 'dialog' }, h('h2', { className: 'legend', textContent: title }), ...body, status,
+    h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), go));
+  const dlg = sheet(title, form, className);
+  form.onsubmit = async (ev) => {
+    if (ev.submitter !== go) return;
+    ev.preventDefault();
+    go.disabled = true;
+    status.textContent = await submit().catch(errText);
+    go.disabled = false;
+    if (!status.textContent) dlg.close();
+  };
+  return dlg;
+}
+
+/** A labelled form field, with an optional hint under it. */
+export const field = (label: string, ctl: HTMLElement, hint?: string): HTMLLabelElement =>
+  h('label', { className: 'field' }, h('span', { className: 'legend', textContent: label }), ctl, ...(hint ? [h('span', { className: 'pref-hint', textContent: hint })] : []));
+
 /** A modal question with keys [value, label, className]; resolves with the picked value ('cancel' on Escape). Cancel comes first. */
 export function choose(title: string, detail: string, keys: [string, string, string][]): Promise<string> {
   const d = sheet(title, h('form', { method: 'dialog' },

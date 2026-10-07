@@ -3,7 +3,8 @@
 # A long-lived process run by MyIDE with the Python that has mlx-audio installed. It reads one JSON
 # request per line on stdin and answers one JSON line per request on stdout:
 #   {"id": 1, "model": "<hf repo>", "text": "...", "voice": "af_heart", "lang": "a", "speed": 1.0,
-#    "ref": "/path/clone.wav", "ref_text": "...", "rate": 1.0, "out": "/path/out.wav"}
+#    "ref": "/path/clone.wav", "ref_text": "...", "instruct": "voice description (VoiceDesign)",
+#    "rate": 1.0, "out": "/path/out.wav"}
 #   -> {"id": 1, "state": "downloading" | "loading"}   (only while a model is fetched or loaded)
 #   -> {"id": 1, "ok": true, "secs": 0.9} | {"id": 1, "ok": false, "error": "..."}
 #   {"stop": true} cancels everything sent so far: playback stops, queued lines are skipped.
@@ -84,7 +85,7 @@ def speak(req):
     global player
     m = model(req)
     kw = {"text": req["text"], "speed": req.get("speed") or 1.0}
-    for k, arg in (("voice", "voice"), ("lang", "lang_code"), ("ref", "ref_audio"), ("ref_text", "ref_text")):
+    for k, arg in (("voice", "voice"), ("lang", "lang_code"), ("ref", "ref_audio"), ("ref_text", "ref_text"), ("instruct", "instruct")):
         if req.get(k):
             kw[arg] = req[k]
     t0 = time.time()

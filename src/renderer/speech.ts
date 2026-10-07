@@ -1,6 +1,6 @@
 import type { Row } from '../main/components';
-import type { Engine, SpeechOptions, SpeechStatus, Voice } from '../main/speech';
-import { errText, h, key } from './dom';
+import type { Clip, Clone, Engine, SpeechOptions, SpeechStatus, Voice } from '../main/speech';
+import { ask, errText, field as labelled, formSheet, h, key } from './dom';
 import { openPanel } from './registry';
 
 // Read-back and dictation for any panel: speakButton(textFn) reads a summary aloud in the chosen
@@ -55,8 +55,8 @@ api.speech.onEngine(async () => {
 });
 api.speech.onSpeaking((on) => { if (!on && engineChanged) { engineChanged = false; redraw?.(); } });
 
-/** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice); `onNote` gets any fallback note. */
-export function speakButton(textFn: () => string, label = 'Read aloud', force = false, onNote?: (note: string) => void): HTMLButtonElement {
+/** A speaker key that runs `run` (a line read aloud or a clip played), lit as Stop until it ends; `onNote` gets any note or error. */
+function playKey(label: string, run: () => Promise<string>, onNote?: (note: string) => void): HTMLButtonElement {
   const b = key('', null, { className: 'key key--sm sp-key' });
   b.dataset.label = label;
   idle(b);
@@ -64,10 +64,16 @@ export function speakButton(textFn: () => string, label = 'Read aloud', force = 
     if (active === b) { await api.speech.stop(); return; }
     await api.speech.stop();
     active = b;
-    icon(b, 'stop', 'Stop reading');
+    icon(b, 'stop', 'Stop');
     b.classList.add('key--lit');
-    try { const note = await api.speech.speak(textFn(), force); onNote?.(note); } finally { if (active === b) { idle(b); active = null; } }
+    try { onNote?.(await run()); } catch (e) { onNote?.(errText(e)); } finally { if (active === b) { idle(b); active = null; } }
   };
+  return b;
+}
+
+/** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice); `onNote` gets any fallback note. */
+export function speakButton(textFn: () => string, label = 'Read aloud', force = false, onNote?: (note: string) => void): HTMLButtonElement {
+  const b = playKey(label, () => api.speech.speak(textFn(), force), onNote);
   if (!force) { b.hidden = !status.on; speakers.add(new WeakRef(b)); }
   return b;
 }
@@ -210,14 +216,17 @@ let pendingEngine = '', pendingDictate = '';
 export async function voiceSection(say: (t: string) => void): Promise<Node[]> {
   const wrap = h('div', { className: 'sp-voice' });
   let opts: SpeechOptions, seq = 0;
+  // Cloned voices (Qwen3-TTS): MyIDE's copies, the last Spotlight search, and the voice-design box.
+  let clones: Clone[] = [], found: Clip[] | null = null, designOpen = false, generating = false, designed = '';
+  let designDesc = '', designText = 'Hello, this is my new voice. Engineer one needs approval to merge.';
   const set = async (patch: Parameters<typeof api.speech.set>[0]) => {
     try { status = await api.speech.set(patch); sync(); return true; } catch (e) { say(errText(e)); return false; } finally { void draw(); }
   };
   const draw = async () => {
     const n = ++seq;
-    const [o, st] = await Promise.all([api.speech.options(), api.speech.get()]);
+    const [o, st, cl] = await Promise.all([api.speech.options(), api.speech.get(), api.speech.clones()]);
     if (n !== seq) return; // a newer draw is on its way
-    opts = o; status = st;
+    opts = o; status = st; clones = cl;
     // An engine that just became ready takes over from the one that was holding its place.
     if (pendingEngine && pendingEngine !== status.engine && opts.engines.find((e) => e.id === pendingEngine)?.state !== 'missing') {
       const id = pendingEngine;
@@ -233,6 +242,92 @@ export async function voiceSection(say: (t: string) => void): Promise<Node[]> {
     if (focused) (wrap.querySelector(`#${CSS.escape(focused)}`) as HTMLElement | null)?.focus();
   };
   redraw = () => { if (wrap.isConnected) void draw(); };
+
+  const secs = (d?: number) => (d === undefined ? 'Length unknown' : `${d.toFixed(1)} s`);
+  const fileName = (p: string) => p.split('/').pop() ?? p;
+
+  /** Name and transcript for a clip, then MyIDE copies it into its voices folder. */
+  function addSheet(c: Clip, hint: string): void {
+    const name = h('input', { className: 'input', required: true, maxLength: 40, value: c.name, placeholder: 'e.g. David' });
+    const text = h('textarea', { className: 'input', rows: 3, value: c.transcript, placeholder: 'What is said in the clip; improves the clone' });
+    formSheet('Add voice', [h('p', { className: 'pref-hint sp-path', textContent: c.path }), labelled('Name', name), labelled('Transcript', text, hint)], async () => {
+      const v = await api.speech.addClone(c.path, name.value, text.value);
+      say(`Added ${v.name}. Pick it under Voice to use it.`);
+      void draw();
+      return '';
+    }, 'Add', 'sp-sheet');
+  }
+  const addFound = (c: Clip) => addSheet(c, c.transcript ? `From ${fileName(c.path).replace(/\.[^.]+$/, '')}.txt next to the clip. Check it matches.` : 'Optional. What is said in the clip, word for word.');
+
+  function cloneRows(s: SpeechStatus, engine: Engine): Node[] {
+    const live = s.engine === engine.id, installed = engine.state !== 'missing';
+    const rows: Node[] = [
+      h('h3', { className: 'legend psec-sub', textContent: 'Cloned voices' }),
+      pref('Your voices', 'Qwen3-TTS clones a voice from a short clip (3 to 30 s) and, ideally, what is said in it. MyIDE keeps its own copy in ~/.myide/components/qwen3-tts/voices; originals are never moved or changed.',
+        key('Add voice…', async () => { try { const c = await api.speech.pickClip(); if (c) addFound(c); } catch (e) { say(errText(e)); } }),
+        key(found ? 'Search again' : 'Find voices on this Mac', async () => {
+          say('Searching your home folder with Spotlight…');
+          try { found = await api.speech.findClips(); say(`${found.length} clip${found.length === 1 ? '' : 's'} found. Nothing is copied until you press Add.`); } catch (e) { say(errText(e)); }
+          void draw();
+        }),
+        key('Design a voice…', () => { designOpen = !designOpen; void draw(); }, { className: `key key--sm${designOpen ? ' key--lit' : ''}` })),
+    ];
+    if (!clones.length) rows.push(h('p', { className: 'sp-need', textContent: 'No cloned voices yet.' }));
+    for (const c of clones) {
+      const text = h('textarea', { className: 'input grow', rows: 2, id: `sp-clone-${c.name.replace(/\W/g, '_')}`, value: c.transcript, placeholder: 'What is said in the clip; improves the clone' });
+      text.setAttribute('aria-label', `Transcript of ${c.name}`);
+      text.oninput = () => { c.transcript = text.value; };
+      text.onchange = () => void api.speech.setCloneText(c.name, text.value).then(() => say(`Saved ${c.name}'s transcript.`), (e) => say(errText(e)));
+      const test = playKey(`Test ${c.name}`, () => api.speech.speak(`Hello, this is ${c.name}. Engineer one needs approval to merge.`, true, `clone:${c.name}`), say);
+      if (!live) { test.disabled = true; test.title = `Install ${engine.name} to hear it`; }
+      const rename = key('Rename…', () => {
+        const name = h('input', { className: 'input', required: true, maxLength: 40, value: c.name });
+        formSheet(`Rename ${c.name}`, [labelled('Name', name)], async () => { const n = await api.speech.renameClone(c.name, name.value); say(`Renamed ${c.name} to ${n}.`); void draw(); return ''; }, 'Rename', 'sp-sheet');
+      });
+      const remove = h('button', { type: 'button', className: 'btn btn--quiet rm', textContent: 'Remove', onclick: async () => {
+        if (!await ask(`Remove ${c.name}?`, 'Deletes MyIDE’s copy of the clip and its transcript. The recording it came from is not touched.', 'Remove', true)) return;
+        try { await api.speech.removeClone(c.name); say(`Removed ${c.name}.`); } catch (e) { say(errText(e)); }
+        void draw();
+      } });
+      const row = pref(c.name, secs(c.duration), text, test, rename, remove);
+      row.dataset.clone = c.name;
+      rows.push(row);
+    }
+    if (designOpen) {
+      const desc = h('textarea', { className: 'input grow', rows: 2, id: 'sp-design-desc', value: designDesc, placeholder: 'e.g. warm older British man, calm, slightly gravelly' });
+      desc.setAttribute('aria-label', 'Voice description');
+      desc.oninput = () => { designDesc = desc.value; };
+      const line = h('input', { className: 'input grow', id: 'sp-design-text', value: designText });
+      line.setAttribute('aria-label', 'Sample sentence');
+      line.oninput = () => { designText = line.value; };
+      const gen = key(generating ? 'Stop' : 'Generate', async () => {
+        if (generating) { await api.speech.stop(); return; }
+        generating = true; designed = '';
+        say('Designing the voice…');
+        void draw();
+        try { designed = await api.speech.design(designDesc, designText); say('Designed. Play it, then Save as voice to keep it.'); } catch (e) { say(errText(e)); }
+        generating = false;
+        void draw();
+      }, { className: `key key--sm${generating ? ' key--lit' : ''}`, disabled: !installed });
+      if (!installed) gen.title = `Install ${engine.name} first`;
+      const made = designed ? [playKey('Play the designed voice', () => api.speech.preview(designed), say),
+        key('Save as voice…', () => addSheet({ path: designed, name: '', transcript: designText, score: 0 }, 'The sentence the designed voice says. Keep it as is.'))] : [];
+      rows.push(pref('Design a voice', 'Describe a voice in words and Qwen3-TTS makes a sample of it; save the sample to reuse the voice. The first design downloads the VoiceDesign model (4.5 GB) from Hugging Face.',
+        desc, line, gen, ...made));
+    }
+    if (found) {
+      rows.push(h('h3', { className: 'legend psec-sub', textContent: `Clips on this Mac (${found.length})` }));
+      if (!found.length) rows.push(h('p', { className: 'sp-need', textContent: 'Spotlight found no WAV clips of 3 to 30 seconds in your home folder.' }));
+      for (const c of found) {
+        const snip = c.transcript ? `“${c.transcript.length > 90 ? `${c.transcript.slice(0, 90)}…` : c.transcript}”` : 'No transcript next to it.';
+        const row = pref(fileName(c.path), `${c.path.replace(/^\/Users\/[^/]+/, '~')} · ${secs(c.duration)}`,
+          h('span', { className: 'sp-snip', textContent: snip }), playKey(`Play ${fileName(c.path)}`, () => api.speech.preview(c.path), say), key('Add…', () => addFound(c)));
+        row.dataset.clip = c.path;
+        rows.push(row);
+      }
+    }
+    return rows;
+  }
 
   function build(): Node[] {
     const s = status;
@@ -306,6 +401,7 @@ export async function voiceSection(say: (t: string) => void): Promise<Node[]> {
       pref('Speed', '', rate, out, sysRate),
       pref('Test voice', `Plays a sample in ${active.name}${chosen.id === s.engine && s.voice ? `, ${chosen.voices.find((v) => v.id === s.voice)?.label ?? s.voice}` : ''}, even while read-back is off.`,
         speakButton(() => sample, 'Test voice', true, (note) => say(note))),
+      ...(chosen.id === 'qwen3-tts' ? cloneRows(s, chosen) : []),
       h('h3', { className: 'legend psec-sub', textContent: 'Dictation' }),
       pref('Engine', 'macOS dictation (press Fn twice) works in every text box. Local Whisper adds mic keys that transcribe on this Mac.', dict),
       ...dictRows,
