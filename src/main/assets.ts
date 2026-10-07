@@ -313,9 +313,10 @@ export async function saveToProject(projectId: string, id: string, version: numb
 
 // ---- one-off claude -p turns ----
 
-/** One `claude -p` turn in a throwaway folder on the user's own CLI and login; resolves with every stream-json line. */
-async function oneShot(prompt: string, args: string[], timeoutMs = 180_000): Promise<{ lines: any[]; ok: boolean; text: string }> {
-  const cwd = mkdtempSync(join(tmpdir(), 'myide-assets-'));
+/** One `claude -p` turn in a throwaway folder on the user's own CLI and login; resolves with every stream-json line.
+ *  `dir`: run there instead and leave it (the role wizard resumes its session from the same folder). */
+export async function oneShot(prompt: string, args: string[], timeoutMs = 180_000, dir?: string): Promise<{ lines: any[]; ok: boolean; text: string }> {
+  const cwd = dir ?? mkdtempSync(join(tmpdir(), 'myide-assets-'));
   try {
     const child = spawn('claude', ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...args], { cwd, env: await spawnEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
     const lines: any[] = [];
@@ -328,7 +329,7 @@ async function oneShot(prompt: string, args: string[], timeoutMs = 180_000): Pro
     const result = lines.find((l) => l.type === 'result');
     return { lines, ok: !!result && !result.is_error, text: typeof result?.result === 'string' ? result.result : stderr.trim() || 'claude gave no result' };
   } finally {
-    rmSync(cwd, { recursive: true, force: true });
+    if (!dir) rmSync(cwd, { recursive: true, force: true });
   }
 }
 

@@ -1,10 +1,11 @@
 import type { Mode, Pick } from '../main/org';
 import { accountPicker } from './accounts';
 import { attachBox } from './attach';
-import { h } from './dom';
+import { h, key } from './dom';
 import type { Project } from '../main/projects';
 import { activeProject } from './projects';
 import { micButton } from './speech';
+import { openWizard } from './wizard';
 
 const api = window.myide;
 
@@ -77,13 +78,13 @@ let sheet: HTMLDialogElement | undefined;
 /** The hire sheet: role, task, model and effort (defaults from the role). */
 /** `o.task` prefills the task (a promoted to-do); `o.onHired` hears the new employee. */
 /** `o.project` is the project to hire into (a project's Employees panel); default the active one. */
-export async function openHire(o: { task?: string; project?: Project; onHired?: (e: { id: string; role: string }) => void } = {}): Promise<void> {
+export async function openHire(o: { task?: string; role?: string; project?: Project; onHired?: (e: { id: string; role: string }) => void } = {}): Promise<void> {
   const project = o.project ?? activeProject();
   if (!project) return;
   sheet?.remove();
   const [roles, org] = await Promise.all([api.employees.roles(project.id), api.org.get()]);
   const po = org.projects.find((p) => p.id === project.id);
-  const role = select(roles.map((r) => [r.name, `${r.name}${r.source === 'project' ? ' (project)' : ''}`]), roles[0]?.name ?? '');
+  const role = select(roles.map((r) => [r.name, `${r.name}${r.source === 'project' ? ' (project)' : ''}`]), o.role && roles.some((r) => r.name === o.role) ? o.role : roles[0]?.name ?? '');
   role.id = 'hire-role';
   const desc = h('p', { className: 'pref-hint' });
   const task = h('textarea', { id: 'hire-task', className: 'input', rows: 4, required: true, placeholder: 'What should this employee do?', value: o.task ?? '' });
@@ -102,6 +103,7 @@ export async function openHire(o: { task?: string; project?: Project; onHired?: 
     pick.set(po?.model || r?.model || 'sonnet', po?.effort || r?.effort);
     mode.set(po?.mode || r?.mode || 'pinned');
     pick.el.hidden = mode.get() === 'auto';
+    lead.checked = !!r?.lead;
   };
   role.onchange = fromRole;
   role.addEventListener('change', () => void acct.sync());
@@ -113,6 +115,10 @@ export async function openHire(o: { task?: string; project?: Project; onHired?: 
       ? h('label', { className: 'field', htmlFor: 'hire-role' }, h('span', { className: 'legend', textContent: 'Role' }), role)
       : h('p', { className: 'pref-hint', textContent: 'No roles found. A role is an agent file in ~/.claude/agents or this project\'s .claude/agents.' }),
     desc,
+    // The role wizard opens as a panel; this sheet closes so it is not hidden behind the modal.
+    h('div', { className: 'wz-hire-keys' },
+      ...(roles.length ? [key('Edit role with wizard', () => { sheet?.close(); openWizard({ projectId: project.id, edit: role.value }); }, { title: 'Change this role with the role wizard' })] : []),
+      key('Create a new role with the wizard', () => { sheet?.close(); openWizard({ projectId: project.id }); })),
     h('label', { className: 'field', htmlFor: 'hire-task' }, h('span', { className: 'legend', textContent: 'Task' }), task),
     micButton(task, (t) => { status.textContent = t; }),
     attach.el,

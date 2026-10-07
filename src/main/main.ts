@@ -20,6 +20,7 @@ import { registerButtonsIpc } from './buttons';
 import { refreshTray, startTray } from './tray';
 import { registerAssetsIpc } from './assets';
 import { registerTodosIpc } from './todos';
+import { registerWizardIpc } from './wizard';
 
 // One MyIDE at a time. The lock lives in userData, so a dev or test run with its own MYIDE_HOME
 // gets its own userData and runs beside the installed app.
@@ -131,6 +132,7 @@ app.whenReady().then(() => {
   registerButtonsIpc({ onPaused: refreshTray });
   registerAssetsIpc();
   registerTodosIpc();
+  registerWizardIpc();
   createMainWindow();
   void startTray({ open: showAll, showNeeds: () => { showAll(); mainWindow?.webContents.send('command', 'employees-all'); } });
 });

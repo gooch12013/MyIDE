@@ -37,7 +37,7 @@ export interface Employee {
   /** This Mac: the plan from its last ExitPlanMode, the commands in it, and when David hit GO. */
   plan?: { text: string; commands: string[]; approvedAt?: number };
 }
-export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; addDirs?: string[]; source: 'user' | 'project' }
+export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; addDirs?: string[]; lead?: boolean; maxReports?: number; readOnly?: boolean; source: 'user' | 'project' }
 /** Per-project org settings, kept in that project's state.json. Priority and pause live in config.json projects[]. */
 export interface ProjectOrg { model?: string; effort?: string; mode?: Mode; ceiling?: Pick; maxDepth?: number }
 type Issue = NonNullable<Employee['issue']>;
@@ -114,7 +114,14 @@ function macSettings(e: Emp): object {
     },
   };
 }
-const settingsFor = (e: Emp) => (isMac(e) ? macSettings(e) : employeeSettings());
+// myide-readonly: true in the role denies every file-editing tool (Claude only; the ACP agents ignore the settings file).
+// ponytail: Bash can still write files; the role's own rules say not to. A per-command Bash deny list is the upgrade.
+function settingsFor(e: Emp): object {
+  const s = (isMac(e) ? macSettings(e) : employeeSettings()) as { permissions: { deny: string[] } };
+  let ro = false;
+  try { ro = !!(e.roleFile && parseRole(e.roleFile, 'user')?.readOnly); } catch { /* role file gone */ }
+  return ro ? { ...s, permissions: { ...s.permissions, deny: [...s.permissions.deny, 'Edit', 'Write', 'MultiEdit', 'NotebookEdit'] } } : s;
+}
 
 /** GO on a This Mac plan card: the commands come from the text on that card, which must still be the employee's latest plan.
  *  Its pending ExitPlanMode is answered (the plan-mode turn ends), and the next turn runs with those commands allowed. */
@@ -184,22 +191,25 @@ function load(): void {
 
 // ---- roles ----
 
-function parseRole(file: string, source: Role['source']): (Role & { file: string }) | null {
+export function parseRole(file: string, source: Role['source']): (Role & { file: string }) | null {
   const f = frontmatter(file);
   if (!f.name) return null;
   const model = f.model && f.model !== 'inherit' ? f.model : undefined;
   const mode = ['pinned', 'manager', 'auto'].includes(f['myide-mode']) ? f['myide-mode'] as Mode : undefined;
   const maxTurns = Number(f['myide-max-turns']);
+  const maxReports = Number(f['myide-max-reports']);
   const addDirs = f['myide-add-dir']?.split(',').map((d) => d.trim().replace(/^~(?=\/|$)/, homedir())).filter(Boolean);
   return {
     addDirs: addDirs?.length ? addDirs : undefined,
     name: f.name, description: f.description ?? '', model, effort: f.effort || undefined, mode, account: f['myide-account'] || undefined,
     shared: f['myide-shared'] === 'true' || undefined, maxTurns: Number.isInteger(maxTurns) && maxTurns > 0 ? maxTurns : undefined, source, file,
+    lead: f['myide-lead'] === 'true' || undefined, maxReports: Number.isInteger(maxReports) && maxReports > 0 ? maxReports : undefined,
+    readOnly: f['myide-readonly'] === 'true' || undefined,
   };
 }
 
 /** Roles from ~/.claude/agents and <project>/.claude/agents; a project role overrides a user role of the same name. */
-function roles(projectId: string): (Role & { file: string })[] {
+export function roles(projectId: string): (Role & { file: string })[] {
   const project = projectId === MAC.id ? MAC : projectById(projectId);
   const out = new Map<string, Role & { file: string }>();
   const dirs: [string, Role['source']][] = [[join(homedir(), '.claude', 'agents'), 'user']];
@@ -553,7 +563,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   const e: Emp = {
     id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: mac ? '' : `myide/${name}`,
     model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
-    depth, parentId: by?.id, lead: !!o.lead || undefined, maxReports: o.lead ? o.maxReports : undefined, contractor: role.shared,
+    depth, parentId: by?.id, lead: (o.lead ?? role.lead) || undefined, maxReports: (o.lead ?? role.lead) ? o.maxReports ?? role.maxReports : undefined, contractor: role.shared,
     mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
   };
   emps.set(e.id, e);

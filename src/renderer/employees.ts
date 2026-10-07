@@ -1,5 +1,6 @@
 import { h, key } from './dom';
 import { openHire } from './hire';
+import { openWizard } from './wizard';
 import { activeProject, allProjects } from './projects';
 import { showProject } from './layouts';
 import { openPanel, registerPanel } from './registry';
@@ -300,6 +301,7 @@ registerPanel('employees', {
       page.style.setProperty('--proj', project.colour);
       el.append(h('div', { className: 'emps-bar' },
         h('label', { className: 'org-ceiling-field' }, h('span', { className: 'legend', textContent: 'Ceiling' }), ceiling), depthNote,
+        key('New role', () => openWizard({ projectId: project.id }), { title: 'Write a new employee role with the role wizard' }),
         key('Hire', () => void openHire({ project }), { title: `Hire an employee into ${project.name}` })), page);
     } else el.append(h('p', { className: 'files-note', textContent: 'No project open.' }));
 
