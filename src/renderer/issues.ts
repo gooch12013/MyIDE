@@ -5,7 +5,7 @@ import { ask, errText, h, key, sheet } from './dom';
 import { chip, cueOf, led, openEmployee, stateName, steps, type Employee } from './employees';
 import type { Project } from '../main/projects';
 import type { OrgState } from '../preload/preload';
-import { activeProject, allProjects } from './projects';
+import { allProjects, scopeOf } from './projects';
 import { openPanel, registerPanel } from './registry';
 import { micButton } from './speech';
 import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, STATUSES, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
@@ -289,11 +289,13 @@ function foundLine(p: Project, d: Detected, o: { edit: (l: ForgeLink) => void; d
 
 registerPanel('issues', {
   title: 'Issues',
+  description: 'GitHub and Forgejo issues, drafts and who is working on each.',
+  scoped: true,
   create(el, params) {
     el.classList.add('issues');
-    // In a project's layout the panel shows that project; only an explicit { scope: 'all' } (View > Issues: All Projects) shows every one.
-    const all = params.scope === 'all';
-    const scope = all ? 'all' : activeProject()?.id ?? '';
+    // The panel's scope (see scopeOf): the tab's project by default, every project on Home or with { scope: 'all' }.
+    const { all, project } = scopeOf(params);
+    const scope = all ? 'all' : project?.id ?? '';
     let v: View = { ...DEFAULT_VIEW };
     let saveTimer: ReturnType<typeof setTimeout> | undefined;
     const save = () => { clearTimeout(saveTimer); if (scope) saveTimer = setTimeout(() => void api.forge.setView(scope, v).catch(() => {}), 250); };
@@ -363,7 +365,7 @@ registerPanel('issues', {
         if (window.dispatchEvent(new CustomEvent('myide:prefs-section', { detail: 'forges', cancelable: true }))) openPanel('preferences', { section: 'forges' });
       };
       const lines = bare.flatMap((p, i) => {
-        if (!ds[i].found.length && p.id !== activeProject()?.id) return [];
+        if (!ds[i].found.length && p.id !== scope) return [];
         // The same answer keeps its line, so a poll's redraw never wipes a token being typed.
         const k = JSON.stringify([p.name, p.colour, ds[i]]);
         if (kept.get(p.id)?.k === k) return [kept.get(p.id)!.row];

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, Menu, shell, type MenuItemConstructorOptions } from 'electron';
 import { deleteNamedLayout, namedLayouts } from './layouts';
 import { listEmployees, onEmployeeChange, onEmployeeRemoved } from './employees';
-import { listProjects, projectById } from './projects';
+import { listProjects, projectById, readConfig } from './projects';
 import { lastClosed, openTabs } from './tabs';
 
 /** What the renderer reports for the menu: the active project and which panel types are open. */
@@ -19,6 +19,7 @@ export function buildMenu(): void {
   const named = namedLayouts();
   const projects = listProjects();
   const open = openTabs(projects);
+  const homeClosed = readConfig().homeClosed;
   lastNeeds = needsKey();
   const needs = (id: string) => listEmployees().filter((e) => e.projectId === id && e.state === 'needs-you').length;
   const template: MenuItemConstructorOptions[] = [
@@ -51,9 +52,14 @@ export function buildMenu(): void {
     {
       label: 'View',
       submenu: [
+        { label: 'Home', accelerator: 'CmdOrCtrl+0', click: cmd('project:home') },
         {
           label: 'Panels',
-          submenu: state.panels.map((p) => ({ label: p.title, type: 'checkbox' as const, checked: p.open, click: cmd(`panel:${p.id}`) })),
+          submenu: [
+            { label: 'Add Panel…', click: cmd('add-panel') },
+            { type: 'separator' as const },
+            ...state.panels.map((p) => ({ label: p.title, type: 'checkbox' as const, checked: p.open, click: cmd(`panel:${p.id}`) })),
+          ],
         },
         {
           label: 'Layouts',
@@ -79,7 +85,7 @@ export function buildMenu(): void {
         { role: 'reload' },
         ...(app.isPackaged ? [] : [{ role: 'toggleDevTools' as const }]),
         { type: 'separator' },
-        { role: 'resetZoom' }, { role: 'zoomIn' }, { role: 'zoomOut' },
+        { role: 'resetZoom', accelerator: 'CmdOrCtrl+Alt+0' }, // Cmd+0 is Home { role: 'zoomIn' }, { role: 'zoomOut' },
         { type: 'separator' },
         { role: 'togglefullscreen' },
       ],
@@ -88,6 +94,7 @@ export function buildMenu(): void {
       label: 'Projects',
       // Every project in tab order: a check on open tabs, "(current)" on the shown one, ⌘1..9 following the open tabs.
       submenu: [
+        { label: `Home${state.active === 'home' ? ' (current)' : ''}`, type: 'checkbox' as const, checked: !homeClosed, accelerator: 'CmdOrCtrl+0', registerAccelerator: false, click: cmd('project:home') },
         ...projects.map((p) => {
           const n = needs(p.id);
           const i = open.indexOf(p);
@@ -100,10 +107,10 @@ export function buildMenu(): void {
         ...(projects.length ? [{ type: 'separator' as const }] : []),
         { label: 'Add Project…', click: cmd('add-project') },
         { label: 'Close Project Tab', accelerator: 'CmdOrCtrl+Shift+W', registerAccelerator: false, enabled: !!state.active, click: cmd('close-project') },
-        { label: 'Reopen Closed Project', accelerator: 'CmdOrCtrl+Shift+T', enabled: !!lastClosed(projects), click: cmd('reopen-project') },
-        { label: 'Remove Current Project…', enabled: !!state.active, click: cmd('remove-project') },
+        { label: 'Reopen Closed Project', accelerator: 'CmdOrCtrl+Shift+T', enabled: !!lastClosed([{ id: 'home', closed: homeClosed }, ...projects]), click: cmd('reopen-project') },
+        { label: 'Remove Current Project…', enabled: !!state.active && state.active !== 'home', click: cmd('remove-project') },
         { type: 'separator' },
-        { label: 'Hire Employee…', enabled: !!state.active, click: cmd('hire-employee') },
+        { label: 'Hire Employee…', enabled: !!state.active && state.active !== 'home', click: cmd('hire-employee') },
         { label: 'New Employee Role…', click: cmd('new-role') },
       ],
     },
@@ -125,12 +132,18 @@ export function registerMenu(sendCommand: (command: string) => void): void {
   onEmployeeChange(needsChanged);
   onEmployeeRemoved(needsChanged);
   // A project key's context menu.
+  // Home can only be closed: no folder to reveal, no settings, never removed.
   ipcMain.on('projects:menu', (e, id: string) => {
     const p = projectById(id);
-    if (!p) return;
-    Menu.buildFromTemplate([
+    if (!p && id !== 'home') return;
+    const others = openTabs(listProjects()).length + (readConfig().homeClosed ? 0 : 1) > 1;
+    const close: MenuItemConstructorOptions[] = [
       { label: 'Close Tab', click: cmd(`close-project:${id}`) },
-      { label: 'Close Others', enabled: openTabs(listProjects()).length > 1, click: cmd(`close-others:${id}`) },
+      { label: 'Close Others', enabled: others, click: cmd(`close-others:${id}`) },
+    ];
+    if (!p) return void Menu.buildFromTemplate(close).popup({ window: BrowserWindow.fromWebContents(e.sender) ?? undefined });
+    Menu.buildFromTemplate([
+      ...close,
       { type: 'separator' },
       { label: 'Reveal in Finder', click: () => shell.showItemInFolder(p.path) },
       { label: 'Project Settings…', click: cmd(`project-settings:${id}`) },

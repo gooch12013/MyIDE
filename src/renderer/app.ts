@@ -13,6 +13,7 @@ import './buttons';
 import './assets';
 import './todos';
 import './wizard';
+import './home';
 import { startWorkspace } from './layouts';
 import { activeProject } from './projects';
 

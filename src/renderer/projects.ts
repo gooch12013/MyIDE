@@ -1,19 +1,34 @@
 import type { Project } from '../main/projects';
 import { moveBefore, moveBy, openTabs } from '../main/tabs';
 import { h } from './dom';
+import { HOME_ID, resolveScope } from './command';
 
 let projects: Project[] = [];
 let active: Project | null = null;
+// Home: a tab that is not a project (no folder, no repo), always first, closable, never removed.
+// Its empty path means terminals opened there start in the home folder.
+const HOME: Project = { id: HOME_ID, name: 'Home', path: '', colour: '#aeb6c0' };
+let homeClosed: number | null = null;
 
-/** Every project, closed tabs included, in tab order. */
+/** Every project, closed tabs included, in tab order. Home is not one. */
 export const allProjects = (): Project[] => projects;
-/** The projects with a tab in the top bar. */
-export const openProjects = (): Project[] => openTabs(projects);
-export const activeProject = (): Project | null => active;
+/** Home, then every project: the tabs, closed ones included. */
+export const allTabs = (): Project[] => [{ ...HOME, ...(homeClosed ? { closed: homeClosed } : {}) }, ...projects];
+/** The tabs in the top bar (Home first while it is open). */
+export const openProjects = (): Project[] => openTabs(allTabs());
+/** The shown tab's project; null on Home or with no tab open. */
+export const activeProject = (): Project | null => (active?.id === HOME_ID ? null : active);
+/** The shown tab, Home included. */
+export const activeTab = (): Project | null => active;
+/** The project a panel shows (params.scope, see resolveScope): `all` for every project, else `project` (null if it is gone). */
+export function scopeOf(params: Record<string, unknown>): { all: boolean; project: Project | null } {
+  const id = resolveScope(params.scope, active?.id ?? null);
+  return { all: id === null, project: id === null ? null : projects.find((p) => p.id === id) ?? null };
+}
 /** Reloads the project list; the active project is looked up again (null if it was removed) and the keys redrawn. */
 export async function loadProjects(): Promise<Project[]> {
-  projects = await window.myide.projects.list();
-  setActiveProject(projects.find((p) => p.id === active?.id) ?? null);
+  [projects, homeClosed] = await Promise.all([window.myide.projects.list(), window.myide.projects.homeClosed()]);
+  setActiveProject(allTabs().find((p) => p.id === active?.id) ?? null);
   window.dispatchEvent(new Event('myide:projects'));
   return projects;
 }
@@ -29,17 +44,21 @@ async function reorder(next: Project[], focus: string): Promise<void> {
   await window.myide.projects.reorder(next.map((p) => p.id));
 }
 
-/** One page key per open project in its colour (Cmd+1..9), the active one lit, then the add key.
- *  Keys drag to reorder (or Alt+Left/Right), close on their ×, and have a context menu. */
+/** Home (Cmd+0), then one page key per open project in its colour (Cmd+1..9), the active one lit with
+ *  a + key after it for adding panels, then the add-project key. Project keys drag to reorder (or Alt+Left/Right),
+ *  close on their ×, and have a context menu. */
 export function setActiveProject(p: Project | null, on = handlers): void {
   active = p;
   handlers = on;
-  nav.replaceChildren(...openProjects().map((proj, i) => {
+  const home = homeClosed ? [] : [HOME];
+  nav.replaceChildren(...[...home, ...openTabs(projects)].flatMap((proj, n) => {
+    const i = n - home.length;
+    const isHome = proj.id === HOME_ID;
     const close = h('span', { className: 'proj-close', textContent: '×', title: `Close ${proj.name}'s tab` });
     close.setAttribute('aria-hidden', 'true'); // keyboard: Cmd+Shift+W or the context menu
     close.onclick = (ev) => { ev.stopPropagation(); handlers.close(proj); };
     const b = h('button', {
-      type: 'button', className: 'key proj-key', title: `${proj.path}\nDrag or Alt+Left/Right to reorder`, draggable: true,
+      type: 'button', className: `key proj-key${isHome ? ' proj-key--home' : ''}`, title: isHome ? 'Home: every project at a glance' : `${proj.path}\nDrag or Alt+Left/Right to reorder`, draggable: !isHome,
       onclick: () => handlers.pick(proj),
     }, h('span', { className: 'proj-name', textContent: proj.name }));
     b.dataset.id = proj.id;
@@ -51,6 +70,11 @@ export function setActiveProject(p: Project | null, on = handlers): void {
     }
     b.append(close);
     b.oncontextmenu = (ev) => { ev.preventDefault(); window.myide.projects.menu(proj.id); };
+    // The active tab's + key: add any panel to this tab.
+    const add = proj.id === p?.id ? [h('button', { type: 'button', className: 'key proj-add-panel', textContent: '+', title: `Add a panel to ${proj.name}`,
+      onclick: () => window.dispatchEvent(new Event('myide:add-panel')) })] : [];
+    add[0]?.setAttribute('aria-label', `Add a panel to ${proj.name}`);
+    if (isHome) return [b, ...add];
     b.onkeydown = (ev) => {
       if (!ev.altKey || (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight')) return;
       ev.preventDefault();
@@ -70,11 +94,11 @@ export function setActiveProject(p: Project | null, on = handlers): void {
       ev.preventDefault();
       b.classList.remove('drop-before', 'drop-after');
       const id = ev.dataTransfer!.getData('application/x-myide-project');
-      const open = openProjects();
+      const open = openTabs(projects);
       const before = ev.offsetX > b.offsetWidth / 2 ? (open[open.indexOf(proj) + 1]?.id ?? null) : proj.id;
       if (id) void reorder(moveBefore(projects, id, before), id);
     };
-    return b;
+    return [b, ...add];
   }));
   nav.append(h('button', {
     type: 'button', className: 'key key--new', textContent: projects.length ? '+ Project' : 'Add a project',

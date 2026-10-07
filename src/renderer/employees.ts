@@ -1,7 +1,7 @@
 import { h, key } from './dom';
 import { openHire } from './hire';
 import { openWizard } from './wizard';
-import { activeProject, allProjects } from './projects';
+import { activeProject, allProjects, scopeOf } from './projects';
 import { showProject } from './layouts';
 import { openPanel, registerPanel } from './registry';
 import type { DockviewPanelApi } from 'dockview-core';
@@ -78,7 +78,7 @@ const inputSummary = (input: unknown): string => {
 const KIND = { permission: 'Permission', plan: 'Approve plan', question: 'Question' };
 
 /** One NEEDS YOU card: who, what, and the keys that answer it. */
-function needCard(a: Approval, who: string, colour: string | undefined): HTMLElement {
+export function needCard(a: Approval, who: string, colour: string | undefined): HTMLElement {
   const card = h('article', { className: 'need' });
   if (colour) card.style.setProperty('--proj', colour);
   card.setAttribute('aria-label', `${KIND[a.kind]}: ${who}`);
@@ -155,7 +155,7 @@ function row(e: Employee, everyone: Employee[], tag: 'div' | 'summary' = 'div', 
   return r;
 }
 
-const ATTENTION: EmployeeState[] = ['needs-you', 'failed', 'interrupted'];
+export const ATTENTION: EmployeeState[] = ['needs-you', 'failed', 'interrupted'];
 
 /** Outline tree: reports under their lead, each lead a fold. `closed` remembers folds across redraws. */
 function tree(list: Employee[], closed: Set<string>, maxReports: number): HTMLElement[] {
@@ -188,7 +188,7 @@ export function meterBar(v: number, label: string, o: { now?: number; max?: numb
 }
 
 /** Five-hour usage per AI account: a segmented meter with the slow-down mark, its value, and an LED once hiring slows. */
-function gauge(a: { id: string; name: string; cap: number; usage?: Usage }): HTMLElement[] {
+export function gauge(a: { id: string; name: string; cap: number; usage?: Usage }): HTMLElement[] {
   const u = a.usage;
   const v = pct(u?.fiveHour);
   const wrap = h('span', { className: 'meter-wrap' }, meterBar(v, `${a.name}, five-hour usage`));
@@ -204,7 +204,7 @@ function gauge(a: { id: string; name: string; cap: number; usage?: Usage }): HTM
 }
 
 /** One line per project: page colour, what needs you, slots in use, priority and pause. */
-function projectLine(p: { id: string; name: string; colour: string; closed?: number }, list: Employee[], o: OrgState, active: boolean): HTMLElement {
+export function projectLine(p: { id: string; name: string; colour: string; closed?: number }, list: Employee[], o: OrgState, active: boolean): HTMLElement {
   const po = o.projects.find((x) => x.id === p.id);
   const running = list.filter((e) => e.state === 'working').length;
   const needs = list.filter((e) => ATTENTION.includes(e.state)).length;
@@ -268,11 +268,12 @@ const rollText = (all: Employee[]) => {
 
 registerPanel('employees', {
   title: 'Employees',
+  description: 'The team as an outline: needs-you cards, usage, slots, and each employee\'s cue.',
+  scoped: true,
   create(el, params) {
     el.classList.add('emps');
-    // In a project's layout the panel shows that project; only { scope: 'all' } (View > Employees: All Projects) shows every one.
-    const all = params.scope === 'all';
-    const project = all ? null : activeProject();
+    // The panel's scope (see scopeOf): the tab's project by default, every project on Home or with { scope: 'all' }.
+    const { all, project } = scopeOf(params);
     const mine = (projectId?: string) => all || (!!project && projectId === project.id);
     const needs = h('section', { className: 'needs' });
     needs.setAttribute('aria-label', 'Needs you');

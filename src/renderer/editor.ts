@@ -167,6 +167,7 @@ export function linkify(text: string, root: string): (Node | string)[] {
 
 registerPanel('editor', {
   title: 'Editor',
+  description: "Edit a file from the project or an employee's worktree.",
   create(el, params, panel) {
     el.classList.add('ed');
     let current: string | null = null;

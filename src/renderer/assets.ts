@@ -15,6 +15,7 @@ const box = (title: string, ...kids: (Node | string)[]) => h('section', { classN
 
 registerPanel('assets', {
   title: 'Asset studio',
+  description: 'Make images and video with Higgsfield.',
   create(el, params) {
     el.classList.add('studio');
     const projectId = typeof params.projectId === 'string' ? params.projectId : activeProject()?.id ?? '';

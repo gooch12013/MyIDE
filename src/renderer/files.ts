@@ -35,6 +35,7 @@ const changed = (n: Node): boolean => n.files.some(([, s]) => s) || [...n.dirs.v
 // main checkout or any employee worktree. Refreshes when files change on disk.
 registerPanel('files', {
   title: 'Files',
+  description: "The project's folders and files.",
   create(el, params, panel) {
     const project = activeProject();
     el.classList.add('files');

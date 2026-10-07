@@ -11,6 +11,7 @@ const api = window.myide;
 // (`git diff <base>...myide/<name>`), then merge it there or discard it.
 registerPanel('diff', {
   title: 'Review',
+  description: "An employee branch's changes, to merge or discard.",
   create(el, params, panel) {
     const project = activeProject();
     el.classList.add('review');

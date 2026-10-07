@@ -16,7 +16,8 @@ export interface Project { id: string; name: string; path: string; colour: strin
 export const PALETTE = ['#ff7eb6', '#3cd2da', '#b590ff', '#7fd96c', '#62a8ff', '#ff9b6b', '#e2df6a', '#c7a0ff', '#4fd1a5'];
 
 // config.json holds projects and preferences; every write keeps the keys it does not change.
-export type Config = { prefs?: Partial<Prefs>; projects?: Project[] };
+// homeClosed: when the Home tab was closed (Home is not a project: no folder, never removed).
+export type Config = { prefs?: Partial<Prefs>; projects?: Project[]; homeClosed?: number };
 export const readConfig = (): Config => readJSON<Config>('config.json', {});
 export const writeConfig = (c: Config): void => writeJSON('config.json', c);
 export const listProjects = (): Project[] => readConfig().projects ?? [];
@@ -92,13 +93,15 @@ export function registerProjectIpc(onChange: () => void): void {
     onChange();
   });
   // Closing a tab ends its terminals (the renderer has confirmed); its saved layout reopens them as fresh shells.
+  ipcMain.handle('projects:home-closed', () => readConfig().homeClosed ?? null);
   ipcMain.handle('projects:set-closed', (_e, id: string, closed: boolean) => {
-    if (!projectById(id)) throw new Error('No such project');
+    if (id !== 'home' && !projectById(id)) throw new Error('No such project');
     if (closed) {
       const panels = (loadLayouts().perProject[id] as { panels?: Record<string, { contentComponent?: string }> } | undefined)?.panels ?? {};
       for (const [panel, p] of Object.entries(panels)) if (p.contentComponent === 'terminal') killPty(panel);
     }
-    saveProjects(setClosed(listProjects(), id, !!closed));
+    if (id === 'home') writeConfig({ ...readConfig(), homeClosed: closed ? Date.now() : undefined });
+    else saveProjects(setClosed(listProjects(), id, !!closed));
     onChange();
   });
   ipcMain.handle('projects:remove', async (e, id: string) => {

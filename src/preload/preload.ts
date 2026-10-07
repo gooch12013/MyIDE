@@ -68,6 +68,8 @@ const api = {
     /** Tab order: every project id, closed ones included. */
     reorder: (ids: string[]): Promise<void> => ipcRenderer.invoke('projects:reorder', ids),
     setClosed: (id: string, closed: boolean): Promise<void> => ipcRenderer.invoke('projects:set-closed', id, closed),
+    /** When the Home tab was closed, or null while it is open. */
+    homeClosed: (): Promise<number | null> => ipcRenderer.invoke('projects:home-closed'),
     /** The project key's context menu; its picks come back as commands. */
     menu: (id: string): void => ipcRenderer.send('projects:menu', id),
   },

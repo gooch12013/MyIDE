@@ -41,6 +41,7 @@ type Section = (typeof SECTIONS)[number][0];
 
 registerPanel('preferences', {
   title: 'Preferences',
+  description: 'Settings for MyIDE, projects, AI accounts and forges.',
   create(el, params, panel) {
     el.classList.add('prefs');
     const nav = h('nav', { className: 'prefs-nav' });

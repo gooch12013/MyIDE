@@ -1,16 +1,17 @@
 import type { DockviewApi, SerializedDockview } from 'dockview-core';
 import type { Project } from '../main/projects';
-import { lastClosed, neighbour } from '../main/tabs';
+import { lastClosed, neighbour, openTabs } from '../main/tabs';
+import { HOME_ID } from './command';
 import { h } from './dom';
-import { activeProject, allProjects, loadProjects, openProjects, setActiveProject } from './projects';
+import { activeProject, activeTab, allProjects, allTabs, loadProjects, openProjects, setActiveProject } from './projects';
 import { openPanel, panelTypes, park } from './registry';
 
 const api = window.myide;
 let dock: DockviewApi;
 let perProject: Record<string, unknown> = {}; // mirror of layouts.json perProject, so a switch is synchronous
 
-const projectKey = (): string => activeProject()?.id ?? '';
-const cwd = (): string | undefined => activeProject()?.path;
+const projectKey = (): string => activeTab()?.id ?? '';
+const cwd = (): string | undefined => activeTab()?.path || undefined; // Home: the home folder
 
 // With "restore at launch" off the launch layout is the default one. It is not saved over the
 // project's own layout until the user opens or closes a panel or switches project.
@@ -23,14 +24,26 @@ function save(force = false): void {
   pristine = null;
   const layout = dock.toJSON();
   perProject[projectKey()] = layout;
-  api.layouts.putProject(activeProject()?.id ?? null, layout);
+  api.layouts.putProject(activeTab()?.id ?? null, layout);
 }
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 const EMPLOYEES_WIDTH = 340;
 
+/** Home's default: the console. NEEDS YOU across the top, project pages, usage and slots on the right, macros and the command line along the bottom. */
+function homePreset(): void {
+  const pages = openPanel('pages');
+  const usage = openPanel('usage', {}, { position: { referencePanel: pages.id, direction: 'right' }, initialWidth: 340 });
+  openPanel('slots', {}, { position: { referencePanel: usage.id, direction: 'below' } });
+  openPanel('needs', {}, { position: { direction: 'above' }, initialHeight: 170 });
+  const macros = openPanel('macros', {}, { position: { direction: 'below' }, initialHeight: 150 });
+  openPanel('cmdline', {}, { position: { referencePanel: macros.id, direction: 'right' } });
+  pages.api.setActive();
+}
+
 function preset(name: string): void {
   dock.clear();
-  if (!activeProject()) return;
+  if (!activeTab()) return;
+  if (name === 'default' && activeTab()!.id === HOME_ID) return homePreset();
   const term = openPanel('terminal', { cwd: cwd() });
   if (name === 'default') { // a project with no saved layout: the team beside its terminal
     openPanel('employees', {}, { position: { referencePanel: term.id, direction: 'left' }, initialWidth: EMPLOYEES_WIDTH });
@@ -104,12 +117,12 @@ const terminalIds = (layout: unknown): string[] =>
 
 /** Closes a project's tab: its layout is kept and its terminals end (after the running-process check);
  *  its employees keep working. Closing the shown tab shows its neighbour, or the empty state. */
-export async function closeProject(p = activeProject()): Promise<boolean> {
+export async function closeProject(p = activeTab()): Promise<boolean> {
   if (!p || p.closed) return false;
   const shown = p.id === projectKey();
   if (!(await (shown ? okToClose() : api.pty.confirmKill(terminalIds(perProject[p.id]))))) return false;
   if (shown) save(true);
-  const next = neighbour(allProjects(), p.id);
+  const next = neighbour(allTabs(), p.id);
   await api.projects.setClosed(p.id, true); // main ends the terminals in its saved layout
   await loadProjects();
   if (shown) switchTo(next, false);
@@ -119,10 +132,10 @@ export async function closeProject(p = activeProject()): Promise<boolean> {
 
 /** Reopens a closed tab (or shows an open one) with its saved layout. */
 export async function showProject(id?: string): Promise<void> {
-  const p = allProjects().find((x) => x.id === id);
+  const p = allTabs().find((x) => x.id === id);
   if (!p) return;
   if (p.closed) { await api.projects.setClosed(p.id, false); await loadProjects(); }
-  if (p.id !== projectKey()) switchTo(allProjects().find((x) => x.id === p.id)!);
+  if (p.id !== projectKey()) switchTo(allTabs().find((x) => x.id === p.id)!);
   else sync();
 }
 
@@ -182,7 +195,7 @@ export function showEmployeesAll(): void {
 let lastMenu = '';
 function sync(): void {
   const open = new Set(dock.panels.map((p) => p.api.component));
-  const state = { active: activeProject()?.id ?? null, panels: panelTypes().map((t) => ({ ...t, open: open.has(t.id) })) };
+  const state = { active: activeTab()?.id ?? null, panels: panelTypes().map((t) => ({ ...t, open: open.has(t.id) })) };
   const json = JSON.stringify(state);
   if (json !== lastMenu) { lastMenu = json; api.menuState(state); }
   const empty = !openProjects().length && !dock.panels.length;
@@ -193,7 +206,7 @@ function sync(): void {
 
 /** No tab open: closed projects are listed to open again. */
 function emptyState(): void {
-  const closed = allProjects().filter((p) => p.closed);
+  const closed = allTabs().filter((p) => p.closed);
   const list = document.getElementById('empty-closed')!;
   document.getElementById('empty-title')!.textContent = closed.length ? 'Open a project' : 'No projects yet';
   document.getElementById('empty-text')!.hidden = closed.length > 0;
@@ -208,17 +221,17 @@ function emptyState(): void {
 const commands: Record<string, (arg: string) => void> = {
   'add-project': () => void addProject(),
   'remove-project': (id) => void removeProject(allProjects().find((p) => p.id === id)),
-  'close-project': (id) => void closeProject(allProjects().find((p) => p.id === id)),
+  'close-project': (id) => void closeProject(allTabs().find((p) => p.id === id)),
   'close-others': (id) => void closeOthers(id),
-  'reopen-project': () => void showProject(lastClosed(allProjects())?.id),
+  'reopen-project': () => void showProject(lastClosed(allTabs())?.id),
   'project-settings': () => {
     if (window.dispatchEvent(new CustomEvent('myide:prefs-section', { detail: 'projects', cancelable: true }))) openPanel('preferences', { section: 'projects' });
   },
   'save-layout': () => void saveNamed(),
   'close-tab': () => void closeTab(),
   'open-preferences': () => showPanel('preferences'),
-  // ⌘1..9 (sent by main, 'project:3') follow the open tabs; the Projects menu sends an id.
-  project: (arg) => void showProject(/^[1-9]$/.test(arg) ? openProjects()[Number(arg) - 1]?.id : arg),
+  // ⌘1..9 (sent by main, 'project:3') follow the open project tabs (Home is ⌘0, 'project:home'); the Projects menu sends an id.
+  project: (arg) => void showProject(/^[1-9]$/.test(arg) ? openTabs(allProjects())[Number(arg) - 1]?.id : arg),
   preset: (name) => void okToClose().then((ok) => ok && preset(name)),
   layout: (name) => void restoreNamed(name),
   panel: showPanel,
@@ -229,10 +242,10 @@ const commands: Record<string, (arg: string) => void> = {
 /** Restores the last project and its layout, then keeps layouts saved as they change. */
 export async function startWorkspace(d: DockviewApi): Promise<void> {
   dock = d;
-  const [projects, file, { prefs }] = await Promise.all([loadProjects(), api.layouts.get(), api.prefs.get()]);
+  const [, file, { prefs }] = await Promise.all([loadProjects(), api.layouts.get(), api.prefs.get()]);
   perProject = file.perProject;
-  // With "restore at launch" off, start on the first project with the default layout.
-  const open = projects.filter((p) => !p.closed);
+  // With "restore at launch" off, start on the first tab (Home, while it is open) with the default layout.
+  const open = openProjects();
   const last = (prefs.restoreLast && open.find((p) => p.id === file.last?.project)) || open[0] || null;
   setActiveProject(last, { pick: (p) => { if (p.id !== projectKey()) switchTo(p); }, add: () => void addProject(), close: (p) => void closeProject(p) });
   document.getElementById('empty-add')!.onclick = () => void addProject();
@@ -245,6 +258,8 @@ export async function startWorkspace(d: DockviewApi): Promise<void> {
     sync();
   });
   addEventListener('beforeunload', () => save());
+  // A panel's scope changed: its params are part of the layout.
+  addEventListener('myide:layout-dirty', () => { pristine = null; clearTimeout(saveTimer); saveTimer = setTimeout(() => save(), 400); });
   api.onCommand((name) => {
     const i = name.indexOf(':');
     commands[i < 0 ? name : name.slice(0, i)]?.(i < 0 ? '' : name.slice(i + 1));

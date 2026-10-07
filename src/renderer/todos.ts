@@ -33,6 +33,7 @@ const diffView = (text: string) => h('pre', { className: 'td-diff' }, ...(text |
 
 registerPanel('todos', {
   title: 'To-dos',
+  description: 'Your personal list, and This Mac jobs that run on GO.',
   create(el) {
     el.classList.add('todos');
     const input = h('input', { className: 'input td-add-input', placeholder: 'Add a to-do', spellcheck: false, autocomplete: 'off' });

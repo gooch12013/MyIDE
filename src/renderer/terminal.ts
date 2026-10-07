@@ -41,6 +41,7 @@ async function paste(term: Terminal): Promise<void> {
 
 registerPanel('terminal', {
   title: 'Terminal',
+  description: "A shell in the tab's project folder (Home: your home folder).",
   create(el, params, api) {
     const id = api.id;
     const term = new Terminal({

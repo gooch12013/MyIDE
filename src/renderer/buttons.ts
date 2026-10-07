@@ -2,7 +2,8 @@
 import type { Button, PaletteItem, Schedule, Target } from '../main/buttons';
 import { describe, nextRun, WEEKDAYS } from '../main/schedules';
 import { errText, field, formSheet, h, key } from './dom';
-import { activeProject, allProjects } from './projects';
+import type { Project } from '../main/projects';
+import { activeProject, allProjects, scopeOf } from './projects';
 import { registerPanel } from './registry';
 import { micButton, speakButton } from './speech';
 
@@ -20,8 +21,7 @@ const sure = (label: string, act: () => void) => {
 };
 const when = (ms?: number) => (ms ? new Date(ms).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : '—');
 
-async function buttonForm(b: Partial<Button>, palette: PaletteItem[], onSaved: () => void): Promise<void> {
-  const project = activeProject();
+export async function buttonForm(b: Partial<Button>, palette: PaletteItem[], onSaved: () => void, project = activeProject()): Promise<void> {
   const label = h('input', { className: 'input', required: true, value: b.label ?? '', placeholder: 'Code review' });
   const command = h('input', { className: 'input mono', required: true, value: b.command ?? '', placeholder: '/code-review high' });
   const list = h('datalist', { id: 'btn-palette' }, ...palette.map((p) => new Option(p.description.slice(0, 80), `/${p.name}`)));
@@ -106,11 +106,25 @@ function askInput(b: Pick<Button, 'label' | 'input'>): Promise<string | null> {
   });
 }
 
+/** Runs a button (or an installed command) in `project`, asking for its input first; resolves to what to tell David. */
+export async function runButton(b: Pick<Button, 'command' | 'target' | 'label' | 'input'>, project: Project | null, employeeId?: string): Promise<string> {
+  if (!project) return 'Pick a project in the scope menu first.';
+  const input = b.input ? await askInput(b) : undefined;
+  if (input === null) return '';
+  try {
+    const id = await api.buttons.run(b, project.id, { employeeId, input });
+    const e = (await api.employees.list(project.id)).find((x) => x.id === id);
+    return `${b.command} sent to ${e?.name ?? 'the employee'}.`;
+  } catch (err) { return errText(err); }
+}
+
 registerPanel('buttons', {
   title: 'Buttons',
-  create(el) {
+  description: 'Saved buttons, installed commands and skills, and schedules.',
+  scoped: true,
+  create(el, params) {
     el.classList.add('btns');
-    const project = activeProject();
+    const { project } = scopeOf(params); // all projects: the global buttons only
     const runOn = h('select', { className: 'input select' }, new Option('Project lead', ''));
     runOn.setAttribute('aria-label', 'Selected employee');
     runOn.title = 'Who runs installed commands, and buttons set to "selected employee"';
@@ -128,7 +142,7 @@ registerPanel('buttons', {
     const rows = h('div', { className: 'sched-rows' });
     el.append(
       h('div', { className: 'emps-bar' }, h('label', { className: 'org-ceiling-field' }, h('span', { className: 'legend', textContent: 'Run on' }), runOn), editKey,
-        key('New button', () => void buttonForm({}, pal, () => void load()))),
+        key('New button', () => void buttonForm({}, pal, () => void load(), project))),
       status, grid,
       h('details', { className: 'btn-inst' }, instTitle, filter, installed),
       h('section', { className: 'sched' },
@@ -141,21 +155,15 @@ registerPanel('buttons', {
     let pal: PaletteItem[] = [];
     const say = (text: string) => { status.textContent = text; };
 
-    async function run(b: Pick<Button, 'command' | 'target' | 'label' | 'input'>): Promise<void> {
-      if (!project) return say('Open a project first.');
-      const input = b.input ? await askInput(b) : undefined;
-      if (input === null) return;
-      try {
-        const id = await api.buttons.run(b, project.id, { employeeId: runOn.value || undefined, input });
-        const e = (await api.employees.list(project.id)).find((x) => x.id === id);
-        say(`${b.command} sent to ${e?.name ?? 'the employee'}.`);
-      } catch (err) { say(errText(err)); }
-    }
+    const run = async (b: Pick<Button, 'command' | 'target' | 'label' | 'input'>) => {
+      const t = await runButton(b, project, runOn.value || undefined);
+      if (t) say(t);
+    };
 
     function draw(): void {
       grid.replaceChildren(...buttons.map((b) => {
         const k = h('button', { type: 'button', className: 'key btn-key', title: `${b.command} · ${targetText(b.target)}${b.scope === 'project' ? ' · this project' : ''}`,
-          onclick: () => (editing ? void buttonForm(b, pal, () => void load()) : void run(b)) },
+          onclick: () => (editing ? void buttonForm(b, pal, () => void load(), project) : void run(b)) },
         h('span', { className: 'btn-label', textContent: b.label }), h('span', { className: 'btn-sub', textContent: `${b.command} · ${targetText(b.target)}` }));
         if (b.scope === 'project' && project) k.style.setProperty('--proj', project.colour);
         return k;
@@ -167,7 +175,7 @@ registerPanel('buttons', {
       installed.replaceChildren(...shown.map((p) => h('div', { className: 'inst-row' },
         key(`/${p.name}`, () => void run({ command: `/${p.name}`, target: runOn.value ? 'selected' : 'lead', label: p.name }), { title: `Run on ${runOn.selectedOptions[0]?.text ?? 'the lead'}` }),
         h('span', { className: 'inst-desc', textContent: p.description, title: `${p.source}: ${p.description}` }),
-        key('+', () => void buttonForm({ label: p.name, command: `/${p.name}` }, pal, () => void load()), { title: 'Save as a button' }))));
+        key('+', () => void buttonForm({ label: p.name, command: `/${p.name}` }, pal, () => void load(), project), { title: 'Save as a button' }))));
     }
     filter.oninput = draw;
 
