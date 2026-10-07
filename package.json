@@ -1,0 +1,28 @@
+{
+  "name": "myide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A desktop app for running a team of AI coding agents across several projects at once.",
+  "author": "David Gooch",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/build.mjs && electron .",
+    "typecheck": "tsc --noEmit",
+    "postinstall": "electron-rebuild -f -w node-pty && chmod +x node_modules/node-pty/prebuilds/*/spawn-helper && (chmod +x node_modules/node-pty/build/Release/spawn-helper 2>/dev/null || true)"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/addon-webgl": "^0.19.0",
+    "@xterm/xterm": "^6.0.0",
+    "dockview-core": "^8.4.1",
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.2.1",
+    "electron": "^44.6.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

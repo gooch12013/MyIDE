@@ -1,0 +1,192 @@
+/* MyIDE console look: tokens from the design system, base, top bar, keys, dock theme. */
+
+:root {
+  color-scheme: dark;
+
+  /* chassis and wells */
+  --chassis: #111317;
+  --chassis-face: #171a1f;
+  --chassis-edge: #262a31;
+  --well: #08090b;
+  --well-row: #0e1014;
+  --line: #1e2228;
+  --line-strong: #2d323b;
+
+  /* ink */
+  --ink: #e7e9ec;
+  --ink-2: #aeb6c0;
+  --ink-3: #848d98;
+  --ink-off: #565e68;
+
+  /* LCD scribble strip */
+  --lcd-bg: #0c1820;
+  --lcd-ink: #d3edfd;
+  --lcd-dim: #86a9bd;
+
+  /* rubber keys */
+  --key-top: #2c3139;
+  --key-bot: #1d2026;
+  --key-edge: #0b0c0e;
+  --key-legend: #e1e5ea;
+
+  /* console accent: amber backlight, used for current cue, primary action, selection */
+  --accent: #ffb21a;
+  --accent-ink: #1c1300;
+  --accent-dim: #6b4b0c;
+
+  /* LED states (always paired with shape + text) */
+  --st-working: #3ddc84;
+  --st-queued: #62a8ff;
+  --st-idle: #6a727d;
+  --st-needs: #ffc21a;
+  --st-blocked: #ff6a2b;
+  --st-failed: #ff4d61;
+  --st-done: #3cd2da;
+
+  /* meter zones */
+  --zone-ok: #3ddc84;
+  --zone-warn: #ffb21a;
+  --zone-hot: #ff4d61;
+  --seg-off: #1b1f25;
+
+  /* executor page colours (per project) */
+  --proj-tidepool: #ff7eb6;
+  --proj-ledger: #3cd2da;
+  --proj-tars: #b590ff;
+  --proj-relay: #7fd96c;
+
+  /* type */
+  --font-ui: "Barlow Semi Condensed", "Arial Narrow", sans-serif;
+  --font-legend: "Barlow Condensed", "Arial Narrow", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --fs-2xs: 0.6875rem;
+  --fs-xs: 0.75rem;
+  --fs-sm: 0.8125rem;
+  --fs-md: 0.875rem;
+  --fs-lg: 1rem;
+  --fs-xl: 1.125rem;
+  --fs-2xl: 1.375rem;
+
+  /* spacing */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 24px;
+  --sp-8: 32px;
+
+  /* radii */
+  --r-chip: 3px;
+  --r-well: 4px;
+  --r-key: 5px;
+  --r-panel: 7px;
+
+  /* motion */
+  --t-fast: 140ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --topbar-h: 44px;
+}
+
+/* ---------- base ---------- */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; }
+body {
+  display: flex; flex-direction: column;
+  background-color: var(--chassis);
+  background-image: repeating-linear-gradient(90deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px);
+  color: var(--ink);
+  font: 400 var(--fs-md)/1.35 var(--font-ui);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  caret-color: var(--accent);
+}
+::selection { background: var(--accent); color: var(--accent-ink); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button, input, select, textarea { font: inherit; color: inherit; }
+p { margin: 0; }
+* { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+.legend { font-family: var(--font-legend); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; font-size: var(--fs-xs); color: var(--ink-2); }
+kbd { font: 600 var(--fs-xs)/1 var(--font-legend); padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: var(--r-chip); color: var(--ink-2); }
+
+/* ---------- top bar (macOS traffic lights sit at its left) ---------- */
+.topbar {
+  flex: none;
+  height: var(--topbar-h);
+  display: flex; align-items: center; gap: var(--sp-6);
+  padding: 0 var(--sp-5) 0 80px;
+  background: linear-gradient(#1a1d22, #131519);
+  border-bottom: 1px solid #000;
+  box-shadow: 0 1px 0 rgba(255,255,255,0.04);
+  -webkit-app-region: drag;
+  user-select: none;
+}
+.topbar button, .topbar a { -webkit-app-region: no-drag; }
+.brand { font: 700 var(--fs-xl)/1 var(--font-legend); letter-spacing: 0.04em; text-transform: uppercase; white-space: nowrap; }
+.brand b { color: var(--accent); font-weight: 700; }
+.topnav { display: flex; gap: var(--sp-1); min-width: 0; overflow-x: auto; flex: 1; scrollbar-width: none; }
+
+/* ---------- rubber keys ---------- */
+.key {
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-3);
+  min-height: 32px; padding: 6px 12px;
+  border: 1px solid var(--key-edge); border-radius: var(--r-key);
+  background: linear-gradient(var(--key-top), var(--key-bot));
+  box-shadow: 0 2px 3px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.09);
+  color: var(--key-legend);
+  font: 600 var(--fs-sm)/1.1 var(--font-legend); letter-spacing: 0.05em; text-transform: uppercase;
+  cursor: pointer;
+  transition: transform var(--t-fast) var(--ease-out), box-shadow var(--t-fast) var(--ease-out);
+}
+.key:hover { filter: brightness(1.15); }
+.key:active { transform: translateY(1px); box-shadow: 0 1px 1px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.05); }
+.key--sm { min-height: 22px; padding: 2px 8px; font-size: var(--fs-2xs); letter-spacing: 0.08em; }
+
+/* ---------- dock: dockview themed as raised panels holding recessed wells ---------- */
+#dock { flex: 1; min-height: 0; padding: var(--sp-2); }
+#dock .dockview-theme-dark, .dockview-theme-dark {
+  --dv-group-view-background-color: var(--well);
+  --dv-tabs-and-actions-container-background-color: var(--chassis-face);
+  --dv-tabs-and-actions-container-height: 30px;
+  --dv-tabs-and-actions-container-font-size: var(--fs-sm);
+  --dv-activegroup-visiblepanel-tab-background-color: var(--well);
+  --dv-activegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-inactivegroup-visiblepanel-tab-background-color: var(--well);
+  --dv-inactivegroup-hiddenpanel-tab-background-color: transparent;
+  --dv-activegroup-visiblepanel-tab-color: var(--ink);
+  --dv-activegroup-hiddenpanel-tab-color: var(--ink-3);
+  --dv-inactivegroup-visiblepanel-tab-color: var(--ink-2);
+  --dv-inactivegroup-hiddenpanel-tab-color: var(--ink-off);
+  --dv-tab-divider-color: transparent;
+  --dv-separator-border: var(--chassis-edge);
+  --dv-active-sash-color: var(--accent-dim);
+  --dv-drag-over-background-color: rgba(255,178,26,0.12);
+  --dv-drag-over-border-color: var(--accent);
+  --dv-border-radius: var(--r-panel);
+  --dv-tab-border-radius: var(--r-chip) var(--r-chip) 0 0;
+  --dv-icon-hover-background-color: rgba(255,255,255,0.06);
+  --dv-floating-box-shadow: 0 10px 28px rgba(0,0,0,0.7);
+  background: transparent;
+  font-family: var(--font-ui);
+}
+.dv-groupview {
+  border: 1px solid var(--chassis-edge);
+  box-shadow: 0 2px 6px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05);
+}
+.dv-tabs-and-actions-container { padding: var(--sp-1) var(--sp-1) 0; }
+.dv-tab {
+  font: 600 var(--fs-sm)/1 var(--font-legend);
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.dv-active-tab { box-shadow: inset 0 2px 0 var(--accent); }
+.dv-groupview:not(.dv-active-group) .dv-active-tab { box-shadow: inset 0 2px 0 var(--line-strong); }
+.group-actions { display: flex; align-items: center; height: 100%; padding: 0 var(--sp-2); }
+.panel-body { width: 100%; height: 100%; overflow: hidden; background: var(--well); box-shadow: inset 0 2px 6px rgba(0,0,0,0.7); }
+.panel-body .xterm { height: 100%; padding: var(--sp-2) 0 0 var(--sp-3); }
+.watermark { display: grid; place-content: center; gap: var(--sp-3); height: 100%; text-align: center; color: var(--ink-3); font-size: var(--fs-sm); }
+
+/* pop-out windows carry no top bar */
+body:not(:has(.topbar)) { background: var(--chassis); }
+body:not(:has(.topbar)) > * { padding: var(--sp-2); }

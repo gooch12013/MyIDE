@@ -11,3 +11,10 @@ mockups/
 reports/
 research_notes/
 .impeccable/
+
+# Phase 0 throwaway experiments
+spikes/
+
+# Build output
+dist/
+out/
