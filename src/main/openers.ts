@@ -16,7 +16,7 @@ const found = (name: string): Promise<boolean> => {
 };
 const installed: Promise<string[]> = Promise.all(Object.keys(APPS).map(async (n) => ((await found(n)) ? n : ''))).then((a) => a.filter(Boolean));
 
-const isDir = (p: unknown): p is string => {
+export const isDir = (p: unknown): p is string => {
   try {
     return typeof p === 'string' && isAbsolute(p) && statSync(p).isDirectory();
   } catch {

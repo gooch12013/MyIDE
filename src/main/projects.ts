@@ -1,8 +1,10 @@
 import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { randomUUID } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
 import { dropProjectLayout } from './layouts';
+import type { Prefs } from './prefs';
 import { readJSON, writeJSON } from './store';
 
 export interface Project { id: string; name: string; path: string; colour: string }
@@ -10,11 +12,12 @@ export interface Project { id: string; name: string; path: string; colour: strin
 // Page colours handed out in order to new projects; amber is the live colour, so it is never one.
 export const PALETTE = ['#ff7eb6', '#3cd2da', '#b590ff', '#7fd96c', '#62a8ff', '#ff9b6b', '#e2df6a', '#c7a0ff', '#4fd1a5'];
 
-// config.json is shared with other settings, so every write keeps the keys it does not own.
-export const listProjects = (): Project[] => readJSON<{ projects?: Project[] }>('config.json', {}).projects ?? [];
-function saveProjects(projects: Project[]): void {
-  writeJSON('config.json', { ...readJSON<object>('config.json', {}), projects });
-}
+// config.json holds projects and preferences; every write keeps the keys it does not change.
+export type Config = { prefs?: Partial<Prefs>; projects?: Project[] };
+export const readConfig = (): Config => readJSON<Config>('config.json', {});
+export const writeConfig = (c: Config): void => writeJSON('config.json', c);
+export const listProjects = (): Project[] => readConfig().projects ?? [];
+const saveProjects = (projects: Project[]): void => writeConfig({ ...readConfig(), projects });
 
 // Only paths inside a registered project are listed or opened. ponytail: symlinks are not resolved,
 // so a link inside a project can point out of it; realpath both sides if that matters.
@@ -25,6 +28,12 @@ function inProject(path: unknown): path is string {
 }
 
 const SKIP = new Set(['.git', 'node_modules', 'dist', 'out']);
+// Opening these would run them, so the files panel only shows them in Finder.
+const RUNNABLE = /\.(app|command|terminal|sh|tool|pkg)$/i;
+const runnable = (path: string): boolean => {
+  if (RUNNABLE.test(path)) return true;
+  try { const st = statSync(path); return st.isFile() && (st.mode & 0o111) !== 0; } catch { return false; }
+};
 
 export function registerProjectIpc(onChange: () => void): void {
   ipcMain.handle('projects:list', () => listProjects());
@@ -52,7 +61,25 @@ export function registerProjectIpc(onChange: () => void): void {
       .sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
   });
   // Resolves to '' on success or the OS error text.
-  ipcMain.handle('files:open', (_e, path: unknown) => (inProject(path) ? shell.openPath(path) : 'Not inside a project'));
+  ipcMain.handle('files:open', (_e, path: unknown) => {
+    if (!inProject(path)) return 'Not inside a project';
+    if (!runnable(path)) return shell.openPath(path);
+    shell.showItemInFolder(path);
+    return '';
+  });
+  ipcMain.handle('projects:update', (_e, id: string, patch: { name?: unknown; colour?: unknown }) => {
+    const projects = listProjects();
+    const p = projects.find((x) => x.id === id);
+    if (!p) throw new Error('No such project');
+    if (typeof patch.name === 'string' && patch.name.trim()) p.name = patch.name.trim().slice(0, 60);
+    if (typeof patch.colour === 'string' && /^#[0-9a-f]{6}$/i.test(patch.colour)) p.colour = patch.colour.toLowerCase();
+    saveProjects(projects);
+    onChange();
+  });
+  ipcMain.handle('projects:reveal', (_e, id: string) => {
+    const p = listProjects().find((x) => x.id === id);
+    if (p) shell.showItemInFolder(p.path);
+  });
   ipcMain.handle('projects:remove', async (e, id: string) => {
     const project = listProjects().find((p) => p.id === id);
     if (!project) return false;

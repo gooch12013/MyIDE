@@ -1,9 +1,9 @@
-import { app, ipcMain, Menu, shell, type MenuItemConstructorOptions } from 'electron';
+import { app, BrowserWindow, ipcMain, Menu, shell, type MenuItemConstructorOptions } from 'electron';
 import { deleteNamedLayout, namedLayouts } from './layouts';
 import { listProjects } from './projects';
 
 /** What the renderer reports for the menu: the active project and which panel types are open. */
-interface MenuState { active: string | null; panels: { id: string; title: string; open: boolean }[] }
+export interface MenuState { active: string | null; panels: { id: string; title: string; open: boolean }[] }
 
 let state: MenuState = { active: null, panels: [] };
 let send: (command: string) => void = () => {};
@@ -58,7 +58,7 @@ export function buildMenu(): void {
             {
               label: 'Delete Layout',
               enabled: named.length > 0,
-              submenu: named.map((n) => ({ label: n, click: () => void deleteNamedLayout(n, buildMenu) })),
+              submenu: named.map((n) => ({ label: n, click: (_i, w) => void deleteNamedLayout(n, buildMenu, w as BrowserWindow | undefined) })),
             },
           ],
         },

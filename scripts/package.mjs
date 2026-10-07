@@ -1,5 +1,6 @@
 // Builds, packages and ad-hoc signs MyIDE for Apple silicon. Output: out/MyIDE-darwin-arm64/MyIDE.app
 // Usage: node scripts/package.mjs   (no notarization; Gatekeeper treats it as a locally built app)
+import { flipFuses, FuseV1Options, FuseVersion } from '@electron/fuses';
 import { packager } from '@electron/packager';
 import { execFileSync } from 'node:child_process';
 
@@ -9,7 +10,6 @@ const ELECTRON = 'node_modules/electron/dist';
 
 run('node', 'scripts/build.mjs');
 run('node', 'scripts/notices.mjs', NOTICES); // fails the package on a disallowed licence
-run('sh', '-c', 'chmod +x node_modules/node-pty/prebuilds/*/spawn-helper'); // node-pty 1.1.0 ships it non-executable
 
 const [dir] = await packager({
   dir: '.',
@@ -29,6 +29,14 @@ const [dir] = await packager({
     /^\/node_modules\/node-pty\/(deps|third_party|prebuilds\/(?!darwin-arm64))/.test(p),
 });
 const app = `${dir}/MyIDE.app`;
+
+// The shipped binary can't be turned into a plain Node or debugged through env vars and CLI flags.
+await flipFuses(app, {
+  version: FuseVersion.V1,
+  [FuseV1Options.RunAsNode]: false,
+  [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: false,
+  [FuseV1Options.EnableNodeCliInspectArguments]: false,
+});
 
 // --deep does not reach loose binaries under Resources, so sign node-pty's first, then the bundle.
 run('sh', '-c', `find "${app}/Contents/Resources/app/node_modules/node-pty" \\( -name '*.node' -o -name spawn-helper \\) -type f -exec codesign --force --sign - --options runtime {} \\;`);

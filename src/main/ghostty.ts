@@ -2,6 +2,7 @@ import { ipcMain } from 'electron';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { getPrefs } from './prefs';
 
 export interface TerminalSettings {
   fontFamily: string;
@@ -63,6 +64,10 @@ function load(): TerminalSettings {
   }
 }
 
-// Read once at launch; the preload fetches it synchronously so terminals can be built straight away.
+// Ghostty's config is read once at launch; Preferences can override its font. Fetched synchronously
+// so terminals can be built straight away, and again when Preferences change.
 const settings = load();
-ipcMain.on('terminal:settings', (e) => { e.returnValue = settings; });
+ipcMain.on('terminal:settings', (e) => {
+  const p = getPrefs();
+  e.returnValue = { ...settings, ...(p.terminalFontFamily && { fontFamily: p.terminalFontFamily }), ...(p.terminalFontSize && { fontSize: p.terminalFontSize }) };
+});

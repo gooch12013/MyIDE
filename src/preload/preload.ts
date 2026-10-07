@@ -1,7 +1,8 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron';
 import type { TerminalSettings } from '../main/ghostty';
 import type { TerminalMenuAction } from '../main/openers';
-import type { PtyInfo } from '../main/pty';
+import type { PtyInfo, PtySpawnOptions } from '../main/pty';
+import type { MenuState } from '../main/menu';
 import type { LayoutsFile } from '../main/layouts';
 import type { Project } from '../main/projects';
 import type { Prefs } from '../main/prefs';
@@ -16,10 +17,12 @@ function on<A extends unknown[]>(channel: string, cb: (...args: A) => void): () 
 const api = {
   pty: {
     /** Starts the user's login shell for panel `id`, or reattaches if that id already has one. */
-    spawn: (id: string, opts: { cwd?: string; cols: number; rows: number }): Promise<PtyInfo> => ipcRenderer.invoke('pty:spawn', id, opts),
+    spawn: (id: string, opts: PtySpawnOptions): Promise<PtyInfo> => ipcRenderer.invoke('pty:spawn', id, opts),
     write: (id: string, data: string): void => ipcRenderer.send('pty:write', id, data),
     resize: (id: string, cols: number, rows: number): void => ipcRenderer.send('pty:resize', id, cols, rows),
     kill: (id: string): void => ipcRenderer.send('pty:kill', id),
+    /** Resolves true if none of these terminals runs a program other than the shell, or the user agrees to end it. */
+    confirmKill: (ids: string[]): Promise<boolean> => ipcRenderer.invoke('pty:confirm-kill', ids),
     onData: (cb: (id: string, data: string) => void) => on('pty:data', cb),
     onExit: (cb: (id: string, exitCode: number) => void) => on('pty:exit', cb),
     /** The shell's cwd or foreground process changed. */
@@ -27,8 +30,8 @@ const api = {
   },
   // Terminal: Ghostty-derived settings, clipboard, context menu and "Open in".
   terminal: {
-    // Preferences can override Ghostty's font; read once per window load.
-    settings: { ...ipcRenderer.sendSync('terminal:settings'), ...ipcRenderer.sendSync('prefs:terminal') } as TerminalSettings,
+    /** Ghostty's settings with the Preferences font overrides. */
+    settings: (): TerminalSettings => ipcRenderer.sendSync('terminal:settings'),
     menu: (hasSelection: boolean, cwd: string): Promise<TerminalMenuAction> => ipcRenderer.invoke('terminal:menu', hasSelection, cwd),
     copy: (text: string): void => ipcRenderer.send('clipboard:write', text),
     paste: (): Promise<string> => ipcRenderer.invoke('clipboard:read'),
@@ -69,7 +72,7 @@ const api = {
     /** Resolves to null (cancelled) or an error message; on success the app restarts. */
     importSettings: (): Promise<string | null> => ipcRenderer.invoke('settings:import'),
   },
-  menuState: (state: { active: string | null; panels: { id: string; title: string; open: boolean }[] }): void => ipcRenderer.send('menu:state', state),
+  menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */
   onCommand: (cb: (name: string) => void) => on('command', cb),
 };

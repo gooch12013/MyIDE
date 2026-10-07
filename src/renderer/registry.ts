@@ -2,6 +2,7 @@ import {
   createDockview, themeDark,
   type AddPanelPositionOptions, type DockviewApi, type DockviewGroupPanel, type DockviewPanelApi, type IContentRenderer, type IHeaderActionsRenderer, type IWatermarkRenderer,
 } from 'dockview-core';
+import { key } from './dom';
 
 export interface PanelInstance {
   dispose?(): void;
@@ -55,14 +56,6 @@ function createComponent({ name }: { name: string }): IContentRenderer {
     onShow: () => instance.onShow?.(),
     dispose: () => instance.dispose?.(),
   };
-}
-
-function key(label: string): HTMLButtonElement {
-  const b = document.createElement('button');
-  b.type = 'button';
-  b.className = 'key key--sm';
-  b.textContent = label;
-  return b;
 }
 
 // Each group gets a pop-out key; inside a pop-out window it docks the group back into the main window.

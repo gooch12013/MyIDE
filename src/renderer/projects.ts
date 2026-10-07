@@ -1,12 +1,15 @@
 import type { Project } from '../main/projects';
+import { h } from './dom';
 
 let projects: Project[] = [];
 let active: Project | null = null;
 
 export const allProjects = (): Project[] => projects;
 export const activeProject = (): Project | null => active;
+/** Reloads the project list; the active project is looked up again (null if it was removed) and the keys redrawn. */
 export async function loadProjects(): Promise<Project[]> {
   projects = await window.myide.projects.list();
+  setActiveProject(projects.find((p) => p.id === active?.id) ?? null);
   return projects;
 }
 
@@ -18,30 +21,18 @@ export function setActiveProject(p: Project | null, on = handlers): void {
   active = p;
   handlers = on;
   nav.replaceChildren(...projects.map((proj, i) => {
-    const b = document.createElement('button');
-    b.type = 'button';
-    b.className = 'key proj-key';
+    const b = h('button', { type: 'button', className: 'key proj-key', title: proj.path, onclick: () => handlers.pick(proj) },
+      h('span', { className: 'proj-name', textContent: proj.name }));
     b.style.setProperty('--proj', proj.colour);
-    b.title = proj.path;
     b.setAttribute('aria-current', String(proj.id === p?.id));
-    const name = document.createElement('span');
-    name.className = 'proj-name';
-    name.textContent = proj.name;
-    b.append(name);
     if (i < 9) {
       b.setAttribute('aria-keyshortcuts', `Meta+${i + 1}`);
-      const k = document.createElement('kbd');
-      k.textContent = `⌘${i + 1}`;
-      b.append(k);
+      b.append(h('kbd', { textContent: `⌘${i + 1}` }));
     }
-    b.onclick = () => handlers.pick(proj);
     return b;
   }));
-  const add = document.createElement('button');
-  add.type = 'button';
-  add.className = 'key key--new';
-  add.textContent = projects.length ? '+ Project' : 'Add a project';
-  add.title = 'Add a project folder';
-  add.onclick = () => handlers.add();
-  nav.append(add);
+  nav.append(h('button', {
+    type: 'button', className: 'key key--new', textContent: projects.length ? '+ Project' : 'Add a project',
+    title: 'Add a project folder', onclick: () => handlers.add(),
+  }));
 }

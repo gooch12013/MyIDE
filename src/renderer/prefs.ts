@@ -1,18 +1,13 @@
 import type { Prefs } from '../main/prefs';
+import { h, key } from './dom';
 import { removeProject, resetLayout } from './layouts';
-import { activeProject, allProjects, loadProjects, setActiveProject } from './projects';
+import { activeProject, allProjects, loadProjects } from './projects';
 import { registerPanel } from './registry';
+import { reloadTerminalSettings } from './terminal';
 
 const api = window.myide;
 type Info = Awaited<ReturnType<typeof api.prefs.get>>;
 
-function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<HTMLElementTagNameMap[K]> = {}, ...kids: (Node | string)[]): HTMLElementTagNameMap[K] {
-  const el = Object.assign(document.createElement(tag), props);
-  el.append(...kids);
-  return el;
-}
-const key = (label: string, onclick: () => void, extra: Partial<HTMLButtonElement> = {}) =>
-  h('button', { type: 'button', className: 'key key--sm', textContent: label, onclick, ...extra });
 const field = (props: Partial<HTMLInputElement>) => h('input', { className: 'input', ...props });
 function pref(name: string, hint: string, ...ctl: Node[]): HTMLElement {
   return h('div', { className: 'pref' },
@@ -35,12 +30,6 @@ function colourWarning(colour: string, id: string): string {
   const twin = allProjects().find((p) => p.id !== id && dist(p.colour, colour) < 40);
   if (!twin) return '';
   return twin.colour.toLowerCase() === colour.toLowerCase() ? `Same colour as ${twin.name}.` : `Hard to tell apart from ${twin.name}.`;
-}
-
-/** Reloads projects so the top-bar keys show new names and colours. */
-async function refreshKeys(): Promise<void> {
-  await loadProjects();
-  setActiveProject(allProjects().find((p) => p.id === activeProject()?.id) ?? null);
 }
 
 const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['advanced', 'Advanced']] as const;
@@ -70,7 +59,10 @@ registerPanel('preferences', {
       main.replaceChildren(h('section', { className: 'psec' }, h('h2', { className: 'psec-title', textContent: title }), ...body, status));
     }
 
-    const set = (patch: Partial<Prefs>) => api.prefs.set(patch);
+    const set = async (patch: Partial<Prefs>) => {
+      await api.prefs.set(patch);
+      if ('terminalFontFamily' in patch || 'terminalFontSize' in patch) reloadTerminalSettings();
+    };
 
     const build: Record<Section, (info: Info, say: (t: string) => void) => Promise<Node[]> | Node[]> = {
       appearance({ prefs }) {
@@ -88,8 +80,8 @@ registerPanel('preferences', {
         tsize.onchange = () => void set({ terminalFontSize: Math.min(32, Math.max(0, Number(tsize.value) || 0)) });
         return [
           pref('UI font size', 'Body text size. Every label and key scales with it, pop-out windows included.', size, out, reset),
-          pref('Terminal font', 'A CSS font list, e.g. "Iosevka", monospace. Empty uses your Ghostty config. Applies after View > Reload or a restart.', family),
-          pref('Terminal font size', 'Empty uses your Ghostty config. Applies after View > Reload or a restart.', tsize, h('span', { className: 'pref-unit', textContent: 'px' })),
+          pref('Terminal font', 'A CSS font list, e.g. "Iosevka", monospace. Empty uses your Ghostty config.', family),
+          pref('Terminal font size', 'Empty uses your Ghostty config.', tsize, h('span', { className: 'pref-unit', textContent: 'px' })),
           pref('Reduce motion', 'Turns off transitions and animations in every window.', toggle('Reduce motion', prefs.reduceMotion, (on) => void set({ reduceMotion: on }))),
         ];
       },
@@ -103,7 +95,7 @@ registerPanel('preferences', {
           name.onchange = async () => {
             if (!name.value.trim()) { name.value = p.name; return; }
             await api.prefs.updateProject(p.id, { name: name.value });
-            await refreshKeys();
+            await loadProjects();
           };
           const warn = h('p', { className: 'pref-warn' });
           const pick = async (colour: string) => {
@@ -111,7 +103,7 @@ registerPanel('preferences', {
             custom.value = colour;
             warn.textContent = colourWarning(colour, p.id);
             await api.prefs.updateProject(p.id, { colour });
-            await refreshKeys();
+            await loadProjects();
             swatches.forEach((s) => s.setAttribute('aria-pressed', String(s.dataset.c === colour)));
           };
           const swatches = palette.map((c) => {
@@ -136,7 +128,7 @@ registerPanel('preferences', {
           return row;
         });
         const add = key('+ Add project', async () => {
-          try { if (await api.projects.add()) { await refreshKeys(); void show(); } } catch (e) { say(errText(e)); }
+          try { if (await api.projects.add()) { await loadProjects(); void show(); } } catch (e) { say(errText(e)); }
         });
         return [
           h('p', { className: 'psec-lede', textContent: 'Each project is a folder with its own terminals and layout. Its colour marks its key in the top bar.' }),

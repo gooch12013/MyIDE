@@ -10,8 +10,15 @@ let perProject: Record<string, unknown> = {}; // mirror of layouts.json perProje
 const projectKey = (): string => activeProject()?.id ?? '';
 const cwd = (): string | undefined => activeProject()?.path;
 
-function save(): void {
+// With "restore at launch" off the launch layout is the default one. It is not saved over the
+// project's own layout until the user opens or closes a panel or switches project.
+let pristine: string | null = null;
+const panelIds = (): string => dock.panels.map((p) => p.id).sort().join();
+
+function save(force = false): void {
   clearTimeout(saveTimer);
+  if (!force && pristine === panelIds()) return;
+  pristine = null;
   const layout = dock.toJSON();
   perProject[projectKey()] = layout;
   api.layouts.putProject(activeProject()?.id ?? null, layout);
@@ -49,7 +56,7 @@ function restore(layout: unknown): void {
 
 /** Saves the current project's layout and shows `p` with its own layout (default: one terminal). */
 function switchTo(p: Project | null, keepOld = true): void {
-  if (keepOld) save();
+  if (keepOld) save(true);
   setActiveProject(p);
   // Parking keeps the old project's shells running for when it comes back.
   const show = () => restore(perProject[p?.id ?? '']);
@@ -61,16 +68,18 @@ async function addProject(): Promise<void> {
   const p = await api.projects.add();
   if (!p) return;
   await loadProjects();
-  if (p.id === projectKey()) setActiveProject(p); else switchTo(p);
+  if (p.id !== projectKey()) switchTo(p);
 }
 
 /** Removes a project after confirmation; removing the active one switches to the first left. */
 export async function removeProject(p = activeProject()): Promise<void> {
-  if (!p || !(await api.projects.remove(p.id))) return;
+  if (!p) return;
+  const wasActive = p.id === projectKey();
+  if (!(await api.projects.remove(p.id))) return; // main also ends a parked project's shells
   delete perProject[p.id];
   const rest = await loadProjects();
-  if (p.id !== projectKey()) { setActiveProject(rest.find((x) => x.id === projectKey()) ?? null); sync(); return; }
-  switchTo(rest[0] ?? null, false); // ends the removed project's shells
+  if (wasActive) switchTo(rest[0] ?? null, false); // ends the removed project's shells
+  else sync();
 }
 
 /** Forgets a project's saved layout; the active project goes back to one terminal now. */
@@ -91,7 +100,18 @@ async function saveNamed(): Promise<void> {
 
 async function restoreNamed(name: string): Promise<void> {
   const layout = (await api.layouts.get()).named[name];
-  if (layout) restore(fresh(layout as SerializedDockview));
+  if (layout && (await okToClose())) restore(fresh(layout as SerializedDockview));
+}
+
+/** Asks main to confirm before panels close whose terminals run something besides the shell. */
+const okToClose = (panels = dock.panels): Promise<boolean> =>
+  api.pty.confirmKill(panels.filter((p) => p.api.component === 'terminal').map((p) => p.id));
+
+// The group holding focus, which may be in a pop-out window; dockview's active group need not follow it.
+async function closeTab(): Promise<void> {
+  const group = dock.groups.find((g) => { const d = g.element.ownerDocument; return d.hasFocus() && g.element.contains(d.activeElement); }) ?? dock.activeGroup;
+  const panel = group?.activePanel;
+  if (panel && (await okToClose([panel]))) panel.api.close();
 }
 
 function showPanel(type: string): void {
@@ -117,10 +137,10 @@ const commands: Record<string, (arg: string) => void> = {
   'add-project': () => void addProject(),
   'remove-project': () => void removeProject(),
   'save-layout': () => void saveNamed(),
-  'close-tab': () => dock.activePanel?.api.close(),
-  'open-preferences': () => { if (panelTypes().some((t) => t.id === 'preferences')) showPanel('preferences'); },
+  'close-tab': () => void closeTab(),
+  'open-preferences': () => showPanel('preferences'),
   project: (n) => { const p = allProjects()[Number(n) - 1]; if (p && p.id !== projectKey()) switchTo(p); },
-  preset,
+  preset: (name) => void okToClose().then((ok) => ok && preset(name)),
   layout: (name) => void restoreNamed(name),
   panel: showPanel,
 };
@@ -135,13 +155,14 @@ export async function startWorkspace(d: DockviewApi): Promise<void> {
   setActiveProject(last, { pick: (p) => { if (p.id !== projectKey()) switchTo(p); }, add: () => void addProject() });
   document.getElementById('empty-add')!.onclick = () => void addProject();
   if (last) restore(prefs.restoreLast ? perProject[last.id] : null); // no project: the empty state, not a terminal in ~
+  if (last && !prefs.restoreLast) pristine = panelIds();
   dock.onDidLayoutChange(() => {
     clearTimeout(saveTimer);
     // A pop-out reopened by fromJSON is only in toJSON once its window is up.
-    saveTimer = setTimeout(() => void dock.popoutRestorationPromise.then(save), 400);
+    saveTimer = setTimeout(() => void dock.popoutRestorationPromise.then(() => save()), 400);
     sync();
   });
-  addEventListener('beforeunload', save);
+  addEventListener('beforeunload', () => save());
   api.onCommand((name) => {
     const i = name.indexOf(':');
     commands[i < 0 ? name : name.slice(0, i)]?.(i < 0 ? '' : name.slice(i + 1));

@@ -5,12 +5,22 @@ import { Terminal } from '@xterm/xterm';
 import { isParking, registerPanel } from './registry';
 
 const { pty, terminal } = window.myide;
-const { settings } = terminal;
-const terms = new Map<string, Terminal>(); // panel id (= PTY id) -> xterm
-const infoHandlers = new Map<string, (info: { cwd: string; process: string }) => void>();
+let settings = terminal.settings();
+type Info = { cwd: string; process: string };
+const terms = new Map<string, { term: Terminal; write(d: string): void; info(i: Info): void; refit(): void }>(); // by panel id (= PTY id)
 pty.onData((id, data) => terms.get(id)?.write(data));
 pty.onExit((id, code) => terms.get(id)?.write(`\r\n\x1b[2m[process exited with code ${code}]\x1b[0m\r\n`));
-pty.onInfo((id, info) => infoHandlers.get(id)?.(info));
+pty.onInfo((id, info) => terms.get(id)?.info(info));
+
+/** Applies the current terminal font (Preferences or Ghostty) to every open terminal. */
+export function reloadTerminalSettings(): void {
+  settings = terminal.settings();
+  for (const t of terms.values()) {
+    t.term.options.fontFamily = settings.fontFamily;
+    t.term.options.fontSize = settings.fontSize;
+    t.refit();
+  }
+}
 
 async function paste(term: Terminal): Promise<void> {
   const text = await terminal.paste();
@@ -28,6 +38,7 @@ registerPanel('terminal', {
       scrollback: 10_000,
       cursorBlink: true,
       theme: settings.theme,
+      linkHandler: { activate: (_e, uri) => void terminal.openUrl(uri) }, // OSC 8 links
     });
     const fit = new FitAddon();
     term.loadAddon(fit);
@@ -56,20 +67,25 @@ registerPanel('terminal', {
       loadWebgl();
       term.refresh(0, term.rows - 1);
     };
+    // Until the spawn reply, live output is dropped: a reattach's replay already holds it. Output
+    // arriving during the replay is queued behind it. Only a live terminal resizes its PTY.
+    let state: 'spawning' | 'replaying' | 'live' = 'spawning';
+    const queued: string[] = [];
+    const write = (d: string) => { if (state === 'live') term.write(d); else if (state === 'replaying') queued.push(d); };
     const refit = () => {
       rehome();
+      if (state === 'replaying') return; // the replay sets its own sizes; it refits when done
       try { fit.fit(); } catch { /* not laid out yet */ }
     };
 
     // Title is the cwd's folder plus the foreground program when it isn't the shell; the cwd is
     // saved in params so a restored layout reopens the terminal there.
     let cwd = typeof params.cwd === 'string' ? params.cwd : '';
-    const onInfo = (info: { cwd: string; process: string }) => {
+    const onInfo = (info: Info) => {
       if (info.cwd !== cwd) { cwd = info.cwd; api.updateParameters({ ...params, cwd }); }
       const folder = cwd.split('/').filter(Boolean).pop() || '/';
       api.setTitle(info.process ? `${folder} · ${info.process}` : folder);
     };
-    infoHandlers.set(id, onInfo);
 
     // Cmd+C / Cmd+V / Cmd+K, for when no app menu catches them first (and in pop-outs).
     term.attachCustomKeyEventHandler((ev) => {
@@ -92,21 +108,22 @@ registerPanel('terminal', {
       term.focus();
     });
 
-    terms.set(id, term);
+    terms.set(id, { term, write, info: onInfo, refit });
     term.onData((d) => pty.write(id, d));
-    let replaying = false;
-    term.onResize(({ cols, rows }) => { if (!replaying) pty.resize(id, cols, rows); });
+    term.onResize(({ cols, rows }) => { if (state === 'live') pty.resize(id, cols, rows); });
     refit();
     void pty.spawn(id, { cwd: cwd || undefined, cols: term.cols, rows: term.rows }).then(async (info) => {
       onInfo(info);
-      if (!info.replay?.length) return;
-      // Reattached to a running shell: redraw its recent output at the sizes it was drawn for, then refit.
-      replaying = true;
-      for (const seg of info.replay) {
-        term.resize(seg.cols, seg.rows);
-        await new Promise<void>((r) => term.write(seg.data, r));
+      if (info.replay?.length) {
+        // Reattached to a running shell: redraw its recent output at the sizes it was drawn for.
+        state = 'replaying';
+        for (const seg of info.replay) {
+          term.resize(seg.cols, seg.rows);
+          await new Promise<void>((r) => term.write(seg.data, r));
+        }
       }
-      replaying = false;
+      for (const d of queued.splice(0)) term.write(d);
+      state = 'live';
       refit();
       pty.resize(id, term.cols, term.rows);
     });
@@ -125,7 +142,6 @@ registerPanel('terminal', {
       dispose() {
         subs.forEach((s) => s.dispose());
         terms.delete(id);
-        infoHandlers.delete(id);
         if (!isParking()) pty.kill(id); // a project switch parks the shell; it reattaches by id
         term.dispose();
       },
