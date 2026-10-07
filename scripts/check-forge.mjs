@@ -96,6 +96,9 @@ const fake = createServer((req, res) => {
       pulls.push(pr);
       return json(201, pr);
     }
+    if (path === '/repos/o/r/pulls/77/reviews') return json(200, [{ user: { login: 'ana' }, state: 'COMMENT' }, { user: { login: 'ana' }, state: 'APPROVED' }, { user: { login: 'bo' }, state: 'REQUEST_CHANGES' }]);
+    if (path === '/repos/o/r/commits/sha77/status') return json(200, { state: 'pending', statuses: [{ state: 'success' }, { state: 'success' }, { state: 'failure' }, { state: 'pending' }] });
+    if (path === '/repos/o/r/pulls/77') return json(200, { ...pulls.find((x) => x.number === 77), mergeable: true });
     if ((m = /^\/repos\/o\/r\/pulls\/(\d+)$/.exec(path))) return json(200, { number: +m[1], state: 'closed', merged: true });
     json(404, { message: `fake has no ${req.method} ${path}` });
   });
@@ -126,6 +129,12 @@ globalThis.__stub = {
   employees: {
     assignIssue: async (o) => { assigned.push(o); return { id: 'e1', projectId: o.projectId, name: 'engineer-1', branch: 'myide/engineer-1', issue: o.issue }; },
     tell: (id, text) => told.push({ id, text }),
+    // A lead with no issue, the engineer holding #1, and an employee of a project with no forge.
+    listEmployees: (projectId) => [
+      { id: 'lead1', projectId: 'p1', name: 'project-lead-1', branch: 'myide/project-lead-1', lead: true },
+      { id: 'e1', projectId: 'p1', name: 'engineer-1', branch: 'myide/engineer-1', issue: { provider: 'forgejo', repo: 'o/r', number: 1, title: 'Sync teardown', url: '' } },
+      { id: 'nf1', projectId: 'nf', name: 'writer-1', branch: 'myide/writer-1' },
+    ].filter((e) => !projectId || e.projectId === projectId),
   },
   pty: { spawnEnv: async () => ({ ...process.env }) },
 };
@@ -133,7 +142,7 @@ const stubs = { electron: 'electron', './employees': 'employees', './pty': 'pty'
 const out = join(tmp, 'forge.cjs');
 await build({
   // forge.ts plus mcp.ts's startMcp, so the issue script can be run against the real /issue endpoint.
-  stdin: { contents: "export * from './src/main/forge.ts'; export { startMcp } from './src/main/mcp.ts';", resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
+  stdin: { contents: "export * from './src/main/forge.ts'; export { startMcp, employeeMcpConfig } from './src/main/mcp.ts';", resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
   plugins: [{
     name: 'stubs',
     setup(b) {
@@ -403,6 +412,52 @@ try {
   await Promise.all([1, 2, 3].map((n) => forge.forgeAction(gh, 'comment', { body: `paced ${n}` })));
   assert.deepEqual(log.map((l) => l.body.body), ['paced 1', 'paced 2', 'paced 3']);
   for (let i = 1; i < 3; i++) assert.ok(times[i] - times[i - 1] >= 950, `GitHub writes ${times[i] - times[i - 1]} ms apart`);
+
+  // ---- reads: any employee of a linked project, through MyIDE's MCP endpoint as a lead would call them ----
+  pulls.push({ number: 77, title: 'Pool fix', body: 'Part of #1', html_url: 'http://forge/o/r/pulls/77', state: 'open', draft: false,
+    user: { login: 'bo' }, head: { ref: 'myide/project-lead-1', sha: 'sha77' }, base: { ref: 'main' }, updated_at: '2026-10-07T01:00:00Z' });
+  const mcpUrl = (id) => forge.employeeMcpConfig(id).mcpServers.myide.url;
+  let rpcId = 0;
+  const rpc = async (id, method, params) => (await (await fetch(mcpUrl(id), { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }) })).json()).result;
+  const tool = async (id, action, args) => {
+    const res = await rpc(id, 'tools/call', { name: 'forge', arguments: { action, args } });
+    assert.ok(!res.isError, res.content[0].text);
+    return JSON.parse(res.content[0].text);
+  };
+  // Offered to a lead holding no issue; not to an employee of a project without a forge.
+  assert.ok((await rpc('lead1', 'tools/list')).tools.some((t) => t.name === 'forge' && t.inputSchema.properties.action.enum.includes('list_issues')));
+  assert.ok(!(await rpc('nf1', 'tools/list')).tools.some((t) => t.name === 'forge'));
+  log.length = 0;
+  let li = await tool('lead1', 'list_issues', {});
+  assert.ok(li.issues.length >= 5);
+  const one = li.issues.find((i) => i.number === 1);
+  assert.deepEqual(one, { number: 1, title: 'Sync teardown', labels: [], state: 'open', assignees: ['david'], employee: 'engineer-1', pr: 'merged', updated: '2026-10-07T00:00:00Z' });
+  assert.deepEqual((await tool('lead1', 'list_issues', { labels: ['BUG'] })).issues.map((i) => i.number), [11]);
+  assert.deepEqual((await tool('lead1', 'list_issues', { assignee: 'david' })).issues.map((i) => i.number), [1]);
+  assert.ok(!(await tool('lead1', 'list_issues', { assignee: 'none' })).issues.some((i) => i.number === 1));
+  assert.deepEqual((await tool('lead1', 'list_issues', { state: 'closed' })).issues, []);
+  const gi = await tool('lead1', 'get_issue', { number: 1 });
+  assert.equal(gi.title, 'Sync teardown');
+  assert.equal(gi.employee, 'engineer-1');
+  assert.ok(gi.comments.some((x) => x.body === 'Fixed the teardown.' && x.author === 'david'));
+  assert.deepEqual(gi.prs.map((x) => `${x.number} ${x.state}`), [`${cache().prs['1'].number} merged`, '77 open']);
+  const lp = await tool('lead1', 'list_prs', {});
+  assert.deepEqual(lp.find((x) => x.number === 77), { number: 77, title: 'Pool fix', url: 'http://forge/o/r/pulls/77', author: 'bo', head: 'myide/project-lead-1', base: 'main',
+    draft: false, updated: '2026-10-07T01:00:00Z', checks: '2 passed, 1 failed, 1 pending' });
+  assert.deepEqual(await tool('lead1', 'pr_status', { number: 77 }), { number: 77, title: 'Pool fix', url: 'http://forge/o/r/pulls/77', state: 'open', merged: false, draft: false,
+    mergeable: true, head: 'myide/project-lead-1', base: 'main', checks: '2 passed, 1 failed, 1 pending',
+    reviews: [{ user: 'ana', state: 'APPROVED' }, { user: 'bo', state: 'REQUEST_CHANGES' }] });
+  assert.deepEqual(log, [], 'reads never write');
+  // Writes keep their rules: a lead holding no issue cannot comment; it can draft.
+  const w = await rpc('lead1', 'tools/call', { name: 'forge', arguments: { action: 'comment', args: { body: 'x' } } });
+  assert.ok(w.isError && /hold no issue/.test(w.content[0].text));
+  assert.match((await rpc('lead1', 'tools/call', { name: 'forge', arguments: { action: 'get_issue', args: {} } })).content[0].text, /Give the issue number/);
+  // Offline: get_issue falls back to the cached copy, without comments.
+  down = true;
+  const off = await tool('lead1', 'get_issue', { number: 1 });
+  assert.equal(off.title, 'Sync teardown');
+  assert.match(off.note, /cached copy/);
+  down = false;
 
   console.log('forge ok');
 } finally {

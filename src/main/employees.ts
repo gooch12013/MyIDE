@@ -10,7 +10,6 @@ import type { ClaudeEvent, TaskState } from './claude/parse';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
 import { account, claudeConfigDir, listAccounts, usageOf } from './accounts';
 import { frontmatter } from './buttons';
-import { forgeAction } from './forge';
 import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
 import { planCommands } from './mac';
@@ -636,7 +635,7 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
 const TRIAGE = 'How to read the issue: its title, every comment and its linked PRs together are the issue, and the title alone can be the whole spec. '
   + 'Verify the behaviour it names against the code. Never judge it, close it or call it stale or done by its body. '
   + 'If you find it already done or not planned, stop and say so with ask_human, citing file and line; David decides. '
-  + 'Write to the forge only through the forge tool (comment, open_pr, set_labels, draft_issue). Open the PR with "Closes #N" in its body; there is no close action.';
+  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue). Write to the forge only through the forge tool (comment, open_pr, set_labels, draft_issue). Open the PR with "Closes #N" in its body; there is no close action.';
 
 function issuePrompt(i: Issue, note?: string): string {
   return [`Work on ${i.repo}#${i.number}: ${i.title}`, i.url, note ?? '', TRIAGE].filter(Boolean).join('\n\n');
@@ -724,9 +723,7 @@ function registerOrgTools(): void {
       id: r.id, name: r.name, role: r.role, state: r.held ? 'waiting for approval' : r.state, model: fmt(r), branch: r.branch,
       task: r.task, progress: r.progress && `${r.progress.done} of ${r.progress.total}`, last: r.lastText?.slice(-500),
     })), isLead);
-  registerEmployeeTool('forge', 'Write to the issue you hold: comment, open_pr (put "Closes #N" in the body), set_labels, draft_issue (David files it). There is no close.',
-    { type: 'object', properties: { action: { type: 'string', enum: ['comment', 'open_pr', 'set_labels', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
-    async (employeeId, a) => forgeAction(view(get(employeeId)), a?.action, a?.args ?? {}), (id) => !!emps.get(id)?.issue);
+  // The forge tool (reads and writes) is registered by forge.ts.
 }
 
 type ProjectPatch = { [K in keyof ProjectOrg]?: ProjectOrg[K] | null } & { priority?: number; paused?: boolean };

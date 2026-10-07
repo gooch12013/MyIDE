@@ -2,7 +2,7 @@
 // and that a rendered role file round-trips through employees.ts parseRole and back into the same draft.
 // Usage: node scripts/check-roles.mjs
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -143,6 +143,25 @@ assert.equal(r.draftOf({ ...hd, model: 'opusplan', orig: undefined }, ctx).model
 for (const fm of ['tools:\n  - Read', 'description: >\n  folded', 'description: |', 'hooks:\n  PreToolUse: x', 'color:', '# a comment', 'color: a\ncolor: b']) {
   assert.throws(() => r.parseRoleText(`---\nname: x\n${fm}\n---\n\nbody\n`, ctx), (e) => e.message === r.ADVANCED, fm);
 }
+
+// ---- shipped templates (build/role-templates): parse, pass the checks, round-trip unchanged, read as leads ----
+const want = { 'project-lead': ['opus', 4], 'product-manager': ['sonnet', 3], 'project-owner': ['opus', 3], 'hardware-project-lead': ['opus', 3] };
+for (const f of readdirSync('build/role-templates').filter((x) => x.endsWith('.md'))) {
+  const path = join('build/role-templates', f);
+  const text = readFileSync(path, 'utf8');
+  const d = r.parseRoleText(text, ctx);
+  assert.deepEqual(r.check(d, ctx).errors, [], f);
+  assert.equal(r.renderRole(d), text, `${f} round-trips`);
+  assert.ok(d.rules.length >= 4, f);
+  for (const s of ['## Responsibilities', '## How to work', '## Definition of done', '## Report back', 'list_issues', 'list_reports', 'ask_human']) assert.ok(text.includes(s), `${f}: ${s}`);
+  assert.ok(!/`(gh|tea) |\bgh (issue|pr|api)\b/.test(text), `${f} names no gh/tea command`);
+  const role = parseRole(path, 'user');
+  assert.equal(`${role.name}.md`, f);
+  assert.equal(role.lead, true, f);
+  assert.deepEqual([role.model, role.maxReports], want[role.name], f);
+  delete want[role.name];
+}
+assert.deepEqual(Object.keys(want), [], 'every shipped template present');
 
 rmSync(tmp, { recursive: true, force: true });
 console.log('check-roles: ok');

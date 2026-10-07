@@ -23,5 +23,6 @@ cpSync('build/speech', 'dist/speech', { recursive: true }); // the read-back hel
 for (const f of ['trayTemplate.png', 'trayTemplate@2x.png']) cpSync(`build/${f}`, `dist/${f}`); // the menu-bar icon
 cpSync('build/prompt-guides', 'dist/prompt-guides', { recursive: true }); // asset studio prompt guides, copied to ~/.myide/prompt-guides on first use
 cpSync('build/agents', 'dist/agents', { recursive: true }); // the designer role, installed into ~/.claude/agents only on a click
+cpSync('build/role-templates', 'dist/role-templates', { recursive: true }); // generic role templates the wizard starts from
 for (const f of ['index.html', 'popout.html']) cpSync(`src/renderer/${f}`, `dist/renderer/${f}`);
 console.log('built dist/');

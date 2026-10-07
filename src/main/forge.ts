@@ -4,10 +4,10 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stripAttribution } from './attribution';
-import { assignIssue, tell } from './employees';
+import { assignIssue, listEmployees, tell } from './employees';
 import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
-import { onIssuePost } from './mcp';
+import { onIssuePost, registerEmployeeTool } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
 import { detect, type Detected } from './remotes';
 import { spawnEnv } from './pty';
@@ -381,9 +381,97 @@ const strip = (s: unknown) => stripAttribution(String(s ?? '')).trim();
 const cleanLabels = (x: unknown): string[] => (Array.isArray(x) ? x : typeof x === 'string' ? x.split(',') : [])
   .map((l) => String(l).trim()).filter(Boolean).slice(0, 20);
 
-/** The employees' one path to a forge. Every body is stripped of attribution. There is no close action. */
-export async function forgeAction(emp: Holder, action: 'comment' | 'open_pr' | 'set_labels' | 'draft_issue', args: any): Promise<string> {
+// ---- reads for employees (through MyIDE's token; the employee never sees it) ----
+
+const READS = ['list_issues', 'get_issue', 'list_prs', 'pr_status'];
+const num = (x: unknown, what: string): number => {
+  const n = Number(x);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`Give the ${what} number.`);
+  return n;
+};
+const openPrs = (id: string, f: ForgeLink): Promise<any[]> => call(f, 'GET', `/repos/${f.repo}/pulls?state=open&per_page=100&limit=50`, undefined, id);
+
+/** "2 passed, 1 failed, 0 pending" from commit statuses (both forges) and GitHub check runs; undefined if the forge would not say. */
+async function checksOf(id: string, f: ForgeLink, sha: string): Promise<string | undefined> {
+  if (!sha) return undefined;
+  const R = `/repos/${f.repo}/commits/${sha}`;
+  const n = { passed: 0, failed: 0, pending: 0 };
+  try {
+    for (const s of (await call(f, 'GET', `${R}/status`, undefined, id))?.statuses ?? []) n[s.state === 'success' ? 'passed' : s.state === 'pending' ? 'pending' : 'failed']++;
+    if (f.provider === 'github') {
+      for (const r of (await call(f, 'GET', `${R}/check-runs?per_page=100`, undefined, id))?.check_runs ?? []) {
+        n[r.status !== 'completed' ? 'pending' : ['success', 'neutral', 'skipped'].includes(r.conclusion) ? 'passed' : 'failed']++;
+      }
+    }
+  } catch { return undefined; }
+  return n.passed + n.failed + n.pending ? `${n.passed} passed, ${n.failed} failed, ${n.pending} pending` : 'none reported';
+}
+
+async function forgeRead(id: string, action: string, a: any): Promise<unknown> {
+  const { f } = linked(id);
+  const R = `/repos/${f.repo}`;
+  const holders = new Map(listEmployees(id).filter((e) => e.issue).map((e) => [e.issue!.number, e.name]));
+  const prState = (p?: PrLink) => p && (p.merged ? 'merged' : p.state);
+  if (action === 'list_issues') {
+    await fetchIssues(id); // refreshes at most every 30 s; otherwise this is the cached list
+    const c = cache(id);
+    const state = ['open', 'closed', 'all'].includes(a.state) ? a.state : 'open';
+    const want = cleanLabels(a.labels).map((l) => l.toLowerCase());
+    const who = typeof a.assignee === 'string' ? a.assignee.trim().toLowerCase() : '';
+    const issues = c.issues.filter((i) => (state === 'all' || i.state === state)
+      && want.every((l) => i.labels.some((x) => x.toLowerCase() === l))
+      && (!who || (who === 'none' ? !i.assignees.length : i.assignees.some((x) => x.toLowerCase() === who))));
+    return {
+      ...(c.offline || c.error ? { note: `Cached list from ${c.fetchedAt ? new Date(c.fetchedAt).toISOString() : 'never'}: ${c.error ?? 'forge unreachable'}` } : {}),
+      issues: issues.map((i) => ({ number: i.number, title: i.title, labels: i.labels, state: i.state, assignees: i.assignees,
+        employee: holders.get(i.number), pr: prState(c.prs[i.number]), updated: i.updatedAt })),
+    };
+  }
+  if (action === 'get_issue') {
+    const n = num(a.number, 'issue');
+    const mine = cache(id).prs[n];
+    try {
+      const i = norm(await call(f, 'GET', `${R}/issues/${n}`, undefined, id));
+      const comments: any[] = await call(f, 'GET', `${R}/issues/${n}/comments?per_page=100&limit=50`, undefined, id);
+      const refs = (await openPrs(id, f)).filter((p) => new RegExp(`#${n}\\b`).test(`${p.title ?? ''}\n${p.body ?? ''}`) && p.number !== mine?.number);
+      return {
+        number: i.number, title: i.title, state: i.state, labels: i.labels, assignees: i.assignees, author: i.author, url: i.url, updated: i.updatedAt,
+        employee: holders.get(n), body: i.body,
+        comments: comments.map((x) => ({ author: x.user?.login ?? '', at: x.created_at ?? '', body: x.body ?? '' })),
+        prs: [...(mine ? [{ number: mine.number, url: mine.url, state: prState(mine) }] : []),
+          ...refs.map((p) => ({ number: p.number, title: p.title, url: p.html_url, state: 'open', head: p.head?.ref }))],
+      };
+    } catch (e) {
+      const i = cache(id).issues.find((x) => x.number === n);
+      if (!(e instanceof Offline) || !i) throw e;
+      return { ...i, employee: holders.get(n), pr: prState(mine), note: `Forge unreachable; cached copy without comments. ${e.message}` };
+    }
+  }
+  if (action === 'list_prs') {
+    const prs = await openPrs(id, f);
+    // ponytail: checks for the first 10 only, to keep one call from becoming dozens; pr_status has the rest.
+    return Promise.all(prs.map(async (p, k) => ({
+      number: p.number, title: p.title, url: p.html_url, author: p.user?.login ?? '', head: p.head?.ref, base: p.base?.ref, draft: !!p.draft,
+      updated: p.updated_at, checks: k < 10 ? await checksOf(id, f, p.head?.sha) : undefined,
+    })));
+  }
+  const n = num(a.number, 'PR');
+  const p = await call(f, 'GET', `${R}/pulls/${n}`, undefined, id);
+  const reviews: any[] = await call(f, 'GET', `${R}/pulls/${n}/reviews?per_page=100&limit=50`, undefined, id).catch(() => []);
+  const latest = new Map<string, string>(); // each reviewer's last verdict
+  for (const r of reviews ?? []) if (r.user?.login) latest.set(r.user.login, r.state);
+  return {
+    number: p.number, title: p.title, url: p.html_url, state: p.state, merged: !!(p.merged || p.merged_at), draft: !!p.draft,
+    mergeable: p.mergeable ?? null, mergeableState: p.mergeable_state, head: p.head?.ref, base: p.base?.ref,
+    checks: await checksOf(id, f, p.head?.sha), reviews: [...latest].map(([user, state]) => ({ user, state })),
+  };
+}
+
+/** The employees' one path to a forge: reads for anyone on a linked project, writes to the issue they hold.
+ *  Every body is stripped of attribution. There is no close action. */
+export async function forgeAction(emp: Holder, action: string, args: any): Promise<unknown> {
   const a = args ?? {};
+  if (READS.includes(action)) return forgeRead(emp.projectId, action, a);
   if (action === 'draft_issue') {
     const title = strip(a.title);
     if (!title) throw new Error('A draft needs a title.');
@@ -552,6 +640,17 @@ export type ForgeSnapshot = ReturnType<typeof snapshot>[number];
 const detected = new Map<string, Promise<Detected>>();
 
 export function registerForgeIpc(): void {
+  registerEmployeeTool('forge',
+    'The project\'s GitHub or Forgejo, through MyIDE. Reads: list_issues {state: open|closed|all, labels, assignee (a login or "none")}, '
+    + 'get_issue {number} (body, comments, linked PRs), list_prs (open PRs, head branch, checks), pr_status {number} (mergeable, checks, reviews). '
+    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body), set_labels. draft_issue {title, body, labels}: David files it. There is no close.',
+    { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
+    async (employeeId, a) => {
+      const e = listEmployees().find((x) => x.id === employeeId);
+      if (!e) throw new Error('No such employee');
+      return forgeAction(e, a?.action, a?.args ?? {});
+    },
+    (employeeId) => { const e = listEmployees().find((x) => x.id === employeeId); return !!e && !!projects().find((p) => p.id === e.projectId)?.forge; });
   // The quick-add script: ~/.myide/bin/issue PROJECT "title".
   try {
     mkdirSync(join(STATE_DIR, 'bin'), { recursive: true, mode: 0o700 });

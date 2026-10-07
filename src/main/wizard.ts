@@ -79,7 +79,7 @@ function systemPrompt(ctx: Ctx, projectId?: string): string {
     '- Questions are only about the job: purpose, responsibilities, how to work, definition of done, what to report back, and what it may and may not do.',
     '- Never ask about these settings in a question: AI, account, model, effort, mode, lead, max reports, shared, read-only, max turns, where to save. As soon as you understand the job, put your suggestions in "settings"; MyIDE shows them as a settings card. David\'s picks come back in his messages as "Settings: {...}"; respect them.',
     '- Your first reply never has a draft: ask your 1 or 2 most useful questions and give your settings. After that, stop asking once you have enough (usually 2 to 4 turns) and send the draft. When David says to draft it, send the draft at once, filling gaps with sensible defaults.',
-    '- Employees reach GitHub and Forgejo only through MyIDE\'s forge tool (comment, open_pr, set_labels, draft_issue); gh and tea are blocked. Their commits carry no AI attribution.',
+    '- Employees reach GitHub and Forgejo only through MyIDE\'s forge tool: reads (list_issues, get_issue, list_prs, pr_status) and writes (comment, open_pr, set_labels, draft_issue); gh and tea are blocked. Their commits carry no AI attribution.',
     'Reply with one or two plain sentences for David, then exactly one ```json block:',
     '{"ask": [{"q": "...", "choices": ["..."], "multi": false}], "settings": null or {"provider", "account", "model", "effort", "mode", "lead", "maxReports", "shared", "readOnly", "maxTurns"}, "draft": null or {...}}',
     'The draft: {"name": "kebab-case", "description": "one sentence: when to hire this role", "body": "markdown in the second person (You are ...), with short sections: purpose, responsibilities, how to work, definition of done, what to report back", "rules": ["plain rules of what it may and may not do"], "firstTask": "a sensible first task", and every settings key}. With a draft, "ask" is [].',
@@ -127,10 +127,10 @@ async function read(projectId: string | undefined, name: string): Promise<{ draf
   catch (e) { if ((e as Error).message === ADVANCED) return { advanced: true, where: r.source, file: r.file }; throw e; }
 }
 
-/** Templates to start from: David's own in ~/.myide/role-templates (not starting with "_"), then the shipped roles. */
+/** Templates to start from: David's own in ~/.myide/role-templates (not starting with "_"), then the shipped templates, then the shipped roles. */
 async function templates(): Promise<{ file: string; draft: Draft }[]> {
   const ctx = await context();
-  return [join(STATE_DIR, 'role-templates'), join(__dirname, 'agents')].flatMap((dir) => {
+  return [join(STATE_DIR, 'role-templates'), join(__dirname, 'role-templates'), join(__dirname, 'agents')].flatMap((dir) => {
     let files: string[] = [];
     try { files = readdirSync(dir).filter((f) => f.endsWith('.md') && !f.startsWith('_')).sort(); } catch { return []; }
     return files.flatMap((f) => {
