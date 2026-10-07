@@ -2,7 +2,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-export const STATE_DIR = join(homedir(), '.myide');
+// MYIDE_HOME points the app at another state folder (tests use a temp dir).
+export const STATE_DIR = process.env.MYIDE_HOME || join(homedir(), '.myide');
 
 /** Reads `~/.myide/<name>`. Missing file gives `fallback`; corrupt JSON throws so nobody overwrites it blindly. */
 export function readJSON<T>(name: string, fallback: T): T {

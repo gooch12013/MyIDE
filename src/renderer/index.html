@@ -12,6 +12,21 @@
   <nav class="topnav" id="project-keys" aria-label="Projects"></nav>
 </header>
 <main id="dock"></main>
+<section id="empty-state" class="empty-state" hidden>
+  <p class="legend">No projects yet</p>
+  <p>A project is a folder you work in. Its terminals open there and it keeps its own layout.</p>
+  <button type="button" class="key key--go" id="empty-add">Add a project</button>
+</section>
+<dialog id="layout-name" class="sheet" aria-labelledby="layout-name-title">
+  <form method="dialog">
+    <label class="legend" id="layout-name-title" for="layout-name-input">Save layout as</label>
+    <input id="layout-name-input" class="input" required maxlength="60" autocomplete="off" placeholder="e.g. Laptop only">
+    <div class="sheet-keys">
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn btn--primary" value="save">Save</button>
+    </div>
+  </form>
+</dialog>
 <script src="app.js"></script>
 </body>
 </html>

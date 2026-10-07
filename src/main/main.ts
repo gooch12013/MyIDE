@@ -2,6 +2,13 @@ import { app, BrowserWindow, net, protocol } from 'electron';
 import { join, normalize, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { killAllPtys, registerPtyIpc } from './pty';
+import { registerLayoutIpc } from './layouts';
+import { buildMenu, registerMenu } from './menu';
+import { registerProjectIpc } from './projects';
+import './ghostty';
+import { registerOpenerIpc } from './openers';
+import './mic';
+import { registerPrefsIpc } from './prefs';
 
 // The renderer is served from app://myide/ rather than file:// because dockview only opens
 // same-origin pop-out windows.
@@ -38,6 +45,9 @@ function createMainWindow(): void {
 // Keyboard commands go through main so they work in pop-out windows too; the renderer that owns
 // the layout (the main window) handles them.
 const COMMANDS: Record<string, string> = { t: 'new-terminal' };
+// Cmd+W closes the active tab; Cmd+1..9 switch project.
+COMMANDS.w = 'close-tab';
+for (let i = 1; i <= 9; i++) COMMANDS[i] = `project:${i}`;
 
 app.on('web-contents-created', (_e, wc) => {
   wc.on('will-navigate', (e, url) => { if (!url.startsWith(`${ORIGIN}/`)) e.preventDefault(); });
@@ -57,6 +67,11 @@ app.whenReady().then(() => {
     return net.fetch(pathToFileURL(file).toString());
   });
   registerPtyIpc();
+  registerProjectIpc(buildMenu);
+  registerLayoutIpc(buildMenu);
+  registerMenu((command) => mainWindow?.webContents.send('command', command));
+  registerOpenerIpc();
+  registerPrefsIpc(buildMenu);
   createMainWindow();
 });
 

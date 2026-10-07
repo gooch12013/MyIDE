@@ -2,10 +2,13 @@ import '@xterm/xterm/css/xterm.css';
 import './styles.css';
 import { openPanel, startDock } from './registry';
 import './terminal';
+import './files';
+import './prefs';
+import { startWorkspace } from './layouts';
+import { activeProject } from './projects';
 
-startDock(document.getElementById('dock')!);
-openPanel('terminal');
+void startWorkspace(startDock(document.getElementById('dock')!));
 
 window.myide.onCommand((name) => {
-  if (name === 'new-terminal') openPanel('terminal');
+  if (name === 'new-terminal') openPanel('terminal', { cwd: activeProject()?.path });
 });

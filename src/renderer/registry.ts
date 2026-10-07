@@ -1,6 +1,6 @@
 import {
   createDockview, themeDark,
-  type DockviewApi, type DockviewGroupPanel, type DockviewPanelApi, type IContentRenderer, type IHeaderActionsRenderer, type IWatermarkRenderer,
+  type AddPanelPositionOptions, type DockviewApi, type DockviewGroupPanel, type DockviewPanelApi, type IContentRenderer, type IHeaderActionsRenderer, type IWatermarkRenderer,
 } from 'dockview-core';
 
 export interface PanelInstance {
@@ -22,11 +22,23 @@ export function registerPanel(id: string, def: PanelDef): void {
   defs.set(id, def);
 }
 
-/** Adds a new instance of a registered panel as a tab in the active group. */
-export function openPanel(id: string, params: Record<string, unknown> = {}) {
+/** Adds a new instance of a registered panel, as a tab in the active group unless `place` says where. */
+export function openPanel(id: string, params: Record<string, unknown> = {}, place: { position?: AddPanelPositionOptions; initialWidth?: number } = {}) {
   const def = defs.get(id);
   if (!def) throw new Error(`No panel registered as "${id}"`);
-  return dock.addPanel({ id: `${id}-${crypto.randomUUID().slice(0, 8)}`, component: id, title: def.title, params });
+  return dock.addPanel({ id: `${id}-${crypto.randomUUID().slice(0, 8)}`, component: id, title: def.title, params, ...place });
+}
+
+/** Registered panel types, for the Panels menu. */
+export const panelTypes = (): { id: string; title: string }[] => [...defs].map(([id, d]) => ({ id, title: d.title }));
+
+// A project switch tears the whole layout down and rebuilds it later. While that runs, panels
+// should let go of their backing process (a terminal's shell) instead of ending it.
+let parking = false;
+export const isParking = (): boolean => parking;
+export function park(fn: () => void): void {
+  parking = true;
+  try { fn(); } finally { parking = false; }
 }
 
 function createComponent({ name }: { name: string }): IContentRenderer {
