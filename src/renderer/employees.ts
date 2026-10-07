@@ -19,6 +19,7 @@ const LED: Record<EmployeeState, [string, string]> = {
   idle: ['idle', 'Idle'], queued: ['queued', 'Queued'], working: ['working', 'Working'], 'needs-you': ['needs', 'Needs you'],
   done: ['done', 'Done'], failed: ['failed', 'Failed'], interrupted: ['blocked', 'Interrupted'], talking: ['talking', 'Talking'],
 };
+export const stateName = (state: string): string => LED[state as EmployeeState]?.[1] ?? cap(state);
 export function led(state: string, label?: string): HTMLSpanElement {
   const [s, text] = LED[state as EmployeeState] ?? [state, state];
   const el = h('span', { className: 'led', textContent: label ?? text });
@@ -110,19 +111,25 @@ function needCard(a: Approval, who: string, colour: string | undefined): HTMLEle
   return card;
 }
 
+/** cue(), with a lead's roll-up of its reports and a held model in place of the count. */
+export function cueOf(e: Employee, everyone: Employee[]): { count: string; text: string } {
+  let { count, text } = cue(e);
+  if (everyone.some((x) => x.parentId === e.id)) {
+    const u = rollup(everyone, e.id);
+    count = u.total ? `${u.done} of ${u.total} across ${u.reports} report${u.reports === 1 ? '' : 's'}` : `${u.reports} report${u.reports === 1 ? '' : 's'}`;
+  }
+  if (e.held) count = `Approve ${fmtPick(e.held)}`;
+  return { count, text };
+}
+
 /** One tree row. A lead's cue column is its roll-up; `tag` is 'summary' when it heads a branch. */
 function row(e: Employee, everyone: Employee[], tag: 'div' | 'summary' = 'div', maxReports = 3): HTMLElement {
   const r = h(tag, { className: `o-row${e.contractor ? ' is-contractor' : ''}` });
   r.dataset.state = e.state;
   r.dataset.id = e.id;
   r.style.setProperty('--depth', String(Math.max(0, e.depth - 1)));
-  let { count, text } = cue(e);
+  const { count, text } = cueOf(e, everyone);
   const reports = everyone.filter((x) => x.parentId === e.id);
-  if (reports.length) {
-    const u = rollup(everyone, e.id);
-    count = u.total ? `${u.done} of ${u.total} across ${u.reports} report${u.reports === 1 ? '' : 's'}` : `${u.reports} report${u.reports === 1 ? '' : 's'}`;
-  }
-  if (e.held) count = `Approve ${fmtPick(e.held)}`;
   const rank = e.contractor ? 'Contractor' : e.lead ? 'Lead' : '';
   const role = h('span', { className: 'o-role', title: e.role }, e.role);
   if (e.lead) {
@@ -192,7 +199,7 @@ function gauge(a: { id: string; name: string; cap: number; usage?: Usage }): HTM
 }
 
 /** One line per project: page colour, what needs you, slots in use, priority and pause. */
-function projectLine(p: { id: string; name: string; colour: string }, list: Employee[], o: OrgState, active: boolean): HTMLElement {
+function projectLine(p: { id: string; name: string; colour: string; closed?: number }, list: Employee[], o: OrgState, active: boolean): HTMLElement {
   const po = o.projects.find((x) => x.id === p.id);
   const running = list.filter((e) => e.state === 'working').length;
   const needs = list.filter((e) => ATTENTION.includes(e.state)).length;
@@ -210,7 +217,8 @@ function projectLine(p: { id: string; name: string; colour: string }, list: Empl
   less.setAttribute('aria-label', `Lower ${p.name} priority`);
   more.setAttribute('aria-label', `Raise ${p.name} priority`);
   const line = h('div', { className: `proj-line${active ? ' is-active' : ''}` },
-    h('span', { className: 'proj-line-name', textContent: p.name }), state,
+    h('span', { className: 'proj-line-name', title: p.closed ? 'Its tab is closed; its employees keep working' : '' }, p.name,
+      ...(p.closed ? [h('span', { className: 'capflag proj-line-closed', textContent: 'tab closed' })] : [])), state,
     h('span', { className: 'proj-line-slots' }, meter, h('span', { className: 'cap-val', textContent: `${running}/${slots}` })),
     h('span', { className: 'proj-line-roll', textContent: [`${list.length} employee${list.length === 1 ? '' : 's'}`, queued && `${queued} queued`, total && `${done} of ${total} cues`].filter(Boolean).join(' · ') }),
     h('span', { className: 'proj-line-keys' }, less, h('span', { className: 'proj-line-prio', textContent: `P${prio}`, title: 'Priority: the queue serves higher first' }), more,
@@ -321,6 +329,8 @@ registerPanel('employees', {
       api.org.onChange((o) => { org = o; draw(); }),
       api.accounts.onUsage((id, u) => { readings.set(id, u); void drawUsage(); }),
     ];
+    window.addEventListener('myide:projects', draw); // a tab closed or reopened
+    offs.push(() => window.removeEventListener('myide:projects', draw));
     return { dispose: () => offs.forEach((off) => off()) };
   },
 });

@@ -179,6 +179,15 @@ body:not(:has(.topbar)) > * { padding: var(--sp-2); }
   box-shadow: 0 2px 3px rgba(0,0,0,0.6), 0 0 14px -4px color-mix(in srgb, var(--proj) 70%, transparent), inset 0 1px 0 rgba(255,255,255,0.14);
 }
 .proj-key[aria-current="true"] kbd { color: var(--ink-2); }
+/* project tabs: × on hover/focus, drag to reorder (amber edge marks the drop side) */
+.proj-close { width: 14px; margin: 0 -4px 0 -8px; font-size: var(--fs-md); line-height: 1; text-align: center; color: var(--ink-3); border-radius: 2px; visibility: hidden; }
+.proj-key:hover .proj-close, .proj-key:focus-visible .proj-close { visibility: visible; }
+.proj-close:hover { color: var(--ink); background: rgba(255,255,255,0.08); }
+.proj-key.is-dragging { opacity: 0.45; }
+.proj-key.drop-before { box-shadow: inset 2px 0 0 var(--accent); }
+.proj-key.drop-after { box-shadow: inset -2px 0 0 var(--accent); }
+.empty-closed:not([hidden]) { display: flex; flex-wrap: wrap; justify-content: center; gap: var(--sp-1); max-width: 60ch; }
+.proj-line-closed { margin-left: var(--sp-2); vertical-align: middle; }
 .key--new { min-height: 30px; flex: none; border-style: dashed; border-color: var(--line-strong); background: transparent; box-shadow: none; color: var(--ink-3); }
 .key--go {
   min-height: 40px; padding: 8px 18px;
@@ -474,6 +483,19 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .iss-pr { font: 600 var(--fs-xs)/1 var(--font-legend); letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); padding: 2px 5px; border: 1px solid var(--line-strong); border-radius: 2px; background: none; white-space: nowrap; cursor: pointer; }
 .iss-row[data-state="merged"] .iss-pr { color: var(--st-done); border-color: color-mix(in srgb, var(--st-done) 40%, var(--line-strong)); }
 .iss-actions { display: inline-flex; gap: var(--sp-2); margin-left: auto; }
+/* The issue's employee: LED, cue, chip, right-aligned; it wraps to its own line when the panel is narrow. */
+.iss-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px var(--sp-3); margin-left: auto; max-width: 100%; min-width: 0; padding: 2px 4px; border: 0; border-radius: 2px; background: none; color: inherit; font: inherit; cursor: pointer; }
+.iss-status:hover { background: #1a1e24; }
+.iss-status > :not(.iss-status-text) { flex: none; }
+.iss-status .cue-steps { width: 48px; }
+.iss-status-text { min-width: 0; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-sm); color: var(--ink-2); }
+.iss-status:is([data-state="idle"], [data-state="queued"], [data-state="paused"], [data-state="interrupted"], [data-state="talking"]) .o-cue-count { color: var(--ink-3); }
+.iss-status[data-state="done"] .o-cue-count { color: var(--st-done); }
+.iss-status[data-state="failed"] .o-cue-count { color: var(--st-failed); }
+.iss-row[data-emp="needs-you"] { background: color-mix(in srgb, var(--st-needs) 7%, var(--well-row)); }
+.iss-row[data-emp="interrupted"] { background: color-mix(in srgb, var(--st-blocked) 8%, var(--well-row)); }
+.iss-row[data-emp="failed"] { background: color-mix(in srgb, var(--st-failed) 8%, var(--well-row)); }
+.iss-labels:empty { display: none; }
 .iss-empty { padding: var(--sp-6) var(--sp-4); color: var(--ink-3); font-size: var(--fs-sm); text-align: center; }
 .iss-empty[hidden] { display: none; }
 .sheet.iss-sheet { width: min(560px, 92vw); }

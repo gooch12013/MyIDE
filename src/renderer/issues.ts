@@ -2,12 +2,13 @@ import type { ForgeLink, ForgeSnapshot } from '../main/forge';
 import type { Detected, Found } from '../main/remotes';
 import { attachBox } from './attach';
 import { ask, errText, h, key, sheet } from './dom';
-import { led, openEmployee, type Employee } from './employees';
+import { chip, cueOf, led, openEmployee, stateName, steps, type Employee } from './employees';
 import type { Project } from '../main/projects';
+import type { OrgState } from '../preload/preload';
 import { activeProject, allProjects } from './projects';
 import { openPanel, registerPanel } from './registry';
 import { micButton } from './speech';
-import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
+import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, STATUSES, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
 
 const api = window.myide;
 type Issue = ForgeSnapshot['issues'][number];
@@ -22,7 +23,25 @@ function age(iso: string): string {
   if (!(s > 0)) return '';
   return s < 3600 ? `${Math.max(1, Math.round(s / 60))} min` : s < 86400 ? `${Math.round(s / 3600)} h` : `${Math.round(s / 86400)} d`;
 }
-const holder = (emps: Linked[], s: ForgeSnapshot, n: number) => emps.find((e) => e.projectId === s.projectId && e.issue?.repo === s.repo && e.issue?.number === n);
+// Several employees on one issue (a lead and its reports): the shallowest holds it, and shows the roll-up.
+const holder = (emps: Linked[], s: ForgeSnapshot, n: number) => emps.filter((e) => e.projectId === s.projectId && e.issue?.repo === s.repo && e.issue?.number === n)
+  .sort((a, b) => a.depth - b.depth)[0];
+/** The employee's state, or 'paused' while its project is paused and its turn waits. */
+const statusOf = (e: Employee, paused: Set<string>) => (paused.has(e.projectId) && e.state === 'queued' ? 'paused' : e.state);
+
+/** LED, cue count and text, model chip: one right-aligned button that opens the employee. */
+function statusButton(e: Employee, everyone: Employee[], status: string): HTMLButtonElement {
+  const { count, text } = cueOf(e, everyone);
+  const b = h('button', { type: 'button', className: 'iss-status', title: `Open ${e.name}${text ? `: ${text}` : ''}`, onclick: () => openEmployee(e.id) },
+    status === 'paused' ? led('interrupted', 'Paused') : led(status),
+    ...(count ? [h('span', { className: 'o-cue-count', textContent: count })] : []),
+    ...(e.progress?.total ? [steps(e)] : []),
+    ...(text ? [h('span', { className: 'iss-status-text', textContent: text })] : []),
+    chip(e));
+  b.dataset.state = status;
+  b.setAttribute('aria-label', `${e.name}: ${stateName(status)}${count ? `, ${count}` : ''}${text ? `, ${text}` : ''}. Open ${e.name}`);
+  return b;
+}
 const sheetText = (form: HTMLElement) => {
   const t = h('p', { className: 'pref-warn' });
   t.setAttribute('aria-live', 'polite');
@@ -165,12 +184,14 @@ function retry(s: ForgeSnapshot): HTMLButtonElement {
   return b;
 }
 
-function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean): HTMLElement {
+function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean, paused: Set<string>): HTMLElement {
   const p = proj(s.projectId);
   const pr = s.prs[String(i.number)];
   const emp = holder(emps, s, i.number);
   const row = h('li', { className: 'iss-row' });
   row.dataset.state = pr?.merged ? 'merged' : i.state;
+  const status = emp && statusOf(emp, paused);
+  if (status) row.dataset.emp = status;
   if (all && p) row.style.setProperty('--proj', p.colour);
   const labelChips = i.labels.map((l) => h('span', { className: `iss-label${/in progress/i.test(l) ? ' is-progress' : ''}`, textContent: l }));
   const prText = pr ? (pr.merged ? `PR #${pr.number} merged` : `PR #${pr.number} ${pr.state}`) : '';
@@ -184,6 +205,7 @@ function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean): HTM
         : h('span', { className: 'iss-nobody', textContent: 'No employee' }),
       ...(prText ? [pr!.url ? h('button', { type: 'button', className: 'iss-pr', textContent: prText, onclick: () => void api.terminal.openUrl(pr!.url) }) : h('span', { className: 'iss-pr', textContent: prText })] : []),
       h('span', { className: 'iss-labels' }, ...labelChips),
+      ...(emp ? [statusButton(emp, emps, status!)] : []),
       h('span', { className: 'iss-actions' }, ...(i.state === 'open' && !emp ? [key('Assign…', () => void openAssign(s, i))] : []))),
   );
   return row;
@@ -301,14 +323,14 @@ registerPanel('issues', {
     const who = h('select', { className: 'input select iss-sel' });
     who.setAttribute('aria-label', 'Assignee');
     who.onchange = () => set({ who: who.value });
-    const emp = sel('Employee', [['', 'Any employee'], ['yes', 'Given to an employee'], ['no', 'No employee']], () => v.emp, (x) => set({ emp: x as View['emp'] }));
+    const emp = sel('Employee', [['', 'Any employee'], ['yes', 'Given to an employee'], ['no', 'No employee'], ...STATUSES.map((x): [string, string] => [x, `Employee: ${stateName(x)}`])], () => v.emp, (x) => set({ emp: x as View['emp'] }));
     const pr = sel('Pull request', [['', 'Any PR'], ['yes', 'Has PR'], ['no', 'No PR']], () => v.pr, (x) => set({ pr: x as View['pr'] }));
     const labelBox = h('div', { className: 'iss-labelpick', role: 'group' });
     labelBox.setAttribute('aria-label', 'Labels (all selected must match)');
     const SORT_NAMES: Record<Sort, string> = { updated: 'Updated', created: 'Created', number: 'Number', title: 'Title', comments: 'Comments', custom: 'Custom order' };
     const sort = sel('Sort by', SORTS.map((s) => [s, SORT_NAMES[s]]), () => v.sort, (x) => set({ sort: x as Sort }));
     const dir = key('', () => set({ desc: !v.desc }), { className: 'key key--sm iss-dir' });
-    const group = sel('Group by', GROUPS.map((g) => [g, g === 'none' ? 'No groups' : `By ${g}`]), () => v.group, (x) => set({ group: x as Group }));
+    const group = sel('Group by', GROUPS.map((g) => [g, g === 'none' ? 'No groups' : g === 'status' ? 'By employee status' : `By ${g}`]), () => v.group, (x) => set({ group: x as Group }));
     const clear = key('Clear', () => set({ q: '', state: 'open', labels: [], who: '', emp: '', pr: '' }), { title: 'Clear the filters (keeps sort and order)' });
     const bar = h('div', { className: 'iss-bar' },
       h('div', { className: 'iss-bar-row' }, search, stateBox, who, emp, pr, clear),
@@ -357,6 +379,7 @@ registerPanel('issues', {
 
     let snaps: ForgeSnapshot[] = [];
     let emps: Linked[] = [];
+    let paused = new Set<string>(); // paused project ids
     let rows: (Row & { s: ForgeSnapshot; i: Issue })[] = [];
     let focusKey = '';
     let dragKey = '';
@@ -370,7 +393,7 @@ registerPanel('issues', {
     };
 
     function rowEl(r: (typeof rows)[number]): HTMLElement {
-      const li = issueRow(r.s, r.i, emps, all);
+      const li = issueRow(r.s, r.i, emps, all, paused);
       li.dataset.key = r.key;
       li.tabIndex = 0;
       li.draggable = true;
@@ -428,7 +451,8 @@ registerPanel('issues', {
       const ul = (rs: typeof rows) => h('ul', { className: 'iss-list' }, ...rs.map(rowEl));
       list.replaceChildren(...(v.group === 'none' ? (groups[0] ? [ul(groups[0].rows as typeof rows)] : []) : groups.map((g) => {
         const d = h('details', { className: 'iss-group', open: !v.collapsed.includes(g.name) },
-          h('summary', { className: 'iss-group-head' }, h('span', { className: 'legend', textContent: g.name }), h('span', { className: 'iss-count', textContent: String(g.rows.length) })),
+          h('summary', { className: 'iss-group-head' }, v.group === 'status' ? (g.name === 'none' ? h('span', { className: 'legend', textContent: 'No employee' }) : led(g.name === 'paused' ? 'interrupted' : g.name, stateName(g.name)))
+            : h('span', { className: 'legend', textContent: g.name }), h('span', { className: 'iss-count', textContent: String(g.rows.length) })),
           ul(g.rows as typeof rows));
         d.dataset.group = g.name;
         d.ontoggle = () => { v = { ...v, collapsed: d.open ? v.collapsed.filter((x) => x !== g.name) : [...new Set([...v.collapsed, g.name])] }; save(); };
@@ -441,7 +465,8 @@ registerPanel('issues', {
         : v.who === 'me' && snaps.some((s) => !s.me) ? 'No issues match. "Assigned to me" needs a token, so MyIDE knows who you are.'
         : 'No issues match these filters.';
       // A redraw replaces the rows and chips; keep focus where it was.
-      const again = focusKey ? list.querySelector<HTMLElement>(`[data-key="${CSS.escape(focusKey)}"]`)
+      const k = focusKey || (was && list.contains(was) ? was.closest<HTMLElement>('.iss-row')?.dataset.key : '');
+      const again = k ? list.querySelector<HTMLElement>(`[data-key="${CSS.escape(k)}"]`)
         : was?.dataset.label ? labelBox.querySelector<HTMLElement>(`[data-label="${CSS.escape(was.dataset.label)}"]`) : null;
       again?.focus();
       focusKey = '';
@@ -450,9 +475,9 @@ registerPanel('issues', {
     let seq = 0;
     async function draw(): Promise<void> {
       const n = ++seq;
-      const [s, e] = await Promise.all([api.forge.issues(all ? undefined : scope || '-'), api.employees.list() as Promise<Linked[]>]);
+      const s = await api.forge.issues(all ? undefined : scope || '-');
       if (n !== seq) return;
-      snaps = s; emps = e;
+      snaps = s;
       void drawFound(snaps);
 
       head.replaceChildren(h('dl', { className: 'forges' }, ...snaps.map((s) => {
@@ -477,19 +502,29 @@ registerPanel('issues', {
       drafts.hidden = !allDrafts.length;
       drafts.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · drafted issues · ${allDrafts.length}` }), ...allDrafts);
 
+      rebuild();
+    }
+    /** Rows from the last fetch and the live employees; an employee change lands here without asking the forge. */
+    function rebuild(): void {
       rows = snaps.flatMap((s) => s.issues.map((i) => {
         const e = holder(emps, s, i.number);
         return { s, i, key: all ? `${s.projectId}#${i.number}` : String(i.number), number: i.number, title: i.title, body: i.body, labels: i.labels,
           state: i.state, assignees: i.assignees, updatedAt: i.updatedAt, createdAt: i.createdAt ?? '', comments: i.comments ?? 0,
-          me: s.me, employee: e?.name, pr: !!s.prs[String(i.number)] };
+          me: s.me, employee: e?.name, status: e && statusOf(e, paused), pr: !!s.prs[String(i.number)] };
       }));
       render();
     }
 
     const refresh = () => void api.forge.refresh(all ? undefined : scope || '-');
     el.addEventListener('focusin', refresh);
-    const offs = [api.forge.onChange(() => void draw()), api.employees.onChange(() => void draw())];
-    void (scope ? api.forge.view(scope).catch(() => null) : Promise.resolve(null)).then((saved) => { v = viewOf(saved); void draw(); });
+    const pausedOf = (o: OrgState) => new Set(o.projects.filter((p) => p.paused).map((p) => p.id));
+    const offs = [api.forge.onChange(() => void draw()),
+      api.employees.onChange((e) => { emps = [...emps.filter((x) => x.id !== e.id), e]; rebuild(); }),
+      api.employees.onRemoved((id) => { emps = emps.filter((x) => x.id !== id); rebuild(); }),
+      api.org.onChange((o) => { paused = pausedOf(o); rebuild(); })];
+    void Promise.all([scope ? api.forge.view(scope).catch(() => null) : null, api.employees.list(), api.org.get().catch(() => null)]).then(([saved, e, o]) => {
+      v = viewOf(saved); emps = e; if (o) paused = pausedOf(o); void draw();
+    });
     refresh();
     return { onShow: refresh, dispose: () => { clearTimeout(saveTimer); if (scope) void api.forge.setView(scope, v).catch(() => {}); offs.forEach((off) => off()); el.removeEventListener('focusin', refresh); } };
   },

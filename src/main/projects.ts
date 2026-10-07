@@ -3,11 +3,14 @@ import { randomUUID } from 'node:crypto';
 import { statSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { basename, resolve, sep } from 'node:path';
-import { dropProjectLayout } from './layouts';
+import { dropProjectLayout, loadLayouts } from './layouts';
+import { killPty } from './pty';
+import { sameIds, setClosed } from './tabs';
 import type { Prefs } from './prefs';
 import { readJSON, writeJSON } from './store';
 
-export interface Project { id: string; name: string; path: string; colour: string }
+/** `closed`: when its tab was closed (the project, its layout and its employees stay). */
+export interface Project { id: string; name: string; path: string; colour: string; closed?: number }
 
 // Page colours handed out in order to new projects; amber is the live colour, so it is never one.
 export const PALETTE = ['#ff7eb6', '#3cd2da', '#b590ff', '#7fd96c', '#62a8ff', '#ff9b6b', '#e2df6a', '#c7a0ff', '#4fd1a5'];
@@ -80,6 +83,23 @@ export function registerProjectIpc(onChange: () => void): void {
   ipcMain.handle('projects:reveal', (_e, id: string) => {
     const p = projectById(id);
     if (p) shell.showItemInFolder(p.path);
+  });
+  // The array order is the tab order.
+  ipcMain.handle('projects:reorder', (_e, ids: unknown) => {
+    const projects = listProjects();
+    if (!sameIds(projects, ids)) throw new Error('Not a reordering of the projects');
+    saveProjects(ids.map((id) => projects.find((p) => p.id === id)!));
+    onChange();
+  });
+  // Closing a tab ends its terminals (the renderer has confirmed); its saved layout reopens them as fresh shells.
+  ipcMain.handle('projects:set-closed', (_e, id: string, closed: boolean) => {
+    if (!projectById(id)) throw new Error('No such project');
+    if (closed) {
+      const panels = (loadLayouts().perProject[id] as { panels?: Record<string, { contentComponent?: string }> } | undefined)?.panels ?? {};
+      for (const [panel, p] of Object.entries(panels)) if (p.contentComponent === 'terminal') killPty(panel);
+    }
+    saveProjects(setClosed(listProjects(), id, !!closed));
+    onChange();
   });
   ipcMain.handle('projects:remove', async (e, id: string) => {
     const project = projectById(id);

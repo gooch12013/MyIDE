@@ -1,6 +1,8 @@
 import type { DockviewApi, SerializedDockview } from 'dockview-core';
 import type { Project } from '../main/projects';
-import { activeProject, allProjects, loadProjects, setActiveProject } from './projects';
+import { lastClosed, neighbour } from '../main/tabs';
+import { h } from './dom';
+import { activeProject, allProjects, loadProjects, openProjects, setActiveProject } from './projects';
 import { openPanel, panelTypes, park } from './registry';
 
 const api = window.myide;
@@ -74,7 +76,7 @@ function switchTo(p: Project | null, keepOld = true): void {
   if (keepOld) save(true);
   setActiveProject(p);
   // Parking keeps the old project's shells running for when it comes back.
-  const show = () => restore(perProject[p?.id ?? '']);
+  const show = () => (p ? restore(perProject[p.id]) : dock.clear()); // no tab open: the empty state
   if (keepOld) park(show); else show();
   sync();
 }
@@ -92,9 +94,41 @@ export async function removeProject(p = activeProject()): Promise<void> {
   const wasActive = p.id === projectKey();
   if (!(await api.projects.remove(p.id))) return; // main also ends a parked project's shells
   delete perProject[p.id];
-  const rest = await loadProjects();
-  if (wasActive) switchTo(rest[0] ?? null, false); // ends the removed project's shells
+  await loadProjects();
+  if (wasActive) switchTo(openProjects()[0] ?? null, false); // ends the removed project's shells
   else sync();
+}
+
+const terminalIds = (layout: unknown): string[] =>
+  Object.entries((layout as SerializedDockview | undefined)?.panels ?? {}).filter(([, p]) => p.contentComponent === 'terminal').map(([id]) => id);
+
+/** Closes a project's tab: its layout is kept and its terminals end (after the running-process check);
+ *  its employees keep working. Closing the shown tab shows its neighbour, or the empty state. */
+export async function closeProject(p = activeProject()): Promise<boolean> {
+  if (!p || p.closed) return false;
+  const shown = p.id === projectKey();
+  if (!(await (shown ? okToClose() : api.pty.confirmKill(terminalIds(perProject[p.id]))))) return false;
+  if (shown) save(true);
+  const next = neighbour(allProjects(), p.id);
+  await api.projects.setClosed(p.id, true); // main ends the terminals in its saved layout
+  await loadProjects();
+  if (shown) switchTo(next, false);
+  else sync();
+  return true;
+}
+
+/** Reopens a closed tab (or shows an open one) with its saved layout. */
+async function showProject(id?: string): Promise<void> {
+  const p = allProjects().find((x) => x.id === id);
+  if (!p) return;
+  if (p.closed) { await api.projects.setClosed(p.id, false); await loadProjects(); }
+  if (p.id !== projectKey()) switchTo(allProjects().find((x) => x.id === p.id)!);
+  else sync();
+}
+
+async function closeOthers(id: string): Promise<void> {
+  for (const p of openProjects()) if (p.id !== id && !(await closeProject(p))) return;
+  if (id !== projectKey()) await showProject(id);
 }
 
 /** Forgets a project's saved layout; the active project goes back to the default layout now. */
@@ -144,18 +178,40 @@ function sync(): void {
   const state = { active: activeProject()?.id ?? null, panels: panelTypes().map((t) => ({ ...t, open: open.has(t.id) })) };
   const json = JSON.stringify(state);
   if (json !== lastMenu) { lastMenu = json; api.menuState(state); }
-  const empty = !allProjects().length && !dock.panels.length;
+  const empty = !openProjects().length && !dock.panels.length;
   document.getElementById('empty-state')!.hidden = !empty;
+  if (empty) emptyState();
   document.getElementById('dock')!.hidden = empty;
+}
+
+/** No tab open: closed projects are listed to open again. */
+function emptyState(): void {
+  const closed = allProjects().filter((p) => p.closed);
+  const list = document.getElementById('empty-closed')!;
+  document.getElementById('empty-title')!.textContent = closed.length ? 'Open a project' : 'No projects yet';
+  document.getElementById('empty-text')!.hidden = closed.length > 0;
+  list.replaceChildren(...closed.map((p) => {
+    const b = h('button', { type: 'button', className: 'key proj-key', title: p.path, onclick: () => void showProject(p.id) }, h('span', { className: 'proj-name', textContent: p.name }));
+    b.style.setProperty('--proj', p.colour);
+    return b;
+  }));
+  list.hidden = !closed.length;
 }
 
 const commands: Record<string, (arg: string) => void> = {
   'add-project': () => void addProject(),
-  'remove-project': () => void removeProject(),
+  'remove-project': (id) => void removeProject(allProjects().find((p) => p.id === id)),
+  'close-project': (id) => void closeProject(allProjects().find((p) => p.id === id)),
+  'close-others': (id) => void closeOthers(id),
+  'reopen-project': () => void showProject(lastClosed(allProjects())?.id),
+  'project-settings': () => {
+    if (window.dispatchEvent(new CustomEvent('myide:prefs-section', { detail: 'projects', cancelable: true }))) openPanel('preferences', { section: 'projects' });
+  },
   'save-layout': () => void saveNamed(),
   'close-tab': () => void closeTab(),
   'open-preferences': () => showPanel('preferences'),
-  project: (n) => { const p = allProjects()[Number(n) - 1]; if (p && p.id !== projectKey()) switchTo(p); },
+  // ⌘1..9 (sent by main, 'project:3') follow the open tabs; the Projects menu sends an id.
+  project: (arg) => void showProject(/^[1-9]$/.test(arg) ? openProjects()[Number(arg) - 1]?.id : arg),
   preset: (name) => void okToClose().then((ok) => ok && preset(name)),
   layout: (name) => void restoreNamed(name),
   panel: showPanel,
@@ -168,8 +224,9 @@ export async function startWorkspace(d: DockviewApi): Promise<void> {
   const [projects, file, { prefs }] = await Promise.all([loadProjects(), api.layouts.get(), api.prefs.get()]);
   perProject = file.perProject;
   // With "restore at launch" off, start on the first project with the default layout.
-  const last = (prefs.restoreLast && projects.find((p) => p.id === file.last?.project)) || projects[0] || null;
-  setActiveProject(last, { pick: (p) => { if (p.id !== projectKey()) switchTo(p); }, add: () => void addProject() });
+  const open = projects.filter((p) => !p.closed);
+  const last = (prefs.restoreLast && open.find((p) => p.id === file.last?.project)) || open[0] || null;
+  setActiveProject(last, { pick: (p) => { if (p.id !== projectKey()) switchTo(p); }, add: () => void addProject(), close: (p) => void closeProject(p) });
   document.getElementById('empty-add')!.onclick = () => void addProject();
   if (last) restore(prefs.restoreLast ? perProject[last.id] : null); // no project: the empty state, not a terminal in ~
   if (last && !prefs.restoreLast) pristine = panelIds();

@@ -2,23 +2,25 @@
 // scripts/check-issue-view.mjs can test them without a DOM. Saved per project as issues-view.json.
 
 export type Sort = 'updated' | 'created' | 'number' | 'title' | 'comments' | 'custom';
-export type Group = 'none' | 'label' | 'state' | 'employee';
+export type Group = 'none' | 'label' | 'state' | 'employee' | 'status';
+/** The issue's employee status, most urgent first: the employee filter and the status groups use this order. */
+export const STATUSES = ['needs-you', 'failed', 'interrupted', 'paused', 'working', 'talking', 'queued', 'done', 'idle'] as const;
 export interface View {
   q: string; state: 'open' | 'closed' | 'all'; labels: string[];
   who: string; // '' anyone, 'me', 'none' (unassigned), or a login
-  emp: '' | 'yes' | 'no'; pr: '' | 'yes' | 'no';
+  emp: '' | 'yes' | 'no' | (typeof STATUSES)[number]; pr: '' | 'yes' | 'no';
   sort: Sort; desc: boolean; group: Group;
   order: string[]; // custom order, by row key (the issue number; "project#number" in the all-projects view)
   collapsed: string[]; // collapsed group names
 }
 export interface Row {
   key: string; number: number; title: string; body: string; labels: string[]; state: string; assignees: string[];
-  updatedAt: string; createdAt: string; comments: number; me?: string; employee?: string; pr: boolean;
+  updatedAt: string; createdAt: string; comments: number; me?: string; employee?: string; status?: string; pr: boolean;
 }
 
 export const DEFAULT_VIEW: View = { q: '', state: 'open', labels: [], who: '', emp: '', pr: '', sort: 'updated', desc: true, group: 'none', order: [], collapsed: [] };
 export const SORTS: Sort[] = ['updated', 'created', 'number', 'title', 'comments', 'custom'];
-export const GROUPS: Group[] = ['none', 'label', 'state', 'employee'];
+export const GROUPS: Group[] = ['none', 'label', 'state', 'employee', 'status'];
 
 const pick = <T>(v: unknown, ok: readonly T[], d: T): T => (ok.includes(v as T) ? (v as T) : d);
 const strs = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []);
@@ -31,7 +33,7 @@ export function viewOf(raw: unknown): View {
     q: typeof r.q === 'string' ? r.q : d.q,
     state: pick(r.state, ['open', 'closed', 'all'] as const, d.state),
     labels: strs(r.labels), who: typeof r.who === 'string' ? r.who : d.who,
-    emp: pick(r.emp, ['', 'yes', 'no'] as const, d.emp), pr: pick(r.pr, ['', 'yes', 'no'] as const, d.pr),
+    emp: pick(r.emp, ['', 'yes', 'no', ...STATUSES] as const, d.emp), pr: pick(r.pr, ['', 'yes', 'no'] as const, d.pr),
     sort: pick(r.sort, SORTS, d.sort), desc: typeof r.desc === 'boolean' ? r.desc : d.desc,
     group: pick(r.group, GROUPS, d.group), order: strs(r.order), collapsed: strs(r.collapsed),
   };
@@ -42,7 +44,7 @@ export function matches(v: View, r: Row): boolean {
   return (v.state === 'all' || r.state === v.state)
     && v.labels.every((l) => r.labels.includes(l))
     && (!v.who || (v.who === 'me' ? !!r.me && r.assignees.includes(r.me) : v.who === 'none' ? !r.assignees.length : r.assignees.includes(v.who)))
-    && (!v.emp || (v.emp === 'yes') === !!r.employee)
+    && (!v.emp || (v.emp === 'yes' || v.emp === 'no' ? (v.emp === 'yes') === !!r.employee : r.status === v.emp))
     && (!v.pr || (v.pr === 'yes') === r.pr)
     && (!q || String(r.number) === q || [r.title, r.body, ...r.labels].some((t) => t.toLowerCase().includes(q)));
 }
@@ -85,7 +87,7 @@ export function arrange(v: View, rows: Row[]): Row[] {
 
 // ponytail: an issue with several labels groups under its first one; show it in every label group if that is wanted.
 const groupName = (g: Group, r: Row): string =>
-  g === 'label' ? r.labels[0] ?? 'No label' : g === 'state' ? r.state : g === 'employee' ? r.employee ?? 'No employee' : '';
+  g === 'label' ? r.labels[0] ?? 'No label' : g === 'state' ? r.state : g === 'employee' ? r.employee ?? 'No employee' : g === 'status' ? r.status ?? 'none' : '';
 
 /** Arranged rows split into groups, in order of first appearance (rows keep their arranged order inside each). */
 export function grouped(v: View, rows: Row[]): { name: string; rows: Row[] }[] {
@@ -94,5 +96,7 @@ export function grouped(v: View, rows: Row[]): { name: string; rows: Row[] }[] {
     const n = groupName(v.group, r);
     out.set(n, [...(out.get(n) ?? []), r]);
   }
-  return [...out].map(([name, rows]) => ({ name, rows }));
+  const gs = [...out].map(([name, rows]) => ({ name, rows }));
+  const rank = (n: string) => (STATUSES as readonly string[]).indexOf(n) >>> 0; // 'none' last
+  return v.group === 'status' ? gs.sort((a, b) => rank(a.name) - rank(b.name)) : gs;
 }

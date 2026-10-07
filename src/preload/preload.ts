@@ -63,6 +63,11 @@ const api = {
     add: (): Promise<Project | null> => ipcRenderer.invoke('projects:add'),
     /** Asks for confirmation; resolves true if the project was removed. */
     remove: (id: string): Promise<boolean> => ipcRenderer.invoke('projects:remove', id),
+    /** Tab order: every project id, closed ones included. */
+    reorder: (ids: string[]): Promise<void> => ipcRenderer.invoke('projects:reorder', ids),
+    setClosed: (id: string, closed: boolean): Promise<void> => ipcRenderer.invoke('projects:set-closed', id, closed),
+    /** The project key's context menu; its picks come back as commands. */
+    menu: (id: string): void => ipcRenderer.send('projects:menu', id),
   },
   layouts: {
     get: (): Promise<LayoutsFile> => ipcRenderer.invoke('layouts:get'),
