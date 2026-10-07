@@ -758,3 +758,9 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .mac-line > summary { list-style: none; cursor: pointer; }
 .mac-line > summary::-webkit-details-marker { display: none; }
 .mac-line .o-list { padding: 4px 0 2px 12px; }
+
+/* ---- Voice & read-back engine pickers (speech.ts) ---- */
+.sp-opt { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 4px; padding-top: 6px; padding-bottom: 6px; }
+.sp-opt .led { font-size: var(--fs-2xs); }
+.seg input:checked + .sp-opt .led { color: var(--accent-ink); }
+.comp-tbl tbody tr.comp-hit :is(th, td) { box-shadow: inset 0 1px 0 var(--accent), inset 0 -1px 0 var(--accent); }

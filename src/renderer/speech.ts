@@ -1,14 +1,14 @@
 import type { Row } from '../main/components';
-import type { SpeechStatus } from '../main/speech';
+import type { Engine, SpeechOptions, SpeechStatus, Voice } from '../main/speech';
 import { errText, h, key } from './dom';
 import { openPanel } from './registry';
 
-// Read-back and dictation for any panel: speakButton(textFn) reads a summary aloud through macOS
-// `say` (hidden while read-back is off); micButton(input) records, transcribes with the installed
+// Read-back and dictation for any panel: speakButton(textFn) reads a summary aloud in the chosen
+// engine (hidden while read-back is off); micButton(input) records, transcribes with the installed
 // whisper-cli and inserts the text (hidden until Local Whisper and a model are installed).
 
 const api = window.myide;
-let status: SpeechStatus = { on: false, voice: '', rate: 0, dictation: false };
+let status: SpeechStatus = { on: false, engine: 'say', voice: '', rate: 0, dictation: false, dictate: { engine: 'macos', model: '' } };
 
 // Buttons can sit in pop-out windows, so they are tracked here rather than styled by a body class.
 const speakers = new Set<WeakRef<HTMLButtonElement>>();
@@ -21,10 +21,11 @@ function sync(): void {
     }
   }
 }
+let redraw: (() => void) | null = null; // the open Voice & read-back section, if any
 const refetch = () => void api.speech.get().then((s) => { status = s; sync(); });
 refetch();
-api.speech.onChange((s) => { status = s; sync(); });
-api.components.onChange(refetch); // dictation needs Local Whisper and a model
+api.speech.onChange((s) => { status = s; sync(); redraw?.(); });
+api.components.onChange(() => { refetch(); redraw?.(); }); // engines and dictation depend on components
 
 const ICON = {
   speaker: '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>',
@@ -42,8 +43,8 @@ let active: HTMLButtonElement | null = null;
 const idle = (b: HTMLButtonElement) => { icon(b, 'speaker', b.dataset.label!); b.classList.remove('key--lit'); };
 api.speech.onSpeaking((on) => { if (!on && active) { idle(active); active = null; } });
 
-/** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice). */
-export function speakButton(textFn: () => string, label = 'Read aloud', force = false): HTMLButtonElement {
+/** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice); `onNote` gets any fallback note. */
+export function speakButton(textFn: () => string, label = 'Read aloud', force = false, onNote?: (note: string) => void): HTMLButtonElement {
   const b = key('', null, { className: 'key key--sm sp-key' });
   b.dataset.label = label;
   idle(b);
@@ -53,7 +54,7 @@ export function speakButton(textFn: () => string, label = 'Read aloud', force = 
     active = b;
     icon(b, 'stop', 'Stop reading');
     b.classList.add('key--lit');
-    try { await api.speech.speak(textFn(), force); } finally { if (active === b) { idle(b); active = null; } }
+    try { const note = await api.speech.speak(textFn(), force); onNote?.(note); } finally { if (active === b) { idle(b); active = null; } }
   };
   if (!force) { b.hidden = !status.on; speakers.add(new WeakRef(b)); }
   return b;
@@ -126,8 +127,10 @@ export function micButton(input: HTMLInputElement | HTMLTextAreaElement, onError
   return b;
 }
 
-/** Shows the Components section of Preferences, opening Preferences if needed. */
-export function openComponents(): void {
+let focusComp = '';
+/** Shows the Components section of Preferences (scrolled to component `id`), opening Preferences if needed. */
+export function openComponents(id = ''): void {
+  focusComp = id;
   if (window.dispatchEvent(new CustomEvent('myide:prefs-section', { detail: 'components', cancelable: true }))) openPanel('preferences', { section: 'components' });
 }
 
@@ -144,40 +147,148 @@ function pref(name: string, hint: string, ...ctl: Node[]): HTMLElement {
     h('div', { className: 'pref-ctl' }, ...ctl));
 }
 
+let segN = 0;
+/** Radio keys, each with an LED and its label under the name; the checked one is lit. */
+function seg(label: string, items: { id: string; name: string; led: [string, string] }[], value: string, onpick: (id: string) => void): HTMLFieldSetElement {
+  const name = `sp-seg-${++segN}`;
+  const el = h('fieldset', { className: 'seg sp-seg' });
+  el.setAttribute('aria-label', label);
+  for (const it of items) {
+    const id = `${label.replace(/\W/g, '')}-${it.id.replace(/\W/g, '_')}`; // stable, so focus survives a redraw
+    const led = h('span', { className: 'led', textContent: it.led[1] });
+    led.dataset.state = it.led[0];
+    el.append(h('input', { type: 'radio', name, id, value: it.id, checked: it.id === value, onchange: () => onpick(it.id) }),
+      h('label', { className: 'key key--sm sp-opt', htmlFor: id }, h('span', { textContent: it.name }), led));
+  }
+  return el;
+}
+
+const LANG = new Intl.DisplayNames(['en'], { type: 'language' });
+const langName = (l: string) => { try { return l ? LANG.of(l.replace('_', '-')) ?? l : 'Cloned voices'; } catch { return l; } };
+/** Voices grouped by language, English first. */
+function voiceGroups(voices: Voice[]): HTMLOptGroupElement[] {
+  const by = new Map<string, Voice[]>();
+  for (const v of voices) { const g = langName(v.lang); by.set(g, [...(by.get(g) ?? []), v]); }
+  const en = (g: string) => (/English/.test(g) ? 0 : g === 'Cloned voices' ? 2 : 1);
+  return [...by].sort(([a], [b]) => en(a) - en(b) || a.localeCompare(b))
+    .map(([g, vs]) => h('optgroup', { label: g }, ...vs.map((v) => new Option(v.label, v.id))));
+}
+
+const engineLed = (e: Engine): [string, string] => e.state === 'builtin' ? ['working', 'Built in'] : e.state === 'missing' ? ['idle', 'Not installed']
+  : !e.helper ? ['queued', 'No helper yet'] : ['working', e.state === 'existing' ? 'Using existing' : 'Installed'];
+
+// Picked in the UI but not installed: read-back (or dictation) keeps its working engine and switches when this is ready.
+let pendingEngine = '', pendingDictate = '';
+
 /** Preferences > Voice & read-back. */
 export async function voiceSection(say: (t: string) => void): Promise<Node[]> {
-  const [s, voices] = await Promise.all([api.speech.get(), api.speech.voices()]);
-  const set = async (patch: Partial<SpeechStatus>) => { try { status = await api.speech.set(patch); sync(); } catch (e) { say(errText(e)); } };
+  const wrap = h('div', { className: 'sp-voice' });
+  let opts: SpeechOptions, seq = 0;
+  const set = async (patch: Parameters<typeof api.speech.set>[0]) => {
+    try { status = await api.speech.set(patch); sync(); return true; } catch (e) { say(errText(e)); return false; } finally { void draw(); }
+  };
+  const draw = async () => {
+    const n = ++seq;
+    const [o, st] = await Promise.all([api.speech.options(), api.speech.get()]);
+    if (n !== seq) return; // a newer draw is on its way
+    opts = o; status = st;
+    // An engine that just became ready takes over from the one that was holding its place.
+    if (pendingEngine && pendingEngine !== status.engine && opts.engines.find((e) => e.id === pendingEngine)?.state !== 'missing') {
+      const id = pendingEngine;
+      pendingEngine = '';
+      if (await set({ engine: id })) return; // set redraws
+    }
+    if (pendingDictate === 'whisper' && opts.whisper !== 'missing' && opts.models.length) {
+      pendingDictate = '';
+      if (await set({ dictate: { engine: 'whisper' } })) return;
+    }
+    const focused = document.activeElement?.id;
+    wrap.replaceChildren(...build());
+    if (focused) (wrap.querySelector(`#${CSS.escape(focused)}`) as HTMLElement | null)?.focus();
+  };
+  redraw = () => { if (wrap.isConnected) void draw(); };
 
-  const on = field({ type: 'checkbox', className: 'switch', checked: s.on });
-  on.onchange = () => void set({ on: on.checked });
+  function build(): Node[] {
+    const s = status;
+    const on = field({ type: 'checkbox', className: 'switch', checked: s.on });
+    on.onchange = () => void set({ on: on.checked });
 
-  const voice = h('select', { className: 'input select' }, new Option('System voice', ''),
-    ...voices.map((v) => new Option(`${v.name} (${v.lang})`, v.name, false, v.name === s.voice)));
-  voice.setAttribute('aria-label', 'Voice');
-  voice.onchange = () => void set({ voice: voice.value });
+    // ---- read-back engine and its voices ----
+    const chosen = opts.engines.find((e) => e.id === (pendingEngine || s.engine)) ?? opts.engines[0];
+    const active = opts.engines.find((e) => e.id === s.engine)!;
+    const engines = seg('Read-back engine', opts.engines.map((e) => ({ id: e.id, name: e.name, led: engineLed(e) })), chosen.id, async (id) => {
+      const e = opts.engines.find((x) => x.id === id)!;
+      pendingEngine = e.state === 'missing' ? id : '';
+      if (e.state !== 'missing' && id !== s.engine) await set({ engine: id }); else void draw();
+    });
+    const engineNote: Node[] = [];
+    if (chosen.state === 'missing') {
+      engineNote.push(h('p', { className: 'sp-need' }, `${chosen.name} is not installed. Read-back keeps using ${active.name} until it is ready.`,
+        key(`Install ${chosen.name}`, chosen.canInstall
+          ? async () => { say(`Downloading ${chosen.name}…`); try { await api.components.install(chosen.id); say(`${chosen.name} installed.`); } catch (e) { say(errText(e)); } }
+          : () => openComponents(chosen.id))));
+    } else if (!chosen.helper) {
+      const led = h('span', { className: 'led', textContent: 'Installed, voice helper not built yet' });
+      led.dataset.state = 'queued';
+      engineNote.push(h('p', { className: 'sp-need' }, led, 'Until it is, read-back and Test voice use the macOS system voice.'));
+    }
 
-  const rate = field({ type: 'range', min: '120', max: '320', step: '10', value: String(s.rate || 180), className: 'range' });
-  rate.setAttribute('aria-label', 'Speed in words per minute');
-  const out = h('output', { className: 'pref-value', value: s.rate ? `${s.rate} wpm` : 'System' });
-  rate.oninput = () => { out.value = `${rate.value} wpm`; };
-  rate.onchange = () => void set({ rate: Number(rate.value) });
-  const sysRate = key('System speed', () => { rate.value = '180'; out.value = 'System'; void set({ rate: 0 }); });
+    const voice = h('select', { className: 'input select', disabled: chosen.id !== s.engine },
+      ...(chosen.id === 'say' ? [new Option('System voice', '')] : []), ...voiceGroups(chosen.voices));
+    voice.value = chosen.id === s.engine ? s.voice : chosen.voices[0]?.id ?? '';
+    voice.setAttribute('aria-label', `${chosen.name} voice`);
+    voice.onchange = () => void set({ voice: voice.value });
+    const voiceHint = chosen.id === 'say' ? 'Any voice from System Settings > Accessibility > Spoken Content.'
+      : chosen.id === s.engine ? `${chosen.voices.length} voices.` : `${chosen.name}'s voices, available once it is installed.`;
 
-  const sample = 'MyIDE will read summaries like this one. Engineer one needs approval to merge.';
-  const box = h('textarea', { className: 'input grow', rows: 2, placeholder: 'Dictated text appears here' });
-  box.setAttribute('aria-label', 'Dictation test');
-  return [
-    h('p', { className: 'psec-lede', textContent: 'Speech runs on this Mac. Read-back uses macOS voices; nothing needs installing. Only summaries are read, never code.' }),
-    pref('Read aloud', 'Off by default. On shows a speaker key on summaries.', h('label', { className: 'toggle' }, on, 'Read-back')),
-    pref('Voice', 'Any voice from System Settings > Accessibility > Spoken Content.', voice),
-    pref('Speed', '', rate, out, sysRate),
-    pref('Test voice', 'Plays even while read-back is off.', speakButton(() => sample, 'Test voice', true)),
-    s.dictation
-      ? pref('Dictation', 'Mic keys in text boxes record and transcribe with Local Whisper. macOS dictation (press Fn twice) works everywhere too.', box, micButton(box, say))
-      : pref('Dictation', 'macOS dictation (press Fn twice) works in every text box. Local Whisper adds mic keys that transcribe on this Mac.', needsComponent('Local Whisper')),
-    pref('Other voices', 'Kokoro and Qwen3-TTS voices are coming. Until then read-back uses macOS voices.', key('Optional components', openComponents)),
-  ];
+    const rate = field({ type: 'range', min: '120', max: '320', step: '10', value: String(s.rate || 180), className: 'range' });
+    rate.setAttribute('aria-label', 'Speed in words per minute');
+    const out = h('output', { className: 'pref-value', value: s.rate ? `${s.rate} wpm` : 'System' });
+    rate.oninput = () => { out.value = `${rate.value} wpm`; };
+    rate.onchange = () => void set({ rate: Number(rate.value) });
+    const sysRate = key('System speed', () => { rate.value = '180'; out.value = 'System'; void set({ rate: 0 }); });
+
+    // ---- dictation engine and its model ----
+    const dChosen = pendingDictate || s.dictate.engine;
+    const wLed: [string, string] = opts.whisper === 'missing' ? ['idle', 'Not installed'] : !opts.models.length ? ['queued', 'No model'] : ['working', opts.whisper === 'existing' ? 'Using existing' : 'Installed'];
+    const dict = seg('Dictation engine', [{ id: 'macos', name: 'macOS dictation', led: ['working', 'Built in'] }, { id: 'whisper', name: 'Local Whisper', led: wLed }], dChosen, async (id) => {
+      const ready = id === 'macos' || (opts.whisper !== 'missing' && opts.models.length > 0);
+      pendingDictate = ready ? '' : id;
+      if (ready && id !== s.dictate.engine) await set({ dictate: { engine: id as 'macos' | 'whisper' } }); else void draw();
+    });
+    const dictRows: Node[] = [];
+    if (dChosen === 'whisper' && s.dictate.engine !== 'whisper') {
+      const need = opts.whisper === 'missing' ? ['Local Whisper', 'whisper'] : ['a Whisper model', 'whisper-model'];
+      dictRows.push(h('p', { className: 'sp-need' }, `Install ${need[0]} to use it. Dictation keeps using macOS dictation until then.`, key(`Install ${need[0].replace(/^a /, '')}`, () => openComponents(need[1]))));
+    }
+    if (s.dictate.engine === 'whisper') {
+      const model = h('select', { className: 'input select' }, ...opts.models.map((m) => new Option(m.label, m.path)));
+      model.value = s.dictate.model;
+      model.title = s.dictate.model;
+      model.setAttribute('aria-label', 'Whisper model');
+      model.onchange = () => void set({ dictate: { model: model.value } });
+      const box = h('textarea', { className: 'input grow', rows: 2, placeholder: 'Dictated text appears here' });
+      box.setAttribute('aria-label', 'Dictation test');
+      dictRows.push(pref('Model', 'Whisper models installed on this Mac.', model), pref('Try it', 'Mic keys in text boxes record and transcribe on this Mac.', box, micButton(box, say)));
+    }
+
+    const sample = 'MyIDE will read summaries like this one. Engineer one needs approval to merge.';
+    return [
+      h('p', { className: 'psec-lede', textContent: 'Speech runs on this Mac. macOS voices and macOS dictation are built in; other engines are optional components. Only summaries are read, never code.' }),
+      pref('Read aloud', 'Off by default. On shows a speaker key on summaries.', h('label', { className: 'toggle' }, on, 'Read-back')),
+      h('h3', { className: 'legend psec-sub', textContent: 'Read-back' }),
+      pref('Engine', `In use: ${active.name}.`, engines, ...engineNote),
+      pref('Voice', voiceHint, voice),
+      pref('Speed', '', rate, out, sysRate),
+      pref('Test voice', `Plays a sample in ${active.name}${chosen.id === s.engine && s.voice ? `, ${chosen.voices.find((v) => v.id === s.voice)?.label ?? s.voice}` : ''}, even while read-back is off.`,
+        speakButton(() => sample, 'Test voice', true, (note) => say(note))),
+      h('h3', { className: 'legend psec-sub', textContent: 'Dictation' }),
+      pref('Engine', 'macOS dictation (press Fn twice) works in every text box. Local Whisper adds mic keys that transcribe on this Mac.', dict),
+      ...dictRows,
+    ];
+  }
+  await draw();
+  return [wrap];
 }
 
 const mb = (n?: number) => (n === undefined ? '' : n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : `${Math.max(1, Math.round(n / 1e6))} MB`);
@@ -231,18 +342,23 @@ async function table(wrap: HTMLElement, say: (t: string) => void): Promise<void>
       }));
     }
     const notes = [r.note, r.advanced, r.sizeNote].filter(Boolean).join(' ');
-    return h('tr', {},
-      h('th', { scope: 'row' }, r.name, h('span', { className: 'acct-sub', textContent: r.kind }), where),
+    const tr = h('tr', {},
+      h('th', { scope: 'row' }, r.name, h('span', { className: 'acct-sub', textContent: r.kind === 'tts' ? 'read-back voices' : r.kind }), where),
       td('Adds', r.adds, ...(notes ? [h('span', { className: 'acct-sub comp-note', textContent: notes })] : []),
         h('a', { className: 'acct-sub', href: r.licenceUrl, textContent: `Licence: ${r.licence}`, onclick: (e: MouseEvent) => { e.preventDefault(); void api.terminal.openUrl(r.licenceUrl); } })),
       td('Download', r.size ? mb(r.size) : '—', ...(r.disk ? [h('span', { className: 'acct-sub', textContent: `${mb(r.disk)} on disk` })] : [])),
       td('Status', led, prog),
       td('Actions', h('span', { className: 'acct-keys comp-keys' }, ...keys)));
+    tr.dataset.comp = r.id;
+    return tr;
   });
   const tbl = h('table', { className: 'ptbl comp-tbl' },
     h('thead', {}, h('tr', {}, ...['Component', 'What it adds', 'Download', 'Status', ''].map((t) => h('th', { scope: 'col', textContent: t })))),
     h('tbody', {}, ...rows));
   wrap.replaceChildren(tbl);
+  const hit = focusComp && wrap.querySelector<HTMLElement>(`tr[data-comp="${CSS.escape(focusComp)}"]`);
+  focusComp = '';
+  if (hit) { hit.classList.add('comp-hit'); hit.scrollIntoView({ block: 'center' }); }
 }
 
 api.components.onProgress((id, got, total) => {

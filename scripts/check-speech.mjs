@@ -1,5 +1,7 @@
 // Checks src/main/speech.ts and src/main/components.ts: `say -v '?'` parsing, read-back start and
-// stop (written to an AIFF with `say -o`, so nothing plays aloud), the components manifest, detection
+// stop (written to an AIFF with `say -o`, so nothing plays aloud), read-back engines (voice lists per
+// engine, cloned voices, refusing an engine that is not installed, the helper dispatch and its honest
+// fallback to `say`), settings migration, dictation engine and model choice, the components manifest, detection
 // of existing installs, "use existing", dictation through a fake whisper-cli, and one real install
 // and removal of the GitHub CLI (about 14 MB) plus a checksum failure, all in a temp MYIDE_HOME.
 // Usage: node scripts/check-speech.mjs   (add --offline to skip the downloads)
@@ -41,6 +43,8 @@ await build({
   }],
 });
 const { speech, comp } = createRequire(import.meta.url)(out);
+const writeCfg = (c) => writeFileSync(join(home, 'config.json'), JSON.stringify(c));
+const readCfg = () => JSON.parse(readFileSync(join(home, 'config.json'), 'utf8'));
 
 // ---- voices ----
 const voices = speech.parseVoices('Albert              en_US    # Hello! My name is Albert.\nEddy (English (UK)) en_GB    # Hello!\nnoise\n');
@@ -73,6 +77,70 @@ const b = speech.speak('Second.', { out: join(tmp, 'd.aiff') });
 await a; await b;
 assert.equal(speech.speaking(), false);
 assert.equal(speech.settings().on, false, 'read-back is off by default');
+assert.equal(speech.settings().engine, 'say');
+
+// ---- settings migration: the old {on, voice, rate} reads as the macOS engine ----
+writeCfg({ speech: { on: true, voice: 'Albert', rate: 200 } });
+assert.deepEqual(speech.settings(), { on: true, engine: 'say', voice: 'Albert', rate: 200 });
+await speech.update({ rate: 210 });
+assert.deepEqual(readCfg().speech, { on: true, engine: 'say', voice: 'Albert', rate: 210 }, 'a change writes the new shape');
+assert.equal(readCfg().dictation, undefined, 'dictation is stored only once chosen');
+writeCfg({ speech: { on: false, engine: 'nonsense', voice: 'x', rate: 0 } });
+assert.deepEqual(speech.settings(), { on: false, engine: 'say', voice: '', rate: 0 }, 'an unknown engine falls back to say');
+writeCfg({});
+
+// ---- read-back engines: each with its own voices; one that is not installed is refused ----
+let opt = await speech.options();
+assert.deepEqual(opt.engines.map((e) => e.id), ['say', 'kokoro', 'qwen3-tts'], 'say plus every manifest entry of kind tts');
+const eng = (id) => opt.engines.find((e) => e.id === id);
+assert.equal(eng('say').state, 'builtin');
+assert.ok(eng('say').voices.length > 0 && eng('say').voices.every((v) => v.id && v.lang));
+assert.equal(eng('kokoro').state, 'missing');
+assert.equal(eng('kokoro').helper, false);
+assert.equal(eng('kokoro').voices.length, 54);
+for (const id of ['af_heart', 'af_bella', 'am_michael', 'am_adam', 'bf_emma', 'bm_george']) assert.ok(eng('kokoro').voices.some((v) => v.id === id), id);
+assert.deepEqual(eng('qwen3-tts').voices.map((v) => v.id), ['Vivian', 'Serena', 'Uncle_Fu', 'Dylan', 'Eric', 'Ryan', 'Aiden', 'Ono_Anna', 'Sohee']);
+assert.ok(!eng('kokoro').voices.some((v) => eng('qwen3-tts').voices.some((q) => q.id === v.id)), 'lists are per engine');
+await assert.rejects(speech.update({ engine: 'kokoro' }), /Install Kokoro voice first\. Read-back keeps using macOS voices/);
+await assert.rejects(speech.update({ engine: 'espeak' }), /Unknown read-back engine/);
+assert.equal(speech.settings().engine, 'say', 'refused engine leaves read-back on say');
+
+// cloned voices: <component>/voices/*.wav
+mkdirSync(join(comp.COMPONENTS_DIR, 'qwen3-tts', 'voices'), { recursive: true });
+writeFileSync(join(comp.COMPONENTS_DIR, 'qwen3-tts', 'voices', 'David.wav'), 'x');
+writeFileSync(join(comp.COMPONENTS_DIR, 'qwen3-tts', 'voices', 'notes.txt'), 'x');
+assert.deepEqual((await speech.engineVoices('qwen3-tts')).slice(-1), [{ id: 'clone:David', label: 'Cloned: David', lang: '' }]);
+assert.equal((await speech.engineVoices('qwen3-tts')).length, 10);
+
+// an existing Kokoro install: selectable, voices validated per engine, no helper yet -> say with a note
+const hf = join(fakeHome, '.cache', 'huggingface', 'hub', 'models--hexgrad--Kokoro-82M');
+mkdirSync(hf, { recursive: true });
+await comp.useExisting('kokoro', hf);
+opt = await speech.options();
+assert.equal(eng('kokoro').state, 'existing');
+let st = await speech.update({ engine: 'kokoro' });
+assert.equal(st.engine, 'kokoro');
+assert.equal(st.voice, 'af_heart', 'switching engine picks its first voice');
+await assert.rejects(speech.update({ voice: 'Albert' }), /Kokoro voice has no voice Albert/);
+st = await speech.update({ voice: 'bf_emma' });
+assert.equal(st.voice, 'bf_emma');
+const fb = join(tmp, 'fallback.aiff');
+assert.match(await speech.speak('Fallback test.', { engine: 'kokoro', voice: 'bf_emma', out: fb }), /voice helper is not built yet.*macOS system voice/);
+assert.ok(statSync(fb).size > 1000, 'fell back to say');
+// with a helper: dispatched to it with say's arguments
+const helper = speech.helperPath('kokoro');
+mkdirSync(join(comp.COMPONENTS_DIR, 'kokoro'), { recursive: true });
+writeFileSync(helper, '#!/bin/sh\nout=""; while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done\n{ echo "$0"; cat; } > "$out"\n');
+chmodSync(helper, 0o755);
+opt = await speech.options();
+assert.equal(eng('kokoro').helper, true);
+const hw = join(tmp, 'helper.out');
+assert.equal(await speech.speak('Helper test.', { engine: 'kokoro', voice: 'bf_emma', rate: 200, out: hw }), '');
+assert.equal(readFileSync(hw, 'utf8'), `${helper}\nHelper test.`);
+// removing the engine puts read-back back on say
+comp.remove('kokoro');
+assert.equal(speech.settings().engine, 'say');
+assert.equal(speech.settings().voice, '');
 
 // ---- manifest ----
 const ids = comp.MANIFEST.map((e) => e.id);
@@ -93,6 +161,7 @@ let rows = Object.fromEntries((await comp.rows()).map((r) => [r.id, r]));
 assert.equal(rows.whisper.state, 'missing');
 assert.deepEqual(rows.whisper.found, []);
 assert.equal(speech.status().dictation, false);
+await assert.rejects(speech.update({ dictate: { engine: 'whisper' } }), /Install Local Whisper first/);
 const cli = join(bin, 'whisper-cli');
 writeFileSync(cli, '#!/bin/sh\n[ "$1" = -m ] && [ "$3" = -f ] && [ "$5" = -nt ] && [ "$6" = -np ] || exit 3\n[ -s "$4" ] || exit 4\necho " Hello [BLANK_AUDIO] there."\n');
 chmodSync(cli, 0o755);
@@ -109,6 +178,21 @@ await comp.useExisting('whisper', cli);
 await comp.useExisting('whisper-model', join(models, 'ggml-tiny.en.bin'));
 assert.equal(speech.status().dictation, true);
 assert.equal(await speech.transcribe(new Uint8Array(100)), 'Hello there.');
+// dictation engine and model: models are the installed ones only
+assert.equal(speech.dictate().engine, 'whisper', 'Local Whisper is used once ready (old behaviour)');
+writeFileSync(join(models, 'ggml-small.bin'), 'x');
+assert.deepEqual((await speech.whisperModels()).map((m) => m.label).sort(), ['small', 'tiny.en']);
+await assert.rejects(speech.update({ dictate: { model: '/etc/hosts' } }), /not installed/);
+st = await speech.update({ dictate: { model: join(models, 'ggml-small.bin') } });
+assert.equal(st.dictate.model, join(models, 'ggml-small.bin'));
+st = await speech.update({ dictate: { engine: 'macos' } });
+assert.equal(st.dictation, false);
+assert.equal(speech.status().dictation, false, 'macOS dictation hides the mic keys');
+st = await speech.update({ dictate: { engine: 'whisper' } });
+assert.equal(st.dictation, true);
+assert.deepEqual(readCfg().dictation, { engine: 'whisper', model: join(models, 'ggml-small.bin') });
+rmSync(join(models, 'ggml-small.bin'));
+assert.equal(speech.dictate().model, join(models, 'ggml-tiny.en.bin'), 'a deleted model falls back to the component');
 rows = Object.fromEntries((await comp.rows()).map((r) => [r.id, r]));
 assert.equal(rows.whisper.state, 'existing');
 assert.deepEqual(rows.whisper.found, []);

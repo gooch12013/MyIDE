@@ -12,7 +12,7 @@ import type { Account, Provider, Usage } from '../main/accounts';
 import type { Providers } from '../main/transports';
 import type { ForgeLink, ForgeSnapshot } from '../main/forge';
 import type { Row as ComponentRow } from '../main/components';
-import type { SpeechSettings, SpeechStatus } from '../main/speech';
+import type { SpeechOptions, SpeechPatch, SpeechStatus } from '../main/speech';
 import type { Button, PaletteItem, Schedule } from '../main/buttons';
 import type { AssetRequest, Catalog } from '../main/assets';
 import type { Todo } from '../main/todos';
@@ -199,13 +199,15 @@ const api = {
     /** Deletes the branch; without removeWorktree it refuses (and names the worktree) while one has it checked out. */
     discard: (projectId: string, branch: string, removeWorktree = false): Promise<{ ok: boolean; worktree?: string; lost?: string[]; message: string }> => ipcRenderer.invoke('git:discard', projectId, branch, removeWorktree),
   },
-  // Read-back (macOS say) and dictation (an installed whisper-cli).
+  // Read-back (macOS say or a tts component) and dictation (macOS or an installed whisper-cli).
   speech: {
     get: (): Promise<SpeechStatus> => ipcRenderer.invoke('speech:get'),
-    set: (patch: Partial<SpeechSettings>): Promise<SpeechStatus> => ipcRenderer.invoke('speech:set', patch),
-    voices: (): Promise<{ name: string; lang: string }[]> => ipcRenderer.invoke('speech:voices'),
-    /** Reads a summary aloud (stopping any other); ignored while read-back is off unless force. Resolves when done. */
-    speak: (text: string, force = false): Promise<void> => ipcRenderer.invoke('speech:speak', text, force),
+    /** Refuses an engine that is not installed; the previous one stays in use. */
+    set: (patch: SpeechPatch): Promise<SpeechStatus> => ipcRenderer.invoke('speech:set', patch),
+    /** Read-back engines with their voices, and the installed Whisper models. */
+    options: (): Promise<SpeechOptions> => ipcRenderer.invoke('speech:options'),
+    /** Reads a summary aloud (stopping any other); ignored while read-back is off unless force. Resolves when done, with a note if it fell back to the macOS voice. */
+    speak: (text: string, force = false): Promise<string> => ipcRenderer.invoke('speech:speak', text, force),
     stop: (): Promise<void> => ipcRenderer.invoke('speech:stop'),
     /** A 16 kHz mono WAV to text. */
     transcribe: (wav: Uint8Array): Promise<string> => ipcRenderer.invoke('speech:transcribe', wav),

@@ -24,6 +24,8 @@ export interface Entry {
   /** The file to use, relative to the component folder (inside the archive for a zip). */
   file?: string;
   detect: { bin?: string; dirs?: string[]; match?: string };
+  /** kind "tts": a read-back engine, offered in Preferences > Voice & read-back with these voices. */
+  voices?: { id: string; label: string; lang: string }[];
 }
 export interface Choice { path: string; version?: string; existing?: boolean }
 export interface Row extends Entry { state: 'installed' | 'existing' | 'missing'; path?: string; installedVersion?: string; disk?: number; found: string[] }
