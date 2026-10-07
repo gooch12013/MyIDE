@@ -1,8 +1,9 @@
 import { ipcMain } from 'electron';
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { accessSync, constants, existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { COMPONENTS_DIR, componentPath, detect, MANIFEST, rows, type Entry, type Row } from './components';
 import { readConfig, writeConfig } from './projects';
 import { broadcast } from './store';
@@ -17,17 +18,17 @@ export interface SpeechSettings { on: boolean; engine: string; voice: string; ra
 export interface DictateSettings { engine: 'macos' | 'whisper'; model: string }
 export interface SpeechStatus extends SpeechSettings { dictation: boolean; dictate: DictateSettings }
 export type SpeechPatch = Partial<SpeechSettings> & { dictate?: Partial<DictateSettings> };
-export interface Engine { id: string; name: string; state: 'builtin' | Row['state']; helper: boolean; canInstall: boolean; voices: Voice[] }
+/** What a tts engine's helper is doing: not started, fetching or loading a model, ready, or failed (with `error`). */
+export type EngineStatus = 'idle' | 'starting' | 'downloading' | 'loading' | 'ready' | 'error';
+export interface Engine { id: string; name: string; state: 'builtin' | Row['state']; status: EngineStatus; error?: string; canInstall: boolean; voices: Voice[] }
 export interface SpeechOptions { engines: Engine[]; whisper: Row['state']; models: { path: string; label: string }[] }
 
 export const SAY = 'say';
 const tts = (id: string): Entry | undefined => MANIFEST.find((e) => e.kind === 'tts' && e.id === id);
 const engineName = (id: string) => (id === SAY ? 'macOS voices' : tts(id)?.name ?? id);
 
-/** A tts engine speaks through its helper, ~/.myide/components/<id>/myide-speak, which takes `say`'s
- *  arguments (-v voice, -r words per minute, -o file) and the text on stdin. None is built yet. */
-export const helperPath = (id: string) => join(COMPONENTS_DIR, id, 'myide-speak');
-const hasHelper = (id: string) => { try { accessSync(helperPath(id), constants.X_OK); return true; } catch { return false; } };
+/** The read-back helper (build/speech/helper.py, copied to dist/speech), run with the engine's Python. */
+export const HELPER = join(__dirname, 'speech', 'helper.py');
 
 /** Read-back settings. Old configs ({on, voice, rate}) read as the macOS engine; an engine that was removed falls back to it too. */
 export function settings(): SpeechSettings {
@@ -72,7 +73,7 @@ export const voices = () => (voiceList ??= new Promise((resolve) =>
 export async function engineVoices(id: string): Promise<Voice[]> {
   if (id === SAY) return (await voices()).map((v) => ({ id: v.name, label: v.name, lang: v.lang }));
   let clones: string[] = [];
-  try { clones = readdirSync(join(COMPONENTS_DIR, id, 'voices')).filter((n) => /\.wav$/i.test(n)); } catch { /* none */ }
+  try { if (tts(id)?.cloneModel) clones = readdirSync(join(COMPONENTS_DIR, id, 'voices')).filter((n) => /\.wav$/i.test(n)); } catch { /* none */ }
   return [...(tts(id)?.voices ?? []), ...clones.map((n) => { const name = n.replace(/\.wav$/i, ''); return { id: `clone:${name}`, label: `Cloned: ${name}`, lang: '' }; })];
 }
 
@@ -86,9 +87,10 @@ export async function whisperModels(): Promise<{ path: string; label: string }[]
 /** Everything Preferences > Voice & read-back offers. */
 export async function options(): Promise<SpeechOptions> {
   const [list, models, sayVoices] = await Promise.all([rows(), whisperModels(), engineVoices(SAY)]);
-  const engines: Engine[] = [{ id: SAY, name: engineName(SAY), state: 'builtin', helper: true, canInstall: false, voices: sayVoices }];
+  const engines: Engine[] = [{ id: SAY, name: engineName(SAY), state: 'builtin', status: 'ready', canInstall: false, voices: sayVoices }];
   for (const r of list.filter((x) => x.kind === 'tts')) {
-    engines.push({ id: r.id, name: r.name, state: r.state, helper: hasHelper(r.id), canInstall: !!r.url && !r.status, voices: await engineVoices(r.id) });
+    const h = helpers.get(r.id);
+    engines.push({ id: r.id, name: r.name, state: r.state, status: h?.status ?? 'idle', error: h?.error, canInstall: !r.status && !!(r.url || r.pip), voices: await engineVoices(r.id) });
   }
   return { engines, whisper: list.find((x) => x.id === 'whisper')?.state ?? 'missing', models };
 }
@@ -133,10 +135,13 @@ export function speakable(text: string): string {
   return t.length > 1500 ? `${t.slice(0, 1500)}…` : t;
 }
 
-let current: ChildProcess | null = null;
+// One utterance at a time, through `say` or an engine's helper; stop() ends whichever is running.
+let current: { stop(): void } | null = null;
 let emit = (_speaking: boolean): void => {};
 export const onSpeaking = (cb: (speaking: boolean) => void): void => { emit = cb; };
 export const speaking = () => !!current;
+const begin = (stopFn: () => void) => { const t = { stop: stopFn }; current = t; emit(true); return t; };
+const end = (t: object) => { if (current === t) { current = null; emit(false); } };
 
 /** Stops any utterance, then says `text` in the engine's voice. Resolves when it ends or is stopped, with a
  *  note when it fell back to the macOS system voice. `out` writes a file instead of playing (tests). */
@@ -144,31 +149,116 @@ export function speak(text: string, o: { engine?: string; voice?: string; rate?:
   stop();
   const words = speakable(text);
   if (!words) return Promise.resolve('');
-  let bin = '/usr/bin/say', voice = o.voice, note = '';
-  if (o.engine && o.engine !== SAY) {
-    if (componentPath(o.engine) && hasHelper(o.engine)) bin = helperPath(o.engine);
-    else { voice = ''; note = `${engineName(o.engine)} is installed, but its voice helper is not built yet, so this used the macOS system voice.`; }
-  }
-  const args: string[] = [];
-  if (voice) args.push('-v', voice);
-  if (o.rate) args.push('-r', String(Math.round(Math.min(400, Math.max(90, o.rate)))));
-  if (o.out) args.push('-o', o.out);
-  const child = spawn(bin, args, { stdio: ['pipe', 'ignore', 'ignore'] });
-  current = child;
-  emit(true);
-  child.stdin!.on('error', () => {}); // killed before reading
-  child.stdin!.end(words);
-  return new Promise((resolve) => child.on('close', () => {
-    if (current === child) { current = null; emit(false); }
-    resolve(note);
-  }));
+  if (!o.engine || o.engine === SAY) return viaSay(words, o.voice, o.rate, o.out);
+  const python = componentPath(o.engine);
+  return python ? viaHelper(o.engine, python, words, o)
+    : viaSay(words, '', o.rate, o.out, `${engineName(o.engine)} is not installed, so this used the macOS system voice.`);
 }
 export function stop(): void {
   if (!current) return;
   const c = current;
   current = null;
-  c.kill();
+  c.stop();
   emit(false);
+}
+
+function viaSay(words: string, voice = '', rate = 0, out = '', note = ''): Promise<string> {
+  const args: string[] = [];
+  if (voice) args.push('-v', voice);
+  if (rate) args.push('-r', String(Math.round(Math.min(400, Math.max(90, rate)))));
+  if (out) args.push('-o', out);
+  const child = spawn('/usr/bin/say', args, { stdio: ['pipe', 'ignore', 'ignore'] });
+  const t = begin(() => child.kill());
+  child.stdin!.on('error', () => {}); // killed before reading
+  child.stdin!.end(words);
+  return new Promise((resolve) => child.on('close', () => { end(t); resolve(note); }));
+}
+
+// ---- engine helpers: one long-lived Python process per engine, models kept loaded between lines ----
+
+type Reply = { id?: number; ok?: boolean; error?: string; state?: EngineStatus; ready?: boolean; secs?: number; stopped?: boolean };
+interface Helper { child: ChildProcess; python: string; status: EngineStatus; error?: string; ready: Promise<void>; waiting: Map<number, (r: Reply) => void> }
+const helpers = new Map<string, Helper>();
+let nextId = 0;
+let emitEngine = (_id: string): void => {};
+export const onEngine = (cb: (id: string) => void): void => { emitEngine = cb; };
+
+/** The engine's running helper, started (again) when there is none, it died, or its Python changed. */
+function helper(id: string, python: string): Helper {
+  const old = helpers.get(id);
+  if (old && old.python === python && old.child.exitCode === null && old.child.signalCode === null) return old;
+  old?.child.kill();
+  const child = spawn(python, ['-u', HELPER], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, HF_HUB_DISABLE_PROGRESS_BARS: '1', TOKENIZERS_PARALLELISM: 'false' } });
+  const h: Helper = { child, python, status: 'starting', waiting: new Map(), ready: Promise.resolve() };
+  const set = (st: EngineStatus, err?: string) => { h.status = st; h.error = err; emitEngine(id); };
+  let tail = '', startErr = '';
+  child.stderr!.on('data', (d: Buffer) => { tail = (tail + d.toString()).slice(-4000); });
+  child.stdin!.on('error', () => {}); // it exited; the exit handler reports why
+  h.ready = new Promise((resolve, reject) => {
+    const fail = (msg: string) => {
+      set('error', startErr || msg);
+      reject(new Error(h.error));
+      for (const cb of h.waiting.values()) cb({ ok: false, error: h.error });
+      h.waiting.clear();
+    };
+    createInterface({ input: child.stdout! }).on('line', (line) => {
+      let m: Reply;
+      try { m = JSON.parse(line); } catch { return; }
+      if (m.ready === true) { set('ready'); resolve(); } else if (m.ready === false) startErr = `Python cannot run the voice helper: ${m.error}`;
+      else if (m.state) set(m.state);
+      else if (m.id !== undefined) {
+        if (!m.stopped) set(m.ok === false ? 'error' : 'ready', m.error);
+        h.waiting.get(m.id)?.(m);
+        h.waiting.delete(m.id);
+      }
+    });
+    child.on('error', (err) => fail(`Could not start ${python}: ${err.message}`));
+    child.on('exit', (code, sig) => fail(`The voice helper stopped (${sig ?? `exit ${code}`}): ${tail.trim().split('\n').pop() ?? ''}`.replace(/: $/, '.')));
+  });
+  h.ready.catch(() => {});
+  helpers.set(id, h);
+  set('starting');
+  return h;
+}
+
+/** wpm to a speed factor around `say`'s default of about 180 wpm. */
+const factor = (rate = 0) => (rate ? Math.min(2, Math.max(0.5, rate / 180)) : 1);
+
+/** The helper request for an engine and voice: which model it needs and how speed applies. Kokoro takes a
+ *  speed and a language (the voice's first letter); Qwen3-TTS presets need the CustomVoice model, clones
+ *  the Base model plus the sample (and its transcript, if there is one), and speed applies on playback. */
+export function helperRequest(id: string, voice = '', rate = 0): Record<string, unknown> {
+  const e = tts(id)!;
+  const v = voice || e.voices?.[0]?.id || '';
+  if (id === 'kokoro') return { model: e.model, voice: v, lang: v[0], speed: factor(rate) };
+  if (!v.startsWith('clone:')) return { model: e.model, voice: v, rate: factor(rate) };
+  const base = join(COMPONENTS_DIR, id, 'voices', v.slice(6));
+  let refText = '';
+  try { refText = readFileSync(`${base}.txt`, 'utf8').trim(); } catch { /* no transcript: the voice is cloned from the sound alone */ }
+  return { model: e.cloneModel, ref: `${base}.wav`, ...(refText ? { ref_text: refText } : {}), rate: factor(rate) };
+}
+
+async function viaHelper(id: string, python: string, words: string, o: { voice?: string; rate?: number; out?: string }): Promise<string> {
+  let finish!: (r: Reply) => void;
+  const replied = new Promise<Reply>((r) => { finish = r; });
+  const h = helper(id, python), n = ++nextId;
+  const t = begin(() => {
+    h.waiting.delete(n);
+    if (h.child.exitCode === null) h.child.stdin!.write('{"stop":true}\n');
+    finish({ stopped: true });
+  });
+  let r: Reply;
+  try {
+    await Promise.race([h.ready, replied]);
+    if (current === t) {
+      h.waiting.set(n, finish);
+      h.child.stdin!.write(`${JSON.stringify({ id: n, ...helperRequest(id, o.voice, o.rate), text: words, ...(o.out ? { out: o.out } : {}) })}\n`);
+    }
+    r = await replied;
+  } catch (err) { r = { ok: false, error: (err as Error).message }; }
+  if (current !== t) return ''; // stopped, or replaced by the next line
+  end(t);
+  return r.ok === false ? viaSay(words, '', o.rate, o.out, `${engineName(id)} failed (${r.error}), so this used the macOS system voice.`) : '';
 }
 
 /** Transcribes a 16 kHz mono WAV with the installed whisper-cli and model. */
@@ -189,6 +279,7 @@ export async function transcribe(wav: Uint8Array): Promise<string> {
 
 export function registerSpeechIpc(): void {
   onSpeaking((on) => broadcast('speech:speaking', on));
+  onEngine((id) => broadcast('speech:engine', id));
   ipcMain.handle('speech:get', () => status());
   ipcMain.handle('speech:options', () => options());
   ipcMain.handle('speech:set', async (_e, patch: SpeechPatch) => {

@@ -27,6 +27,7 @@ refetch();
 api.speech.onChange((s) => { status = s; sync(); redraw?.(); });
 api.components.onChange(() => { refetch(); redraw?.(); }); // engines and dictation depend on components
 
+
 const ICON = {
   speaker: '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="1"/>',
@@ -42,6 +43,17 @@ const icon = (b: HTMLButtonElement, name: keyof typeof ICON, label: string) => {
 let active: HTMLButtonElement | null = null;
 const idle = (b: HTMLButtonElement) => { icon(b, 'speaker', b.dataset.label!); b.classList.remove('key--lit'); };
 api.speech.onSpeaking((on) => { if (!on && active) { idle(active); active = null; } });
+// A helper started, is fetching or loading a model, or failed. Not while a line plays: a redraw would drop its lit Stop key.
+let engineChanged = false;
+api.speech.onEngine(async () => {
+  if (!active) { redraw?.(); return; }
+  engineChanged = true; // redrawn when the line ends; meanwhile only the engine LEDs change
+  for (const e of (await api.speech.options()).engines) {
+    const led = document.querySelector<HTMLElement>(`label[for="Readbackengine-${e.id.replace(/\W/g, '_')}"] .led`);
+    if (led) [led.dataset.state, led.textContent] = engineLed(e);
+  }
+});
+api.speech.onSpeaking((on) => { if (!on && engineChanged) { engineChanged = false; redraw?.(); } });
 
 /** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice); `onNote` gets any fallback note. */
 export function speakButton(textFn: () => string, label = 'Read aloud', force = false, onNote?: (note: string) => void): HTMLButtonElement {
@@ -175,7 +187,21 @@ function voiceGroups(voices: Voice[]): HTMLOptGroupElement[] {
 }
 
 const engineLed = (e: Engine): [string, string] => e.state === 'builtin' ? ['working', 'Built in'] : e.state === 'missing' ? ['idle', 'Not installed']
-  : !e.helper ? ['queued', 'No helper yet'] : ['working', e.state === 'existing' ? 'Using existing' : 'Installed'];
+  : e.status === 'error' ? ['failed', 'Error'] : e.status === 'downloading' ? ['queued', 'Downloading model']
+  : e.status === 'loading' || e.status === 'starting' ? ['queued', 'Loading model'] : ['working', e.status === 'ready' ? 'Ready' : e.state === 'existing' ? 'Using existing' : 'Installed'];
+
+/** Install (a private Python with the engine) and "Use existing Python…" keys for a Python engine, with its install progress. */
+function pythonKeys(id: string, name: string, say: (t: string) => void, done: () => void = () => {}): Node[] {
+  const prog = h('span', { className: 'comp-prog', textContent: progressText.get(id) ?? '' });
+  prog.dataset.comp = id;
+  return [
+    key('Install', async () => { say(`Installing ${name}…`); try { await api.components.install(id); say(`${name} installed.`); } catch (e) { say(errText(e)); } progressText.delete(id); done(); },
+      { title: `Makes a private Python in ~/.myide/components/${id} with uv and installs ${name}'s packages from PyPI` }),
+    key('Use existing Python…', async () => { try { const p = await api.components.pickPython(id); if (p) say(`${name}: using ${p}.`); } catch (e) { say(errText(e)); } done(); },
+      { title: 'Pick a Python that already has mlx-audio installed' }),
+    prog,
+  ];
+}
 
 // Picked in the UI but not installed: read-back (or dictation) keeps its working engine and switches when this is ready.
 let pendingEngine = '', pendingDictate = '';
@@ -224,13 +250,11 @@ export async function voiceSection(say: (t: string) => void): Promise<Node[]> {
     const engineNote: Node[] = [];
     if (chosen.state === 'missing') {
       engineNote.push(h('p', { className: 'sp-need' }, `${chosen.name} is not installed. Read-back keeps using ${active.name} until it is ready.`,
-        key(`Install ${chosen.name}`, chosen.canInstall
-          ? async () => { say(`Downloading ${chosen.name}…`); try { await api.components.install(chosen.id); say(`${chosen.name} installed.`); } catch (e) { say(errText(e)); } }
-          : () => openComponents(chosen.id))));
-    } else if (!chosen.helper) {
-      const led = h('span', { className: 'led', textContent: 'Installed, voice helper not built yet' });
-      led.dataset.state = 'queued';
-      engineNote.push(h('p', { className: 'sp-need' }, led, 'Until it is, read-back and Test voice use the macOS system voice.'));
+        ...(chosen.canInstall ? pythonKeys(chosen.id, chosen.name, say) : [key(`Install ${chosen.name}`, () => openComponents(chosen.id))])));
+    } else if (chosen.status === 'error') {
+      engineNote.push(h('p', { className: 'sp-need' }, `${chosen.name}: ${chosen.error ?? 'failed'}. Read-back used the macOS system voice instead.`));
+    } else if (chosen.status === 'downloading') {
+      engineNote.push(h('p', { className: 'sp-need' }, `Downloading ${chosen.name}'s model from Hugging Face. This happens once per model; then lines take about a second.`));
     }
 
     const voice = h('select', { className: 'input select', disabled: chosen.id !== s.engine },
@@ -326,7 +350,9 @@ async function table(wrap: HTMLElement, say: (t: string) => void): Promise<void>
 
     const keys: Node[] = [];
     const canDownload = !!r.url && !r.status;
-    if (canDownload && r.state !== 'installed') {
+    if (r.pip && r.state !== 'installed') {
+      keys.push(...pythonKeys(r.id, r.name, say, () => void table(wrap, say)).slice(0, 2));
+    } else if (canDownload && r.state !== 'installed') {
       keys.push(key('Install', act(async () => { say(`Downloading ${r.name}…`); await api.components.install(r.id); say(`${r.name} installed.`); }),
         { title: `Downloads ${mb(r.size)} from ${new URL(r.url!).host} into ~/.myide/components/${r.id}` }));
     }
@@ -361,8 +387,8 @@ async function table(wrap: HTMLElement, say: (t: string) => void): Promise<void>
   if (hit) { hit.classList.add('comp-hit'); hit.scrollIntoView({ block: 'center' }); }
 }
 
-api.components.onProgress((id, got, total) => {
-  const t = total ? `${Math.floor((got / total) * 100)}%` : mb(got);
+api.components.onProgress((id, got, total, text) => {
+  const t = text ? text.slice(0, 80) : total ? `${Math.floor((got / total) * 100)}%` : mb(got);
   progressText.set(id, got >= total && total ? '' : t);
   for (const el of document.querySelectorAll<HTMLElement>(`.comp-prog[data-comp="${CSS.escape(id)}"]`)) el.textContent = progressText.get(id)!;
 });

@@ -213,6 +213,8 @@ const api = {
     transcribe: (wav: Uint8Array): Promise<string> => ipcRenderer.invoke('speech:transcribe', wav),
     onChange: (cb: (s: SpeechStatus) => void) => on('speech:change', cb),
     onSpeaking: (cb: (speaking: boolean) => void) => on('speech:speaking', cb),
+    /** An engine's helper changed state (starting, downloading or loading a model, ready, error). */
+    onEngine: (cb: (id: string) => void) => on('speech:engine', cb),
   },
   // Optional components (feature 23) in ~/.myide/components.
   components: {
@@ -223,7 +225,9 @@ const api = {
     /** Uses an existing install that detection found. */
     use: (id: string, path: string): Promise<void> => ipcRenderer.invoke('components:use', id, path),
     reveal: (): Promise<string> => ipcRenderer.invoke('components:reveal'),
-    onProgress: (cb: (id: string, got: number, total: number) => void) => on('components:progress', cb),
+    /** "Use existing Python…" for a Python engine: a file picker, then a check that it imports the engine. Resolves to the path, or '' if cancelled. */
+    pickPython: (id: string): Promise<string> => ipcRenderer.invoke('components:pick-python', id),
+    onProgress: (cb: (id: string, got: number, total: number, text?: string) => void) => on('components:progress', cb),
     onChange: (cb: () => void) => on('components:change', cb),
   },
   // Action buttons (global in ~/.myide, project ones in <repo>/.myide) and their schedules.

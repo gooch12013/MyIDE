@@ -1,10 +1,11 @@
-import { ipcMain, shell } from 'electron';
-import { execFile } from 'node:child_process';
+import { BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, join } from 'node:path';
+import { basename, isAbsolute, join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { finished } from 'node:stream/promises';
 import { promisify } from 'node:util';
 import { readConfig, writeConfig } from './projects';
@@ -20,12 +21,17 @@ export interface Entry {
   /** build-needed: no download for macOS; coming-soon: install not built yet. Both still offer an existing install. */
   status?: 'build-needed' | 'coming-soon'; note?: string; advanced?: string;
   url?: string; sha256?: string; size?: number; sizeNote?: string;
-  archive?: 'zip';
+  archive?: 'zip' | 'tar.gz';
   /** The file to use, relative to the component folder (inside the archive for a zip). */
   file?: string;
   detect: { bin?: string; dirs?: string[]; match?: string };
   /** kind "tts": a read-back engine, offered in Preferences > Voice & read-back with these voices. */
   voices?: { id: string; label: string; lang: string }[];
+  /** A Python engine: Install makes ~/.myide/components/<id>/venv with uv and pip-installs these; the
+   *  component's path is then that venv's python. `check` is the Python that proves an interpreter works. */
+  pip?: string[]; check?: string;
+  /** Hugging Face models the engine loads (fetched into the normal cache on first use): presets, and clones. */
+  model?: string; cloneModel?: string;
 }
 export interface Choice { path: string; version?: string; existing?: boolean }
 export interface Row extends Entry { state: 'installed' | 'existing' | 'missing'; path?: string; installedVersion?: string; disk?: number; found: string[] }
@@ -48,7 +54,9 @@ function setChoice(id: string, c: Choice | null): void {
 /** The path to use for a component (its binary or model file), or null when it is not available. */
 export function componentPath(id: string): string | null {
   const p = choices()[id]?.path;
-  return p && existsSync(p) ? p : null;
+  if (!p || !existsSync(p)) return null;
+  // A Python engine is the interpreter that runs it; earlier builds stored a model folder here.
+  return MANIFEST.find((e) => e.id === id)?.pip && !statSync(p).isFile() ? null : p;
 }
 
 const tilde = (p: string) => (p.startsWith('~/') ? join(homedir(), p.slice(2)) : p);
@@ -85,8 +93,9 @@ export async function rows(): Promise<Row[]> {
 const busy = new Set<string>();
 
 /** Downloads, checks and unpacks a component into ~/.myide/components/<id>/; replaces an older install. */
-export async function install(id: string, progress: (got: number, total: number) => void = () => {}): Promise<string> {
+export async function install(id: string, progress: Progress = () => {}): Promise<string> {
   const e = entry(id);
+  if (e.pip && !e.status) return installPython(e, progress);
   if (!e.url || !e.file || e.status) throw new Error(`${e.name} cannot be installed from MyIDE yet.`);
   if (!e.url.startsWith('https://')) throw new Error('Downloads must use HTTPS.');
   if (!/^[0-9a-f]{64}$/.test(e.sha256 ?? '')) throw new Error(`${e.name} has no published checksum to check the download against.`);
@@ -119,8 +128,9 @@ export async function install(id: string, progress: (got: number, total: number)
     await finished(out);
     progress(got, total);
     if (hash.digest('hex') !== e.sha256) throw new Error('The download does not match its published checksum; nothing was installed.');
-    if (e.archive === 'zip') {
-      await promisify(execFile)('/usr/bin/ditto', ['-x', '-k', file, tmp]);
+    if (e.archive) {
+      if (e.archive === 'zip') await promisify(execFile)('/usr/bin/ditto', ['-x', '-k', file, tmp]);
+      else await promisify(execFile)('/usr/bin/tar', ['-xzf', file, '-C', tmp]);
       rmSync(file);
     }
     const target = join(tmp, e.file);
@@ -139,10 +149,62 @@ export async function install(id: string, progress: (got: number, total: number)
   return path;
 }
 
-/** Forgets the component. Our own install is deleted; an existing one elsewhere is left untouched. */
+type Progress = (got: number, total: number, text?: string) => void;
+
+/** Runs uv, passing each line it prints to `line`; rejects with its last line on failure. */
+function uv(bin: string, args: string[], line: (l: string) => void): Promise<void> {
+  // Python itself goes into our folder too, not ~/.local/share/uv.
+  const child = spawn(bin, args, { env: { ...process.env, UV_PYTHON_INSTALL_DIR: join(COMPONENTS_DIR, 'uv', 'python'), NO_COLOR: '1' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let last = '';
+  for (const s of [child.stdout!, child.stderr!]) createInterface({ input: s }).on('line', (l) => { if (l.trim()) { last = l.trim(); line(last); } });
+  return new Promise((resolve, reject) => {
+    child.on('error', reject);
+    child.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`uv failed: ${last}`))));
+  });
+}
+
+/** A Python engine: uv (installed first if needed) makes <id>/venv and installs the engine's packages into it. */
+async function installPython(e: Entry, progress: Progress): Promise<string> {
+  if (busy.has(e.id)) throw new Error(`${e.name} is already installing.`);
+  busy.add(e.id);
+  try {
+    const bin = componentPath('uv') ?? await install('uv', (got, total) => progress(got, total, 'Downloading uv'));
+    const venv = join(COMPONENTS_DIR, e.id, 'venv'), python = join(venv, 'bin', 'python');
+    rmSync(venv, { recursive: true, force: true });
+    mkdirSync(join(COMPONENTS_DIR, e.id), { recursive: true, mode: 0o700 });
+    const say = (l: string) => progress(0, 0, l);
+    // --seed adds pip, which spaCy (under Kokoro's misaki) uses to fetch its English model on first use.
+    await uv(bin, ['venv', '--seed', '--managed-python', '--python', '3.12', venv], say);
+    await uv(bin, ['pip', 'install', '--python', python, ...e.pip!], say);
+    await checkPython(e, python);
+    setChoice(e.id, { path: python, version: e.version });
+    return python;
+  } finally { busy.delete(e.id); }
+}
+
+/** Proves a Python runs the engine: it must import what the engine needs. */
+async function checkPython(e: Entry, python: string): Promise<void> {
+  try {
+    await promisify(execFile)(python, ['-c', e.check ?? 'import mlx_audio'], { timeout: 120_000 });
+  } catch (err) {
+    const why = (err as { stderr?: string }).stderr?.trim().split('\n').pop() || (err as Error).message;
+    throw new Error(`${python} cannot run ${e.name}: ${why}`);
+  }
+}
+
+/** Uses a Python the user picked for a Python engine, once it proves it can import the engine. */
+export async function usePython(id: string, python: string): Promise<void> {
+  const e = entry(id);
+  if (!e.pip) throw new Error(`${e.name} does not run in Python.`);
+  if (!isAbsolute(python) || !existsSync(python) || !statSync(python).isFile()) throw new Error(`${python} is not a Python program.`);
+  await checkPython(e, python);
+  setChoice(id, { path: python, existing: true });
+}
+
+/** Forgets the component. Our own install is deleted (a Python engine keeps its voices/ samples); an existing one elsewhere is left untouched. */
 export function remove(id: string): void {
-  entry(id);
-  if (!choices()[id]?.existing) rmSync(join(COMPONENTS_DIR, id), { recursive: true, force: true });
+  const e = entry(id);
+  if (!choices()[id]?.existing) rmSync(join(COMPONENTS_DIR, id, e.pip ? 'venv' : ''), { recursive: true, force: true });
   setChoice(id, null);
 }
 
@@ -159,10 +221,20 @@ export function registerComponentsIpc(): void {
   ipcMain.handle('components:list', () => rows());
   ipcMain.handle('components:install', async (ev, id: string) => {
     try {
-      return await install(id, (got, total) => { if (!ev.sender.isDestroyed()) ev.sender.send('components:progress', id, got, total); });
+      return await install(id, (got, total, text) => { if (!ev.sender.isDestroyed()) ev.sender.send('components:progress', id, got, total, text); });
     } finally { changed(); }
   });
   ipcMain.handle('components:remove', (_e, id: string) => { remove(id); changed(); });
   ipcMain.handle('components:use', async (_e, id: string, path: string) => { await useExisting(id, path); changed(); });
+  // "Use existing Python…": the user picks the interpreter, e.g. a venv's bin/python3; nothing is scanned.
+  ipcMain.handle('components:pick-python', async (ev, id: string) => {
+    const r = await dialog.showOpenDialog(BrowserWindow.fromWebContents(ev.sender)!, {
+      title: `Python for ${entry(id).name}`, message: 'Choose a Python that has mlx-audio installed, e.g. a virtual environment’s bin/python3.',
+      properties: ['openFile', 'showHiddenFiles', 'treatPackageAsDirectory', 'noResolveAliases'], // keep the venv's bin/python, not the interpreter it links to
+    });
+    if (r.canceled || !r.filePaths[0]) return '';
+    try { await usePython(id, r.filePaths[0]); } finally { changed(); }
+    return r.filePaths[0];
+  });
   ipcMain.handle('components:reveal', () => { mkdirSync(COMPONENTS_DIR, { recursive: true, mode: 0o700 }); return shell.openPath(COMPONENTS_DIR); });
 }
