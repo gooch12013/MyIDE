@@ -1,6 +1,7 @@
 import * as monaco from 'monaco-editor';
 import { errText, h, key } from './dom';
 import { led } from './employees';
+import { fileRefs, resolvePath } from './links';
 import { activeProject } from './projects';
 import { openPanel, registerPanel } from './registry';
 
@@ -53,7 +54,8 @@ export function ask(title: string, detail: string, ok: string, danger = false): 
 
 // One model per open file, shared by every editor panel. A closed panel keeps its unsaved files;
 // the next editor panel opened picks them up.
-type Doc = { model: monaco.editor.ITextModel; saved: number; root: string; branch: string };
+// disk: the file's text as last read or written; theirs: a newer disk text held back because the model has unsaved edits.
+type Doc = { model: monaco.editor.ITextModel; saved: number; root: string; branch: string; disk: string; theirs?: string };
 const docs = new Map<string, Doc>();
 const dirty = (d: Doc): boolean => d.model.getAlternativeVersionId() !== d.saved;
 const base = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
@@ -65,17 +67,51 @@ async function load(path: string): Promise<Doc> {
   const { text, root, branch } = await api.code.read(path);
   const uri = monaco.Uri.file(path);
   const model = monaco.editor.getModel(uri) ?? monaco.editor.createModel(text, undefined, uri);
-  const doc = { model, saved: model.getAlternativeVersionId(), root, branch };
+  const doc: Doc = { model, saved: model.getAlternativeVersionId(), root, branch, disk: text };
   docs.set(path, doc);
+  watchRoot(root);
   return doc;
 }
 
-type Instance = { open(path: string, line?: number): Promise<void>; has(path: string): boolean };
+// One watch per checkout with open files. A change on disk reloads a clean file; a dirty one gets the
+// "Changed on disk" bar (every editor panel redraws through `instances`).
+const watches = new Map<string, Promise<number>>(); // root -> watch id
+const watchRoots = new Map<number, string>(); // watch id -> root
+function watchRoot(root: string): void {
+  if (!watches.has(root)) watches.set(root, api.git.watch(root).then((id) => { watchRoots.set(id, root); return id; }, () => -1));
+}
+api.git.onChanged(async (id) => {
+  const root = watchRoots.get(id);
+  if (!root) return;
+  for (const [path, d] of docs) {
+    if (d.root !== root) continue;
+    let text: string;
+    try { text = (await api.code.read(path)).text; } catch { continue; } // deleted or moved: keep what is open
+    if (text === d.disk) { d.theirs = undefined; continue; }
+    if (dirty(d)) d.theirs = text;
+    else takeDisk(d, text);
+  }
+  for (const i of instances) i.redraw();
+});
+/** Replaces the model's text with the disk's, as one undoable edit, and marks it saved. */
+function takeDisk(d: Doc, text: string): void {
+  d.model.pushEditOperations([], [{ range: d.model.getFullModelRange(), text }], () => null);
+  d.disk = text;
+  d.theirs = undefined;
+  d.saved = d.model.getAlternativeVersionId();
+}
+
+type Instance = { open(path: string, line?: number): Promise<void>; has(path: string): boolean; redraw(): void };
 const instances: Instance[] = []; // most recently used first
 /** Lets go of a file's model once no editor panel shows it. */
 function release(path: string): void {
   const d = docs.get(path);
-  if (d && !instances.some((i) => i.has(path))) { docs.delete(path); d.model.dispose(); }
+  if (d && !instances.some((i) => i.has(path))) {
+    docs.delete(path);
+    d.model.dispose();
+    const w = watches.get(d.root);
+    if (w && ![...docs.values()].some((x) => x.root === d.root)) { watches.delete(d.root); void w.then((id) => { watchRoots.delete(id); if (id >= 0) api.git.unwatch(id); }); }
+  }
 }
 const ides = api.code.ides().catch(() => [] as string[]);
 
@@ -83,6 +119,25 @@ const ides = api.code.ides().catch(() => [] as string[]);
 export async function openAt(path: string, line?: number, beside?: string): Promise<void> {
   if (!instances.length) openPanel('editor', {}, beside ? { position: { referencePanel: beside, direction: 'right' } } : {});
   await instances[0].open(path, line);
+}
+
+/** `text` with its file:line references as links that open the editor there; relative ones resolve against `root`. */
+export function linkify(text: string, root: string): (Node | string)[] {
+  const out: (Node | string)[] = [];
+  let at = 0;
+  for (const r of fileRefs(text)) {
+    const abs = resolvePath(root, r.path);
+    const a = h('a', { href: '#', className: 'file-link', textContent: text.slice(r.start, r.end), title: `Open at line ${r.line}` });
+    a.onclick = async (e) => {
+      e.preventDefault();
+      if (await api.code.exists(abs)) await openAt(abs, r.line);
+      else { a.classList.add('is-missing'); a.title = 'Not a file in this project or its worktrees'; }
+    };
+    out.push(text.slice(at, r.start), a);
+    at = r.end;
+  }
+  out.push(text.slice(at));
+  return out;
 }
 
 registerPanel('editor', {
@@ -96,6 +151,10 @@ registerPanel('editor', {
     tabs.setAttribute('aria-label', 'Open files');
     const pathEl = h('span', { className: 'path' });
     const wt = h('span', { className: 'ed-wt' });
+    const diskBar = h('div', { className: 'ed-disk', hidden: true }, h('span', { textContent: 'Changed on disk.' }),
+      key('Reload', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs !== undefined) takeDisk(d, d.theirs); for (const i of instances) i.redraw(); }, { className: 'key key--sm key--lit' }),
+      key('Keep mine', () => { const d = current ? docs.get(current) : undefined; if (d?.theirs !== undefined) { d.disk = d.theirs; d.theirs = undefined; } for (const i of instances) i.redraw(); }));
+    diskBar.setAttribute('role', 'alert');
     const status = h('p', { className: 'ed-status' });
     status.setAttribute('aria-live', 'polite');
     const say = (t: string) => { status.textContent = t; };
@@ -105,7 +164,7 @@ registerPanel('editor', {
       if (current) void api.code.openIn(ide, current, editor.getPosition()?.lineNumber ?? 1);
     }, { title: `Open this file in ${ide} at the cursor line` }))));
     const body = h('div', { className: 'ed-body' });
-    el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), body, status);
+    el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), diskBar, body, status);
 
     const editor = monaco.editor.create(body, { ...EDITOR_OPTIONS, model: null });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void save());
@@ -135,6 +194,7 @@ registerPanel('editor', {
       wt.textContent = d?.branch ? `on ${d.branch}` : '';
       panel.setTitle(current ? `${d && dirty(d) ? '● ' : ''}${base(current)}` : 'Editor');
       send.disabled = !current;
+      diskBar.hidden = d?.theirs === undefined;
     }
 
     async function show(path: string, line?: number): Promise<void> {
@@ -155,8 +215,11 @@ registerPanel('editor', {
       const d = current ? docs.get(current) : undefined;
       if (!d || !current) return;
       try {
-        await api.code.write(current, d.model.getValue());
+        const text = d.model.getValue();
+        await api.code.write(current, text);
         d.saved = d.model.getAlternativeVersionId();
+        d.disk = text; // saving over a disk change is "keep mine"
+        d.theirs = undefined;
         say(`Saved ${rel(d, current)}`);
       } catch (e) { say(`Could not save: ${errText(e)}`); }
       drawTabs();
@@ -219,7 +282,7 @@ registerPanel('editor', {
 
     const changed = editor.onDidChangeModelContent(() => drawTabs());
 
-    const self: Instance = { open: show, has: (p) => open.has(p) };
+    const self: Instance = { open: show, has: (p) => open.has(p), redraw: drawTabs };
     instances.unshift(self);
 
     // Reopen the files this panel had, then any unsaved files a closed panel left behind.

@@ -3,6 +3,7 @@ import { errText, h, key } from './dom';
 import { led } from './employees';
 import { activeProject } from './projects';
 import { registerPanel } from './registry';
+import { micButton } from './speech';
 
 const api = window.myide;
 type Listed = AssetRequest & { thumbs: string[]; dir: string };
@@ -69,7 +70,7 @@ registerPanel('assets', {
       h('div', { className: 'seg' }, type.el),
       field('Higgsfield model', model, h('span', { className: 'as-row' }, modelNote, refreshKey)),
       opts, count.el,
-      field('What do you need', short),
+      field('What do you need', short), micButton(short, (t) => say(t, true)),
       h('div', { className: 'field' }, h('span', { className: 'legend', textContent: 'Reference image (optional)' }), refInput, h('span', { className: 'as-row' }, refName, refClear), refWarn),
       writeKey);
     syncRef();

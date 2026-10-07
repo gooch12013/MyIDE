@@ -1,12 +1,12 @@
 // Menu-bar icon: open MyIDE, what needs David, pause all schedules, quit.
 import { app, Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electron';
-import type { Employee } from './employees';
-import { onEmployeeChange } from './employees';
-import { invoke, pauseSchedules, schedulesPaused } from './buttons';
+import { listEmployees, onEmployeeChange, onEmployeeRemoved } from './employees';
+import { pauseSchedules, schedulesPaused } from './buttons';
 
 let tray: Tray | null = null;
-const needs = new Map<string, boolean>(); // employee id -> in NEEDS YOU
 let actions: { open(): void; showNeeds(): void };
+// Counted from the live list on every change, so a fired employee can never leave the count stuck.
+const needsCount = (): number => listEmployees().filter((e) => e.state === 'needs-you').length;
 
 /** A template image drawn in code: a rounded key outline with a lit dot, black on clear (macOS tints it). */
 function icon(): Electron.NativeImage {
@@ -29,7 +29,7 @@ function icon(): Electron.NativeImage {
 }
 
 export function trayMenu(): MenuItemConstructorOptions[] {
-  const count = [...needs.values()].filter(Boolean).length;
+  const count = needsCount();
   return [
     { label: 'Open MyIDE', click: () => actions.open() },
     { label: count ? `Needs You: ${count}` : 'Nothing Needs You', enabled: count > 0, click: () => actions.showNeeds() },
@@ -42,7 +42,7 @@ export function trayMenu(): MenuItemConstructorOptions[] {
 
 export function refreshTray(): void {
   if (!tray) return;
-  const count = [...needs.values()].filter(Boolean).length;
+  const count = needsCount();
   tray.setTitle(count ? String(count) : '');
   tray.setToolTip(count ? `MyIDE: ${count} need you` : 'MyIDE');
   tray.setContextMenu(Menu.buildFromTemplate(trayMenu()));
@@ -50,12 +50,10 @@ export function refreshTray(): void {
 
 export async function startTray(o: { open(): void; showNeeds(): void }): Promise<void> {
   actions = o;
-  for (const e of await invoke<Employee[]>('employees:list')) needs.set(e.id, e.state === 'needs-you');
-  onEmployeeChange((e) => {
-    const was = needs.get(e.id);
-    needs.set(e.id, e.state === 'needs-you');
-    if (was !== (e.state === 'needs-you')) refreshTray();
-  });
+  let last = -1;
+  const recount = () => { const n = needsCount(); if (n !== last) { last = n; refreshTray(); } };
+  onEmployeeChange(recount);
+  onEmployeeRemoved(recount);
   tray = new Tray(icon());
   refreshTray();
   if (process.env.MYIDE_TEST_CLOCK) (globalThis as Record<string, unknown>).myideTray = () => trayMenu().map((i) => ({ label: i.label, checked: i.checked, enabled: i.enabled }));

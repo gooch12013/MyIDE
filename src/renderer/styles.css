@@ -745,3 +745,16 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
   .td-go { width: 100%; }
 }
 .td-detail .need-plan { max-height: 30em; }
+
+/* ---- integration: read-back beside summaries, file:line links, editor disk bar, This Mac line ---- */
+.emp-said { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--sp-3); align-items: start; }
+.emp-said--last:has(.emp-last:empty) { display: none; }
+.need-head .sp-key, .sched-row .sp-key { margin-left: auto; }
+.file-link { color: var(--accent); text-decoration: underline dotted; text-underline-offset: 2px; cursor: pointer; }
+.file-link:hover { text-decoration-style: solid; }
+.file-link.is-missing { color: var(--ink-3); cursor: default; }
+.ed-disk { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-4); padding: 6px 10px; border-bottom: 1px solid var(--accent-dim); background: color-mix(in srgb, var(--accent) 8%, var(--well-row)); font-size: var(--fs-sm); color: var(--ink-2); }
+.ed-disk[hidden] { display: none; }
+.mac-line > summary { list-style: none; cursor: pointer; }
+.mac-line > summary::-webkit-details-marker { display: none; }
+.mac-line .o-list { padding: 4px 0 2px 12px; }

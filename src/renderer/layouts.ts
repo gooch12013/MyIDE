@@ -24,11 +24,16 @@ function save(force = false): void {
   api.layouts.putProject(activeProject()?.id ?? null, layout);
 }
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
+const EMPLOYEES_WIDTH = 340;
 
 function preset(name: string): void {
   dock.clear();
   if (!activeProject()) return;
   const term = openPanel('terminal', { cwd: cwd() });
+  if (name === 'default') { // a project with no saved layout: the team beside its terminal
+    openPanel('employees', {}, { position: { referencePanel: term.id, direction: 'left' }, initialWidth: EMPLOYEES_WIDTH });
+    term.api.setActive();
+  }
   if (name === 'files') {
     openPanel('files', {}, { position: { referencePanel: term.id, direction: 'left' }, initialWidth: 260 });
     term.api.setActive();
@@ -61,7 +66,7 @@ function restore(layout: unknown): void {
   if (layout) {
     try { dock.fromJSON(noCommands(layout as SerializedDockview)); return; } catch (e) { console.error('Layout restore failed', e); }
   }
-  preset('terminal');
+  preset('default');
 }
 
 /** Saves the current project's layout and shows `p` with its own layout (default: one terminal). */
@@ -92,11 +97,11 @@ export async function removeProject(p = activeProject()): Promise<void> {
   else sync();
 }
 
-/** Forgets a project's saved layout; the active project goes back to one terminal now. */
+/** Forgets a project's saved layout; the active project goes back to the default layout now. */
 export async function resetLayout(id: string): Promise<void> {
   delete perProject[id];
   await api.prefs.resetLayout(id);
-  if (id === projectKey()) preset('terminal');
+  if (id === projectKey()) preset('default');
 }
 
 async function saveNamed(): Promise<void> {
@@ -128,6 +133,7 @@ function showPanel(type: string): void {
   const open = dock.panels.find((p) => p.api.component === type);
   if (open) open.api.setActive();
   else if (type === 'files') openPanel('files', {}, { position: { direction: 'left' }, initialWidth: 260 });
+  else if (type === 'employees') openPanel('employees', {}, { position: { direction: 'left' }, initialWidth: EMPLOYEES_WIDTH });
   else openPanel(type, type === 'terminal' ? { cwd: cwd() } : {});
 }
 
@@ -153,6 +159,7 @@ const commands: Record<string, (arg: string) => void> = {
   preset: (name) => void okToClose().then((ok) => ok && preset(name)),
   layout: (name) => void restoreNamed(name),
   panel: showPanel,
+  'flush-layout': () => save(), // the main window was hidden (closed while MyIDE keeps running)
 };
 
 /** Restores the last project and its layout, then keeps layouts saved as they change. */

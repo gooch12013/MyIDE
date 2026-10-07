@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { Employee } from './employees';
-import { onEmployeeChange } from './employees';
+import { hireEmployee, listEmployees, onEmployeeChange, sendToEmployee } from './employees';
 import { listProjects } from './projects';
 import { due, nextRun, type Schedule } from './schedules';
 import { readJSON, STATE_DIR, writeJSON, writePrivate } from './store';
@@ -104,27 +104,19 @@ function removeButton(id: string): void {
 
 // ---- running a button ----
 
-// ponytail: employees.ts keeps hire/send private, so this calls its IPC handlers in-process (Electron's
-// handler map). Switch to plain imports if employees.ts ever exports them.
-type Handler = (e: unknown, ...a: unknown[]) => unknown;
-export const invoke = async <T>(channel: string, ...a: unknown[]): Promise<T> => {
-  const fn = (ipcMain as unknown as { _invokeHandlers: Map<string, Handler> })._invokeHandlers.get(channel);
-  if (!fn) throw new Error(`${channel} is not available`);
-  return await fn({ sender: null }, ...a) as T;
-};
-
-/** Sends `command` (plus input) to the button's target in `projectId`; resolves to the employee that runs it. */
-export async function runButton(b: Pick<Button, 'command' | 'target' | 'label'>, projectId: string, o: { employeeId?: string; input?: string } = {}): Promise<Employee> {
+/** Sends `command` (plus input) to the button's target in `projectId`; resolves to the employee that runs it.
+ *  quiet: a scheduled run, which notifies only on failure or needs-you. */
+export async function runButton(b: Pick<Button, 'command' | 'target' | 'label'>, projectId: string, o: { employeeId?: string; input?: string; quiet?: boolean } = {}): Promise<Employee> {
   const project = listProjects().find((p) => p.id === projectId);
   if (!project) throw new Error('No such project');
   const text = [b.command.trim(), o.input?.trim()].filter(Boolean).join(' ');
-  if (typeof b.target === 'object') return invoke<Employee>('employees:hire', { projectId, role: b.target.role, task: text });
-  const emps = await invoke<Employee[]>('employees:list', projectId);
+  if (typeof b.target === 'object') return hireEmployee({ projectId, role: b.target.role, task: text, quiet: o.quiet });
+  const emps = listEmployees(projectId);
   const e = b.target === 'selected'
     ? emps.find((x) => x.id === o.employeeId)
     : emps.find((x) => x.lead && !x.parentId) ?? emps.find((x) => x.lead);
   if (!e) throw new Error(b.target === 'selected' ? 'Select an employee first' : `${project.name} has no lead. Hire one (tick Lead) or give the button a role.`);
-  await invoke('employees:send', e.id, text);
+  sendToEmployee(e.id, text, { quiet: o.quiet });
   return e;
 }
 
@@ -211,7 +203,7 @@ async function fire(s: Schedule): Promise<void> {
   const b = findButton(s.buttonId, s.projectId);
   if (!b) return fail(s, s.buttonId, new Error('Its button was deleted'));
   try {
-    const e = await runButton(b, s.projectId, { input: s.input });
+    const e = await runButton(b, s.projectId, { input: s.input, quiet: true });
     active.set(e.id, { schedule: s, label: b.label, command: b.command, started: now() });
     awake();
     record(s, b.label, 'Running', `- Status: Running on ${e.name}`);
@@ -248,7 +240,7 @@ export function registerButtonsIpc(o: { onPaused?: (paused: boolean) => void } =
     const f = readScheds();
     writeScheds({ ...f, schedules: f.schedules.filter((s) => s.buttonId !== id) });
   });
-  h('buttons:run', async (b: Button, projectId: string, o: { employeeId?: string; input?: string }) => (await runButton(b, projectId, o)).id);
+  h('buttons:run', async (b: Button, projectId: string, o: { employeeId?: string; input?: string }) => (await runButton(b, projectId, { employeeId: o?.employeeId, input: o?.input })).id);
   h('schedules:list', () => {
     const f = readScheds();
     return { ...f, schedules: f.schedules.map((s) => ({ ...s, next: nextRun(s, new Date(Math.max(now(), s.handled)))?.getTime() })), awake: keepingAwake() };

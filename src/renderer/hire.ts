@@ -3,6 +3,7 @@ import { accountPicker } from './accounts';
 import { attachBox } from './attach';
 import { h } from './dom';
 import { activeProject } from './projects';
+import { micButton } from './speech';
 
 const api = window.myide;
 
@@ -111,6 +112,7 @@ export async function openHire(o: { task?: string; onHired?: (e: { id: string; r
       : h('p', { className: 'pref-hint', textContent: 'No roles found. A role is an agent file in ~/.claude/agents or this project\'s .claude/agents.' }),
     desc,
     h('label', { className: 'field', htmlFor: 'hire-task' }, h('span', { className: 'legend', textContent: 'Task' }), task),
+    micButton(task, (t) => { status.textContent = t; }),
     attach.el,
     acct.el,
     mode.el,

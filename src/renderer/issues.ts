@@ -4,6 +4,7 @@ import { errText, h, key } from './dom';
 import { led, openEmployee, type Employee } from './employees';
 import { activeProject, allProjects } from './projects';
 import { registerPanel } from './registry';
+import { micButton } from './speech';
 
 const api = window.myide;
 type Issue = ForgeSnapshot['issues'][number];
@@ -113,7 +114,7 @@ export async function openNewIssue(projectId?: string, prefill = ''): Promise<vo
     h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Project' }), project),
     h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Title' }), title,
       h('span', { className: 'pref-hint', textContent: 'The title can be the whole spec. Employees verify it against the code.' })),
-    h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Body (optional)' }), body), attach.el,
+    h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Body (optional)' }), body), micButton(body, (t) => say(t)), attach.el,
     h('div', { className: 'iss-form-row' },
       h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Labels' }), labels), whoBox),
     as,

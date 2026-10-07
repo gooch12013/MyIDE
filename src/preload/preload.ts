@@ -175,6 +175,8 @@ const api = {
     /** The file's text and the checkout it is in (root, branch). */
     read: (path: string): Promise<{ text: string; root: string; branch: string }> => ipcRenderer.invoke('code:read', path),
     write: (path: string, text: string): Promise<void> => ipcRenderer.invoke('code:write', path, text),
+    /** True for an existing file the editor may open (inside a project or a MyIDE worktree). */
+    exists: (path: string): Promise<boolean> => ipcRenderer.invoke('code:exists', path),
     /** Installed IDEs ('WebStorm', 'VS Code'), and opening a file at a line in one. */
     ides: (): Promise<string[]> => ipcRenderer.invoke('code:ides'),
     openIn: (ide: string, path: string, line: number): Promise<void> => ipcRenderer.invoke('code:open-in', ide, path, line),

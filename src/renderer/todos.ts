@@ -8,6 +8,7 @@ import { openHire } from './hire';
 import { openNewIssue } from './issues';
 import { activeProject } from './projects';
 import { openPanel, registerPanel } from './registry';
+import { micButton } from './speech';
 
 const api = window.myide;
 type Approval = Awaited<ReturnType<typeof api.approvals.list>>[number];
@@ -38,7 +39,7 @@ registerPanel('todos', {
     const status = h('p', { className: 'pref-warn td-status' });
     status.setAttribute('aria-live', 'polite');
     const say = (t: string) => { status.textContent = t; };
-    const add = h('form', { className: 'td-add' }, h('span', { className: 'td-add-ic', textContent: '+' }), input,
+    const add = h('form', { className: 'td-add' }, h('span', { className: 'td-add-ic', textContent: '+' }), input, micButton(input, (t) => say(t)),
       h('span', { className: 'td-add-hint' }, 'Enter adds · ', h('b', { textContent: '#tag' }), ' · ', h('b', { textContent: '@sysadmin' }), ' assigns'));
     add.onsubmit = async (ev) => {
       ev.preventDefault();

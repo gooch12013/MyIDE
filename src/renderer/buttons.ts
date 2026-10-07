@@ -4,6 +4,7 @@ import { describe, nextRun, WEEKDAYS } from '../main/schedules';
 import { errText, h, key } from './dom';
 import { activeProject, allProjects } from './projects';
 import { registerPanel } from './registry';
+import { micButton, speakButton } from './speech';
 
 const api = window.myide;
 const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -123,7 +124,7 @@ function ask(b: Pick<Button, 'label' | 'input'>): Promise<string | null> {
   return new Promise((resolve) => {
     const input = h('input', { className: 'input', required: true });
     let value: string | null = null;
-    sheet(b.label, [field(b.input!, input)], async () => { value = input.value; return ''; }, 'Run');
+    sheet(b.label, [field(b.input!, input), micButton(input)], async () => { value = input.value; return ''; }, 'Run');
     document.querySelector<HTMLDialogElement>('.btn-sheet')!.addEventListener('close', () => resolve(value));
     input.focus();
   });
@@ -225,7 +226,8 @@ registerPanel('buttons', {
         const enabled = h('input', { type: 'checkbox', className: 'switch', checked: s.enabled, title: 'On' });
         enabled.onchange = () => void api.schedules.save({ ...s, enabled: enabled.checked });
         const last = s.last
-          ? h('span', {}, `${s.last.status} · ${when(s.last.at)} `, ...(s.last.report ? [key('Report', () => void api.files.open(s.last!.report!))] : []))
+          ? h('span', {}, `${s.last.status} · ${when(s.last.at)} `, ...(s.last.report ? [key('Report', () => void api.files.open(s.last!.report!))] : []),
+            speakButton(() => `${b?.label ?? 'Schedule'} in ${p?.name ?? 'another project'}: ${s.last!.status}, ${when(s.last!.at)}.`, 'Read result aloud'))
           : h('span', { className: 'pref-hint', textContent: 'Not run yet' });
         const row = h('div', { className: 'sched-row' }, enabled,
           h('span', { className: 'sched-what' }, h('b', { textContent: b?.label ?? 'Button in another project' }), ` ${p?.name ?? '?'}`),

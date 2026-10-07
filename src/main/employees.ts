@@ -46,7 +46,8 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // heldFor: the ceiling and who asked, so the approval can be raised again after a restart.
 // wakeups: turns a lead ran on its reports' results since David last spoke to it (runaway bound).
 // A pending turn with images David attached carries their stored paths.
-type Pending = string | { text: string; images: string[] };
+// quiet: a scheduled run; it notifies only when it fails or needs David, never when it is done.
+type Pending = string | { text: string; images?: string[]; quiet?: boolean };
 // go: This Mac's next turn runs the approved plan (permission mode default, these commands granted once).
 interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
 
@@ -61,6 +62,7 @@ const emps = new Map<string, Emp>();
 const orgs = new Map<string, ProjectOrg>();
 const turns = new Map<string, Turn>();
 const changeCbs: ((e: Employee) => void)[] = [];
+const removedCbs: ((id: string) => void)[] = [];
 // Why MyIDE interrupted a running turn, so its result is read correctly.
 const why = new Map<string, 'user' | 'model' | 'talk' | 'fire' | 'bare' | 'quit' | 'pause'>();
 const talkPtys = new Map<string, string>(); // Talk terminal PTY id -> employee id
@@ -84,6 +86,7 @@ const broadcast = (channel: string, ...args: unknown[]) => {
 export const MAC = { id: 'mac', name: 'This Mac', path: join(STATE_DIR, 'mac'), colour: '#8fa3b8' };
 const isMac = (e: { projectId: string }) => e.projectId === MAC.id;
 const goTurns = new Set<string>(); // This Mac employees whose running turn is a GO
+const quietTurns = new Set<string>(); // employees whose running turn is a scheduled run
 const MAC_RULES = 'You work on David\'s Mac itself (shell, files, settings, his servers and services), not in a code repository. '
   + 'Every task starts in plan mode: investigate read-only, then call ExitPlanMode with your plan. In the plan put every command you will run, '
   + 'exactly as you will run it, one per line, in a single ```bash block, and list each file you will edit with its full path. '
@@ -140,6 +143,14 @@ export const hireEmployee = (o: HireOpts): Promise<Employee> => hire(o);
 
 /** Every change to an employee (B's forge panel follows assignments with it). */
 export function onEmployeeChange(cb: (e: Employee) => void): void { changeCbs.push(cb); }
+/** An employee was fired. */
+export function onEmployeeRemoved(cb: (id: string) => void): void { removedCbs.push(cb); }
+
+/** Every employee, or one project's. */
+export const listEmployees = (projectId?: string): Employee[] => [...emps.values()].filter((e) => !projectId || e.projectId === projectId).map(view);
+
+/** David's message as `id`'s next turn (buttons.ts). quiet: a scheduled run, see Pending. */
+export const sendToEmployee = (id: string, text: string, o: { quiet?: boolean } = {}): void => send(id, text, undefined, undefined, undefined, o.quiet);
 
 /** Loads every project's employees. A turn that was running when MyIDE quit is now 'interrupted' (send resumes it). */
 function load(): void {
@@ -276,6 +287,7 @@ function start(e: Emp): void {
     try { const r = e.roleFile ? parseRole(e.roleFile, 'user') : null; maxTurns = r?.maxTurns; addDirs = r?.addDirs; } catch { /* role file gone */ }
     const go = e.go; // taken by this turn only; the plan turn still ending when David hit GO must not clear it
     if (go) { grantCommands(e.id, go); goTurns.add(e.id); e.go = undefined; }
+    if (typeof next !== 'string' && next.quiet) quietTurns.add(e.id); else quietTurns.delete(e.id);
     turn = runTurnFor(e, {
       ...(isMac(e) ? { permissionMode: go ? 'default' as const : 'plan' as const, addDirs } : {}),
       cwd: e.worktree, prompt, images: typeof next === 'string' ? undefined : next.images, sessionId: e.sessionId, model: e.model, effort: e.effort, maxTurns,
@@ -284,6 +296,7 @@ function start(e: Emp): void {
   } catch (err) {
     // Keep the prompt (and a GO with it); it runs when David next sends or talks.
     if (goTurns.delete(e.id)) { clearGrants(e.id); e.go = e.plan?.commands; }
+    quietTurns.delete(e.id);
     e.pending.unshift(next);
     e.queuedAt = queuedAt;
     e.paused = true;
@@ -304,6 +317,7 @@ function start(e: Emp): void {
 function finish(e: Emp, r: Result): void {
   turns.delete(e.id);
   if (goTurns.delete(e.id)) clearGrants(e.id); // a GO covers one turn; the next one plans again
+  const quiet = quietTurns.delete(e.id);
   const w = why.get(e.id);
   why.delete(e.id);
   if (!emps.has(e.id)) return schedule(); // fired
@@ -330,7 +344,7 @@ function finish(e: Emp, r: Result): void {
   if (ended && !r.interrupted && reportBack(e)) {
     // Its lead hears about it, not David. A contractor goes back to the pool once it has reported.
     if (e.contractor && e.state === 'done') void releaseContractor(e);
-  } else if (ended || (e.state === 'interrupted' && !w)) notify(e);
+  } else if ((ended || (e.state === 'interrupted' && !w)) && !(quiet && e.state === 'done')) notify(e);
   schedule();
 }
 
@@ -414,13 +428,13 @@ function get(id: string): Emp {
 }
 
 /** A new task for `e` (from David, or from lead `by`): auto mode re-picks from it; a lead's pick applies in manager mode. */
-function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>, images?: unknown): void {
+function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>, images?: unknown, quiet?: boolean): void {
   const e = get(id);
   if (typeof text !== 'string' || !text.trim()) throw new Error('Nothing to send');
   if (e.mode === 'auto') choose(e, autoFor(text, e), by);
   else if (pick?.model || pick?.effort) choose(e, { model: pick.model || e.model, effort: pick.effort ?? e.effort }, by);
   const paths = saveAttachments(e.projectId, e.name, images);
-  e.pending.push(paths.length ? { text, images: paths } : text);
+  e.pending.push(paths.length || quiet ? { text, images: paths.length ? paths : undefined, quiet } : text);
   e.queuedAt ??= Date.now();
   e.paused = false;
   if (!by) e.wakeups = 0; // David spoke to it
@@ -486,7 +500,7 @@ function hold(e: Emp, want: Pick, ceiling: Pick, by: string): void {
 
 interface HireOpts {
   projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; maxReports?: number;
-  accountId?: string; provider?: Employee['provider']; issue?: Issue; images?: unknown;
+  accountId?: string; provider?: Employee['provider']; issue?: Issue; images?: unknown; quiet?: boolean;
 }
 
 // One hire at a time: a lead's parallel assign_task calls would otherwise pick the same free name.
@@ -538,7 +552,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   if (e.mode === 'auto') choose(e, autoFor(e.task!, first), by);
   else if (by) choose(e, first, by);
   emit(e);
-  e.pending.push(images.length ? { text: e.task!, images } : e.task!);
+  e.pending.push(images.length || o.quiet ? { text: e.task!, images: images.length ? images : undefined, quiet: o.quiet } : e.task!);
   e.queuedAt = Date.now();
   save(e.projectId);
   schedule();
@@ -584,7 +598,9 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
   emps.delete(id);
   save(e.projectId);
   broadcast('employees:removed', id);
+  for (const cb of removedCbs) { try { cb(id); } catch (err) { console.error(err); } }
   for (const a of pendingApprovals()) if (a.employeeId === id) resolveApproval(a.id, false, 'Employee fired');
+  approvalGone(); // NEEDS YOU drops its cards
   await interrupt(id, 'fire');
   rmSync(settingsFile(e), { force: true });
   rmSync(mcpFile(e), { force: true });
@@ -840,7 +856,7 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   void startMcp().then(() => { mcpReady = true; schedule(); }, (err) => console.error('MCP server failed to start', err));
 
   const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
-  h('employees:list', (projectId?: string) => [...emps.values()].filter((e) => !projectId || e.projectId === projectId).map(view));
+  h('employees:list', listEmployees);
   h('employees:roles', (projectId: string) => roles(projectId).map(({ file, ...r }) => r));
   h('employees:hire', hire);
   h('employees:send', (id: string, text: string, images?: unknown) => send(id, text, undefined, undefined, images));

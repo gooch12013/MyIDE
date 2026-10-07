@@ -2,9 +2,11 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Terminal } from '@xterm/xterm';
+import { openAt } from './editor';
+import { fileRefs, resolvePath } from './links';
 import { isParking, openPanel, registerPanel } from './registry';
 
-const { pty, terminal } = window.myide;
+const { pty, terminal, code } = window.myide;
 let settings = terminal.settings();
 type Info = { cwd: string; process: string };
 const terms = new Map<string, { term: Terminal; write(d: string): void; info(i: Info): void; refit(): void }>(); // by panel id (= PTY id)
@@ -54,6 +56,21 @@ registerPanel('terminal', {
     term.loadAddon(fit);
     term.loadAddon(new WebLinksAddon((_e, uri) => void terminal.openUrl(uri)));
     term.open(el);
+    // file:line in the output opens the editor there: relative paths against the shell's cwd, and only
+    // files inside a project or a MyIDE worktree (main checks). ponytail: string index = cell column, so a
+    // line with wide characters before the path underlines a little off; wrapped paths are not joined.
+    term.registerLinkProvider({
+      provideLinks(y, done) {
+        const text = term.buffer.active.getLine(y - 1)?.translateToString(true) ?? '';
+        const refs = fileRefs(text).map((r) => ({ ...r, abs: resolvePath(cwd || '/', r.path) }));
+        if (!refs.length) return done(undefined);
+        void Promise.all(refs.map((r) => code.exists(r.abs).catch(() => false))).then((ok) => done(refs.filter((_, i) => ok[i]).map((r) => ({
+          range: { start: { x: r.start + 1, y }, end: { x: r.end, y } },
+          text: text.slice(r.start, r.end),
+          activate: () => void openAt(r.abs, r.line, id),
+        }))));
+      },
+    });
 
     let webgl: WebglAddon | undefined;
     let ownerWindow: Window | null = null;

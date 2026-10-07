@@ -8,6 +8,7 @@ import { rollup, SLOW_AT, type Usage } from '../main/org';
 import { draftCard } from './issues';
 import type { OrgState } from '../preload/preload';
 import { fmtPick, MODE_TEXT } from './hire';
+import { speakButton } from './speech';
 
 export type { Employee, EmployeeState };
 type Approval = Awaited<ReturnType<typeof api.approvals.list>>[number];
@@ -101,7 +102,8 @@ function needCard(a: Approval, who: string, colour: string | undefined): HTMLEle
     ];
   }
   card.append(
-    h('div', { className: 'need-head' }, led('needs-you', KIND[a.kind]), h('span', { className: 'need-who', textContent: who })),
+    h('div', { className: 'need-head' }, led('needs-you', KIND[a.kind]), h('span', { className: 'need-who', textContent: who }),
+      speakButton(() => `${who} ${a.kind === 'plan' ? 'has a plan for you to approve.' : `${a.kind === 'question' ? 'asks' : 'wants approval'}: ${a.text ?? `to use ${a.tool}`}`}`, 'Read aloud')),
     ...body,
     h('div', { className: 'need-keys' }, ...keys),
   );
@@ -219,6 +221,20 @@ function projectLine(p: { id: string; name: string; colour: string }, list: Empl
   return line;
 }
 
+/** This Mac's staff (the to-dos' employees) as one folded line under the projects. */
+const MAC_COLOUR = '#8fa3b8'; // MAC.colour in src/main/employees.ts
+function macLine(list: Employee[], closed: Set<string>, open: { on: boolean }): HTMLElement {
+  const working = list.filter((e) => e.state === 'working').length;
+  const needs = list.filter((e) => ATTENTION.includes(e.state)).length;
+  const state = needs ? led('needs-you', `${needs} need${needs === 1 ? 's' : ''} you`) : working ? led('working', `${working} working`) : led('idle', 'Idle');
+  const head = h('summary', { className: 'proj-line' }, h('span', { className: 'proj-line-name', textContent: 'This Mac' }), state, h('span'),
+    h('span', { className: 'proj-line-roll', textContent: `${list.length} staff` }), h('span'));
+  head.style.setProperty('--proj', MAC_COLOUR);
+  const d = h('details', { className: 'mac-line', open: open.on }, head, h('div', { className: 'o-list' }, ...tree(list, closed, 3)));
+  d.addEventListener('toggle', () => { open.on = d.open; });
+  return d;
+}
+
 const CEILINGS = [['', 'No ceiling'], ['haiku', 'Haiku'], ['sonnet', 'Sonnet'], ['opus', 'Opus']];
 
 registerPanel('employees', {
@@ -256,10 +272,13 @@ registerPanel('employees', {
 
     const emps = new Map<string, Employee>();
     const closed = new Set<string>();
+    const macOpen = { on: false };
     let org: OrgState | undefined;
     const draw = () => {
       const everyone = [...emps.values()];
-      if (org) lines.replaceChildren(...allProjects().map((p) => projectLine(p, everyone.filter((e) => e.projectId === p.id), org!, p.id === project?.id)));
+      const mac = everyone.filter((e) => e.projectId === 'mac');
+      if (org) lines.replaceChildren(...allProjects().map((p) => projectLine(p, everyone.filter((e) => e.projectId === p.id), org!, p.id === project?.id)),
+        ...(mac.length ? [macLine(mac, closed, macOpen)] : []));
       if (!project) return;
       const all = everyone.filter((e) => e.projectId === project.id);
       list.replaceChildren(...tree(all, closed, org?.caps.maxReports ?? 3));

@@ -1,6 +1,8 @@
 import { employeeAi } from './accounts';
 import { attachBox, imagePaths, thumb, workImages } from './attach';
 import { errText, h, key } from './dom';
+import { linkify } from './editor';
+import { micButton, speakButton } from './speech';
 import { api, chip, cue, led, openEmployees, type Employee } from './employees';
 import { ceilingNote, fmtPick, modelPicker, modePicker } from './hire';
 import { allProjects } from './projects';
@@ -48,7 +50,10 @@ registerPanel('employee', {
     const [progRow, progDd] = line('Progress');
     const [leftRow, leftDd] = line('Left');
     const status3 = h('dl', { className: 'status3' }, onRow, progRow, leftRow);
+    const statusBlock = h('div', { className: 'emp-said' }, status3,
+      speakButton(() => (emp ? `${emp.name}. On: ${onDd.textContent}. ${progDd.textContent}. Next: ${leftDd.textContent}.` : ''), 'Read status aloud'));
     const last = h('p', { className: 'emp-last' });
+    const lastBlock = h('div', { className: 'emp-said emp-said--last' }, last, speakButton(() => emp?.lastText ?? '', 'Read last message aloud'));
     let lastShots: HTMLElement = h('div'); // images its last message mentions, from its worktree
     let shotsKey = '';
     const cues = h('ol', { className: 'cuelist' });
@@ -93,7 +98,7 @@ registerPanel('employee', {
       if (!transcript.open) return;
       try {
         const t = await api.employees.transcript(id);
-        lines.replaceChildren(...t.map((m) => h('li', {}, h('span', { className: 'legend', textContent: m.role }), ' ', m.text,
+        lines.replaceChildren(...t.map((m) => h('li', {}, h('span', { className: 'legend', textContent: m.role }), ' ', ...linkify(m.text, emp?.worktree ?? ''),
           m.images?.length ? h('div', { className: 'iss-thumbs' }, ...m.images.map((src, n) => thumb(src, `Image ${n + 1}`))) : '',
           m.role === 'user' ? '' : workImages(id, m.text))));
         if (!t.length) lines.append(h('li', { textContent: 'Nothing yet.' }));
@@ -112,8 +117,8 @@ registerPanel('employee', {
         h('button', { type: 'button', className: 'btn rm', textContent: 'Fire, remove worktree', onclick: doFire(true) }))));
 
     const box = (title: string, ...kids: Node[]) => h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: title }), ...kids);
-    el.append(head, status3, last, lastShots, h('div', { className: 'emp-grid' },
-      h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, send), sent)),
+    el.append(head, statusBlock, lastBlock, lastShots, h('div', { className: 'emp-grid' },
+      h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, micButton(msg, say), send), sent)),
       h('div', { className: 'emp-col' }, box('Model & effort', aiLine, mode.el, pick.el, pending, held, ceil), box('Worktree', tree), transcript)),
     status, fireSheet);
 
@@ -140,7 +145,7 @@ registerPanel('employee', {
       progDd.textContent = e.state === 'failed' ? `Failed: ${e.error ?? 'no detail'}`
         : p?.total ? `${c.count} · ${p.done} done` : led(e.state).textContent!;
       leftDd.textContent = p?.next.length ? p.next.join(' · ') : 'Nothing queued';
-      last.textContent = e.lastText ?? '';
+      last.replaceChildren(...linkify(e.lastText ?? '', e.worktree));
       const k = imagePaths(e.lastText ?? '').join('\n'); // refetched only when the paths change
       if (k !== shotsKey) { shotsKey = k; const next = workImages(id, e.lastText ?? ''); lastShots.replaceWith(next); lastShots = next; }
 

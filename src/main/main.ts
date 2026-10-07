@@ -33,6 +33,15 @@ const ORIGIN = 'app://myide';
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true } }]);
 
 let mainWindow: BrowserWindow | null = null;
+// Closing the main window hides it (and its pop-outs) so schedules keep firing; Cmd+Q and the tray's Quit really quit.
+let quitting = false;
+app.on('before-quit', () => { quitting = true; });
+function showAll(): void {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  for (const w of BrowserWindow.getAllWindows()) w.show();
+  mainWindow.focus();
+}
 
 function createMainWindow(): void {
   mainWindow = new BrowserWindow({
@@ -45,6 +54,12 @@ function createMainWindow(): void {
     titleBarStyle: 'hiddenInset',
     webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
   });
+  mainWindow.on('close', (e) => {
+    if (quitting) return;
+    e.preventDefault();
+    mainWindow!.webContents.send('command', 'flush-layout'); // what a close would have saved
+    for (const w of BrowserWindow.getAllWindows()) w.hide();
+  });
   mainWindow.on('closed', () => {
     mainWindow = null;
     app.quit(); // pop-outs belong to the main window
@@ -52,10 +67,8 @@ function createMainWindow(): void {
   mainWindow.loadURL(`${ORIGIN}/index.html`);
 }
 
-app.on('second-instance', () => {
-  if (mainWindow?.isMinimized()) mainWindow.restore();
-  mainWindow?.focus();
-});
+app.on('second-instance', showAll);
+app.on('activate', showAll); // the Dock icon
 
 // Keyboard commands go through main so they work in pop-out windows too; the renderer that owns
 // the layout (the main window) handles them.
@@ -104,8 +117,7 @@ app.whenReady().then(() => {
   registerAssetsIpc();
   registerTodosIpc();
   createMainWindow();
-  const show = () => { mainWindow?.show(); mainWindow?.focus(); };
-  void startTray({ open: show, showNeeds: () => { show(); mainWindow?.webContents.send('command', 'panel:employees'); } });
+  void startTray({ open: showAll, showNeeds: () => { showAll(); mainWindow?.webContents.send('command', 'panel:employees'); } });
 });
 
 app.on('before-quit', killAllPtys);

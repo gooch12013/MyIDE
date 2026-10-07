@@ -178,6 +178,8 @@ const unwatch = (id: number): void => { watchers.get(id)?.close(); watchers.dele
 
 export function registerGitIpc(): void {
   ipcMain.handle('code:read', (_e, path: unknown) => read(path));
+  // A file:line link is only offered for a file the editor may open.
+  ipcMain.handle('code:exists', (_e, path: unknown) => allowed(path) && existsSync(path));
   ipcMain.handle('code:write', (_e, path: unknown, text: unknown) => {
     if (typeof text !== 'string') throw new Error('Nothing to save');
     writeFileSync(check(path), text);

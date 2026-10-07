@@ -5,6 +5,7 @@ import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stripAttribution } from './attribution';
 import { assignIssue, tell } from './employees';
+import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
 import { onIssuePost } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
@@ -492,10 +493,14 @@ async function fileDraft(projectId: string, id: string): Promise<{ number: numbe
 
 // ---- tokens ----
 
-function ghToken(): Promise<string | null> {
-  return spawnEnv().then((env) => new Promise((resolve) => {
-    execFile('gh', ['auth', 'token', '--hostname', 'github.com'], { env, timeout: 5000 }, (err, out) => resolve(err ? null : out.trim() || null));
-  }), () => null);
+/** gh's token for github.com: gh on the login PATH, else the gh MyIDE installed as an optional component. */
+async function ghToken(): Promise<string | null> {
+  const env = await spawnEnv().catch(() => undefined);
+  const run = (bin: string) => new Promise<string | null>((resolve) => {
+    execFile(bin, ['auth', 'token', '--hostname', 'github.com'], { env, timeout: 5000 }, (err, out) => resolve(err ? null : out.trim() || null));
+  });
+  const own = componentPath('gh');
+  return (await run('gh')) ?? (own ? run(own) : null);
 }
 
 /** Every forge host that can hold a token: github.com always, plus each linked Forgejo. */
