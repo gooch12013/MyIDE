@@ -93,6 +93,10 @@ function watchReload(wc: WebContents, saved: () => Set<string>): void {
   });
 }
 
+let onExit: (id: string) => void = () => {};
+/** `cb` runs with the panel id whenever a PTY exits (employees end Talk this way). */
+export function onPtyExit(cb: (id: string) => void): void { onExit = cb; }
+
 /** Kills panel `id`'s PTY, now or as soon as its spawn finishes. */
 export function killPty(id: string): void {
   if (pending.has(id)) killOnSpawn.add(id);
@@ -126,7 +130,7 @@ function keep(e: Entry, d: string): void {
 
 async function spawn(id: string, owner: WebContents, opts: PtySpawnOptions): Promise<PtyInfo> {
   const env = {
-    ...baseEnv, PATH: await loginPath, LANG: baseEnv.LANG || 'en_US.UTF-8',
+    ...(await spawnEnv()),
     TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'MyIDE', TERM_PROGRAM_VERSION: app.getVersion(),
   };
   const cwd = opts.cwd && existsSync(opts.cwd) ? opts.cwd : homedir();
@@ -142,6 +146,7 @@ async function spawn(id: string, owner: WebContents, opts: PtySpawnOptions): Pro
   });
   p.onExit(({ exitCode }) => {
     if (ptys.get(id) === entry) ptys.delete(id);
+    onExit(id);
     if (!entry.owner.isDestroyed()) entry.owner.send('pty:exit', id, exitCode);
   });
   if (killOnSpawn.delete(id)) p.kill();

@@ -1,15 +1,16 @@
 import { BrowserWindow, ipcMain, Notification } from 'electron';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { installHooks } from './attribution';
 import type { ClaudeEvent, TaskState } from './claude/parse';
-import { runTurn, type Turn } from './claude/transport';
+import { runTurn, type Turn, type TurnOpts } from './claude/transport';
 import { claudeInfo } from './claude/version';
 import { employeeMcpConfig, onApproval, onApprovalGone, pendingApprovals, registerControlTool, resolveApproval, startMcp, type Approval } from './mcp';
 import { listProjects, readConfig } from './projects';
-import { readJSON, STATE_DIR, writeJSON } from './store';
+import { onPtyExit } from './pty';
+import { lockDown, readJSON, STATE_DIR, writeJSON, writePrivate } from './store';
 import { addWorktree, branchExists, checkRepo, removeWorktree } from './worktree';
 
 export type EmployeeState = 'idle' | 'queued' | 'working' | 'needs-you' | 'done' | 'failed' | 'interrupted' | 'talking';
@@ -22,8 +23,9 @@ export interface Employee {
 export interface Role { name: string; description: string; model?: string; effort?: string; source: 'user' | 'project' }
 type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // Stored beside the public fields: the role file, the parser's task list, turns waiting to run.
-// allow: --allowedTools rules David granted after an approval timed out, used by the next turn only.
-interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: string[]; queuedAt?: number; allow?: string[] }
+// paused: David interrupted, so pending turns wait for his next send or talk.
+// ended: the state the last turn ended in, shown again once a late approval is answered.
+interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: string[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState }
 
 const HOOKS = join(STATE_DIR, 'hooks');
 const CLAUDE_PROJECTS = join(homedir(), '.claude', 'projects'); // default account; CLAUDE_CONFIG_DIR is never set
@@ -34,16 +36,20 @@ const DEFAULT_MODEL = 'sonnet';
 const emps = new Map<string, Emp>();
 const turns = new Map<string, Turn>();
 // Why MyIDE interrupted a running turn, so its result is read correctly.
-const why = new Map<string, 'user' | 'model' | 'talk' | 'fire' | 'bare'>();
+const why = new Map<string, 'user' | 'model' | 'talk' | 'fire' | 'bare' | 'quit'>();
+const talkPtys = new Map<string, string>(); // Talk terminal PTY id -> employee id
 let focus: () => BrowserWindow | null = () => null;
+let mcpReady = false;
+let quitting = false;
 
 const projDir = (projectId: string) => join('projects', projectId);
 const settingsFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'settings', `${e.id}.json`);
 const mcpFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'mcp', `${e.id}.json`);
+const talkPromptFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'talk', `${e.id}.md`);
 const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'employee';
 const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-const view = ({ roleFile, tasks, pending, queuedAt, allow, ...e }: Emp): Employee => e;
-const put = (file: string, data: object) => { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, JSON.stringify(data, null, 2)); };
+const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, ...e }: Emp): Employee => e;
+const put = (file: string, data: object) => writePrivate(file, JSON.stringify(data, null, 2));
 const broadcast = (channel: string, ...args: unknown[]) => {
   for (const w of BrowserWindow.getAllWindows()) if (!w.webContents.isDestroyed()) w.webContents.send(channel, ...args);
 };
@@ -121,8 +127,9 @@ function caps(): { global: number; perProject: number } {
 
 /** Starts waiting turns, oldest first, while there are free slots; the rest show 'queued'. */
 function schedule(): void {
+  if (!mcpReady || quitting) return; // every turn needs the MCP server's port
   const cap = caps();
-  const waiting = [...emps.values()].filter((e) => e.pending.length && !turns.has(e.id) && e.state !== 'talking')
+  const waiting = [...emps.values()].filter((e) => e.pending.length && !e.paused && !turns.has(e.id) && e.state !== 'talking')
     .sort((a, b) => (a.queuedAt ?? 0) - (b.queuedAt ?? 0));
   for (const e of waiting) {
     const inProject = [...turns.keys()].filter((id) => emps.get(id)?.projectId === e.projectId).length;
@@ -143,19 +150,30 @@ function setProgress(e: Emp, tasks: TaskState): void {
 
 function start(e: Emp): void {
   const prompt = e.pending.shift()!;
+  const queuedAt = e.queuedAt;
   if (!e.pending.length) e.queuedAt = undefined;
-  const allow = e.allow;
-  e.allow = undefined;
   let turn: Turn;
+  const onEvent: TurnOpts['onEvent'] = (ev) => {
+    if (ev.type === 'init') {
+      e.sessionId = ev.sessionId;
+      // --bare (or a future bare default) drops MyIDE's server; working without approvals is worse than stopping.
+      if (!ev.mcpServers.some((s) => s.name === 'myide')) { why.set(e.id, 'bare'); turn.interrupt(); }
+      emit(e);
+    } else if (ev.type === 'tasks') { setProgress(e, ev.tasks); emit(e); }
+    else if (ev.type === 'text' && ev.text.trim()) { e.lastText = ev.text.trim().slice(-2000); emit(e); }
+  };
   try {
     put(settingsFile(e), employeeSettings());
     put(mcpFile(e), employeeMcpConfig(e.id)); // rewritten each turn: the server's port changes per launch
     turn = runTurn({
       cwd: e.worktree, prompt, sessionId: e.sessionId, model: e.model, effort: e.effort,
-      settingsPath: settingsFile(e), mcpConfigPath: mcpFile(e), appendSystemPrompt: systemPrompt(e), prevTasks: e.tasks,
-      args: allow?.length ? ['--allowedTools', ...allow] : undefined,
+      settingsPath: settingsFile(e), mcpConfigPath: mcpFile(e), appendSystemPrompt: systemPrompt(e), prevTasks: e.tasks, onEvent,
     });
   } catch (err) {
+    // Keep the prompt; it runs when David next sends or talks.
+    e.pending.unshift(prompt);
+    e.queuedAt = queuedAt;
+    e.paused = true;
     e.state = 'failed';
     e.error = (err as Error).message;
     emit(e);
@@ -165,16 +183,8 @@ function start(e: Emp): void {
   turns.set(e.id, turn);
   e.state = 'working';
   e.error = undefined;
+  e.ended = undefined;
   emit(e);
-  turn.onEvent((ev) => {
-    if (ev.type === 'init') {
-      e.sessionId = ev.sessionId;
-      // --bare (or a future bare default) drops MyIDE's server; working without approvals is worse than stopping.
-      if (!ev.mcpServers.some((s) => s.name === 'myide')) { why.set(e.id, 'bare'); turn.interrupt(); }
-      emit(e);
-    } else if (ev.type === 'tasks') { setProgress(e, ev.tasks); emit(e); }
-    else if (ev.type === 'text' && ev.text.trim()) { e.lastText = ev.text.trim().slice(-2000); emit(e); }
-  });
   turn.done.then((r) => finish(e, r), (err) => finish(e, { type: 'result', ok: false, interrupted: false, text: String(err), sessionId: e.sessionId ?? '' }));
 }
 
@@ -184,7 +194,7 @@ function finish(e: Emp, r: Result): void {
   why.delete(e.id);
   if (!emps.has(e.id)) return schedule(); // fired
   if (r.sessionId) e.sessionId = r.sessionId;
-  if (r.text) e.lastText = r.text.slice(-2000);
+  if (r.text && !r.interrupted) e.lastText = r.text.slice(-2000); // an interrupted result's text is a CLI diagnostic
   if (w === 'talk') e.state = 'talking';
   else if (w === 'bare') { e.state = 'failed'; e.error = 'This Claude Code version runs -p without MyIDE\'s MCP server (bare mode), so the employee was stopped.'; }
   else if (w === 'model' && r.interrupted) { e.pending.unshift(CONTINUE); e.queuedAt = 0; e.state = 'queued'; }
@@ -193,11 +203,13 @@ function finish(e: Emp, r: Result): void {
   else { e.state = 'failed'; e.error = r.text || 'The turn failed.'; }
   // The CLI gave up waiting (approve answered deny), but David still has to answer it.
   if (e.state !== 'talking' && pendingApprovals().some((a) => a.employeeId === e.id && a.timedOut)) {
+    e.ended = e.state;
     e.state = 'needs-you';
     broadcast('approvals:change', pendingApprovals()); // the renderer learns timedOut here
   }
   emit(e);
-  // Interrupts MyIDE asked for are not news; one that came from an error is.
+  // Interrupts MyIDE asked for are not news; one that came from an error is. Nothing is news at quit.
+  if (w === 'quit') return;
   if (e.state === 'done' || e.state === 'failed' || (e.state === 'interrupted' && !w)) notify(e);
   schedule();
 }
@@ -205,8 +217,14 @@ function finish(e: Emp, r: Result): void {
 function employeeSettings(): object {
   return {
     attribution: { commit: '', pr: '' },
-    // Forge writes go through MyIDE's forge tool only.
-    permissions: { deny: ['Bash(gh pr create *)', 'Bash(gh pr comment *)', 'Bash(gh pr edit *)', 'Bash(gh pr review *)', 'Bash(gh pr merge *)', 'Bash(gh issue *)', 'Bash(tea *)'] },
+    permissions: {
+      deny: [
+        // Forge access goes through MyIDE's forge tool only.
+        'Bash(gh *)', 'Bash(env gh *)', 'Bash(command gh *)', 'Bash(*/gh *)', 'Bash(tea *)', 'Bash(curl *api.github.com*)',
+        // The commit-msg hook strips attribution; skipping hooks would skip that.
+        'Bash(git commit --no-verify*)', 'Bash(git commit *--no-verify*)', 'Bash(git commit -n*)', 'Bash(git commit * -n*)',
+      ],
+    },
   };
 }
 
@@ -214,10 +232,16 @@ function employeeSettings(): object {
 
 const LABEL: Partial<Record<EmployeeState, string>> = { 'needs-you': 'needs you', done: 'is done', failed: 'failed', interrupted: 'was interrupted' };
 
+// Held until clicked or closed: a notification that is garbage-collected loses its click handler.
+const shown = new Set<Notification>();
+
 function notify(e: Emp, body?: string): void {
   if (!Notification.isSupported()) return;
   const n = new Notification({ title: `${e.name} ${LABEL[e.state] ?? e.state}`, body: (body ?? e.error ?? e.lastText ?? e.task ?? '').slice(0, 200) });
+  shown.add(n);
+  n.on('close', () => shown.delete(n));
   n.on('click', () => {
+    shown.delete(n);
     const w = focus();
     if (!w) return;
     if (w.isMinimized()) w.restore();
@@ -241,6 +265,16 @@ function send(id: string, text: string): void {
   if (typeof text !== 'string' || !text.trim()) throw new Error('Nothing to send');
   e.pending.push(text);
   e.queuedAt ??= Date.now();
+  e.paused = false;
+  save(e.projectId);
+  schedule();
+}
+
+/** A turn that answers something David just did; it goes ahead of anything already queued. */
+function followUp(e: Emp, text: string): void {
+  e.pending.unshift(text);
+  e.queuedAt ??= Date.now();
+  e.paused = false;
   save(e.projectId);
   schedule();
 }
@@ -271,7 +305,7 @@ async function hire(o: { projectId: string; role: string; task: string; model?: 
   return view(e);
 }
 
-function interrupt(id: string, reason: 'user' | 'model' | 'talk' | 'fire'): Promise<unknown> | undefined {
+function interrupt(id: string, reason: 'user' | 'model' | 'talk' | 'fire' | 'quit'): Promise<unknown> | undefined {
   const t = turns.get(id);
   if (!t) return;
   why.set(id, reason);
@@ -279,13 +313,30 @@ function interrupt(id: string, reason: 'user' | 'model' | 'talk' | 'fire'): Prom
   return t.done.catch(() => {});
 }
 
-async function talk(id: string): Promise<{ cwd: string; command: string }> {
+/** Pauses background turns; the renderer opens terminal `ptyId` in cwd and types command. Talk ends when that PTY exits. */
+async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: string }> {
   const e = get(id);
   if (!e.sessionId) throw new Error(`${e.name} has no session yet; wait for its first turn to start.`);
   await interrupt(id, 'talk');
   e.state = 'talking';
+  e.paused = false;
   emit(e);
-  return { cwd: e.worktree, command: `claude --resume ${e.sessionId} --settings ${shq(settingsFile(e))}` };
+  put(settingsFile(e), employeeSettings());
+  writePrivate(talkPromptFile(e), systemPrompt(e));
+  const ptyId = `terminal-${randomUUID().slice(0, 8)}`;
+  talkPtys.set(ptyId, e.id);
+  // exec: when claude exits so does the PTY, which ends Talk. env -u: a shell rc must not switch accounts.
+  const command = ['exec env -u CLAUDE_CONFIG_DIR claude --resume', shq(e.sessionId), '--settings', shq(settingsFile(e)),
+    '--model', shq(e.model), ...(e.effort ? ['--effort', shq(e.effort)] : []),
+    '--append-system-prompt-file', shq(talkPromptFile(e)), '--disallowedTools Task ScheduleWakeup CronCreate RemoteTrigger'].join(' ');
+  return { cwd: e.worktree, command, ptyId };
+}
+
+function talkEnded(ptyId: string): void {
+  const e = emps.get(talkPtys.get(ptyId) ?? '');
+  if (!talkPtys.delete(ptyId) || !e) return;
+  if (e.state === 'talking') { e.state = 'idle'; emit(e); }
+  schedule();
 }
 
 async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> {
@@ -298,6 +349,7 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
   await interrupt(id, 'fire');
   rmSync(settingsFile(e), { force: true });
   rmSync(mcpFile(e), { force: true });
+  rmSync(talkPromptFile(e), { force: true });
   if (o?.removeWorktree && project) await removeWorktree(project.path, e.worktree, e.branch);
 }
 
@@ -371,35 +423,35 @@ function approvalGone(): void {
   const waiting = new Set(pendingApprovals().map((a) => a.employeeId));
   for (const e of emps.values()) {
     if (e.state !== 'needs-you' || waiting.has(e.id)) continue;
-    e.state = turns.has(e.id) ? 'working' : e.pending.length ? 'queued' : 'done';
+    e.state = turns.has(e.id) ? 'working' : e.pending.length && !e.paused ? 'queued' : e.ended ?? 'done';
     emit(e);
   }
 }
 
-/** David allowed an item whose turn already ended (timed out): grant exactly that call and ask for a short follow-up turn. */
+/** David answered an item whose turn already ended (timed out). mcp.ts now allows that exact call once; a follow-up turn retries it. */
 function allowedLate(a: Approval, message?: string): void {
   const e = emps.get(a.employeeId);
   if (!e) return;
-  if (a.kind === 'question') return send(e.id, `David answered your question: ${message ?? ''}\nContinue.`);
-  const cmd = (a.input as { command?: unknown })?.command;
-  // ponytail: non-Bash tools get the whole tool for one turn; add path-scoped rules (Edit(//abs/path)) if that is too broad.
-  (e.allow ??= []).push(a.tool === 'Bash' && typeof cmd === 'string' ? `Bash(${cmd})` : a.tool);
-  send(e.id, `David approved: ${a.text ?? a.tool}. Run it again now (it will be allowed), then continue.`);
+  if (a.kind === 'question') return followUp(e, `David answered your question: ${message ?? ''}\nContinue.`);
+  followUp(e, `David approved: ${a.text ?? a.tool}. Run exactly that again now (it will be allowed), then continue.`);
 }
 
 /** Stops running turns at quit; their saved 'working' state loads as 'interrupted'. */
 export function stopAllTurns(): void {
-  for (const t of turns.values()) t.interrupt();
+  quitting = true;
+  for (const id of turns.keys()) void interrupt(id, 'quit');
 }
 
 /** `win` gives the main window, which a notification click brings forward. */
 export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   focus = win;
-  installHooks(join(__dirname, 'hooks', 'commit-msg'), HOOKS);
+  lockDown();
+  installHooks(join(__dirname, 'hooks', 'chain'), HOOKS);
   load();
   onApproval(onNewApproval);
   onApprovalGone(approvalGone);
-  void startMcp().then(schedule, (err) => console.error('MCP server failed to start', err));
+  onPtyExit(talkEnded);
+  void startMcp().then(() => { mcpReady = true; schedule(); }, (err) => console.error('MCP server failed to start', err));
 
   const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
   h('employees:list', (projectId?: string) => [...emps.values()].filter((e) => !projectId || e.projectId === projectId).map(view));
@@ -413,13 +465,13 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
     emit(e);
     if (o.now) await interrupt(id, 'model');
   });
-  h('employees:interrupt', (id: string) => interrupt(id, 'user'));
-  h('employees:talk', talk);
-  h('employees:talk-done', (id: string) => {
+  h('employees:interrupt', (id: string) => {
     const e = get(id);
-    if (e.state === 'talking') { e.state = 'idle'; emit(e); }
-    schedule();
+    e.paused = true; // queued messages wait for the next send or talk
+    save(e.projectId);
+    return interrupt(id, 'user');
   });
+  h('employees:talk', talk);
   h('employees:fire', fire);
   h('employees:transcript', transcript);
   h('approvals:list', () => pendingApprovals());
@@ -429,9 +481,8 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
     if (a?.timedOut && allow) allowedLate(a, message); // deny of a timed-out item just clears it
     approvalGone();
   });
-  h('claude:info', async () => { const { path, ...i } = await claudeInfo(); return i; });
+  h('claude:info', claudeInfo);
   h('claude:test', claudeTest);
-  h('claude:login', () => ({ cwd: homedir(), command: 'claude' }));
 
   registerControlTool('status', 'List MyIDE employees with their state, task and progress. Optional projectId filter.',
     { type: 'object', properties: { projectId: { type: 'string' } } },

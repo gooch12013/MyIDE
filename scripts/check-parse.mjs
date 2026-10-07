@@ -1,11 +1,8 @@
 // Feeds the recorded spike streams through src/main/claude/parse.ts. Usage: node scripts/check-parse.mjs
-import { build } from 'esbuild';
 import { readFileSync } from 'node:fs';
 import { gunzipSync } from 'node:zlib';
 import assert from 'node:assert/strict';
-
-const { outputFiles } = await build({ entryPoints: ['src/main/claude/parse.ts'], bundle: true, write: false, format: 'esm', platform: 'node' });
-const { makeParser } = await import('data:text/javascript,' + encodeURIComponent(outputFiles[0].text));
+import { makeParser } from '../src/main/claude/parse.ts';
 
 const lines = (f) => readFileSync(f, 'utf8').split('\n').filter(Boolean);
 const gz = (f) => gunzipSync(readFileSync(f)).toString().split('\n').filter(Boolean);
@@ -37,7 +34,7 @@ assert.equal(init.model, 'claude-haiku-4-5-20251001');
 assert.ok(init.sessionId && init.tools.includes('TaskCreate') && init.mcpServers.some((s) => s.status === 'failed'));
 const res = evs.at(-1);
 assert.equal(res.type, 'result');
-assert.ok(res.ok && !res.interrupted && res.sessionId === init.sessionId && res.costUsd > 0);
+assert.ok(res.ok && !res.interrupted && res.sessionId === init.sessionId);
 evs = feed(makeParser(p.tasks()), gz('spikes/D/raw_run2_resume.jsonl.gz'));
 assert.equal(lastTasks(evs).length, 5);
 

@@ -37,19 +37,25 @@ function preset(name: string): void {
 
 // A named layout can be restored in any project: panels get fresh ids (so no terminal reattaches
 // to another panel's shell) and terminals start in the active project.
+/** Drops any `command` param: a terminal never runs a program from saved state. */
+function noCommands(layout: SerializedDockview): SerializedDockview {
+  for (const p of Object.values(layout.panels ?? {})) if (p.params && 'command' in p.params) delete p.params.command;
+  return layout;
+}
+
 function fresh(layout: SerializedDockview): SerializedDockview {
   let s = JSON.stringify(layout);
   for (const [id, p] of Object.entries(layout.panels)) {
     s = s.split(JSON.stringify(id)).join(JSON.stringify(`${p.contentComponent}-${crypto.randomUUID().slice(0, 8)}`));
   }
-  const out = JSON.parse(s) as SerializedDockview;
+  const out = noCommands(JSON.parse(s) as SerializedDockview);
   for (const p of Object.values(out.panels)) if (p.contentComponent === 'terminal') p.params = { ...p.params, cwd: cwd() };
   return out;
 }
 
 function restore(layout: unknown): void {
   if (layout) {
-    try { dock.fromJSON(layout as SerializedDockview); return; } catch (e) { console.error('Layout restore failed', e); }
+    try { dock.fromJSON(noCommands(layout as SerializedDockview)); return; } catch (e) { console.error('Layout restore failed', e); }
   }
   preset('terminal');
 }

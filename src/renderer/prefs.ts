@@ -1,10 +1,10 @@
 import type { Prefs } from '../main/prefs';
-import { h, key } from './dom';
+import { errText, h, key } from './dom';
 import { removeProject, resetLayout } from './layouts';
 import { activeProject, allProjects, loadProjects } from './projects';
-import { openPanel, registerPanel } from './registry';
+import { registerPanel } from './registry';
 import { api as staff, led } from './employees';
-import { reloadTerminalSettings } from './terminal';
+import { openCommandTerminal, reloadTerminalSettings } from './terminal';
 
 const api = window.myide;
 type Info = Awaited<ReturnType<typeof api.prefs.get>>;
@@ -20,7 +20,6 @@ function toggle(label: string, checked: boolean, onchange: (on: boolean) => void
   box.onchange = () => onchange(box.checked);
   return h('label', { className: 'toggle' }, box, label);
 }
-const errText = (e: unknown) => (e as Error).message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
 
 // Project colours: warn near the accent amber (the live colour) or near another project's colour.
 const AMBER = '#ffb21a';
@@ -182,8 +181,8 @@ registerPanel('preferences', {
         return [
           pref('Claude Code', i.version ? (i.tested ? 'The version MyIDE is tested with.' : `MyIDE is tested with ${i.testedVersion}.`) : 'Install Claude Code to use employees.',
             h('span', { className: 'path', textContent: i.version ?? 'none' }), state),
-          pref('Log in', 'Opens Claude Code in a terminal, where it runs its own login.', key('Log in', async () => {
-            try { const { cwd, command } = await staff.claude.login(); openPanel('terminal', { cwd, command }); } catch (e) { say(errText(e)); }
+          pref('Log in', 'Opens Claude Code in a terminal, where it runs its own login.', key('Log in', () => {
+            openCommandTerminal(undefined, 'env -u CLAUDE_CONFIG_DIR claude'); // the default account, as employees use
           })),
           pref('Test', 'Runs one tiny Claude turn to check employees can work.', key('Test', async () => {
             say('Testing…');

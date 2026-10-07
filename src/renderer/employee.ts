@@ -1,27 +1,10 @@
-import { h, key } from './dom';
+import { errText, h, key } from './dom';
 import { api, chip, cue, led, openEmployees, type Employee } from './employees';
 import { modelPicker } from './hire';
 import { allProjects } from './projects';
-import { openPanel, registerPanel } from './registry';
+import { registerPanel } from './registry';
+import { openCommandTerminal } from './terminal';
 
-// Talk terminals by panel (= PTY) id. Talk ends when the program the terminal started returns
-// to the shell, or the terminal exits or is closed (closing kills its PTY).
-const talking = new Map<string, { emp: string; seen: boolean }>();
-const talkDone = (tid: string) => {
-  const t = talking.get(tid);
-  if (!t) return;
-  talking.delete(tid);
-  void api.employees.talkDone(t.emp);
-};
-api.pty.onExit((id) => talkDone(id));
-api.pty.onInfo((id, info) => {
-  const t = talking.get(id);
-  if (!t) return;
-  if (info.process) t.seen = true;
-  else if (t.seen) talkDone(id);
-});
-
-const errText = (e: unknown) => (e as Error).message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
 const apps = api.terminal.apps().catch(() => ['Terminal']);
 
 registerPanel('employee', {
@@ -45,8 +28,8 @@ registerPanel('employee', {
     const name = h('h1', { className: 'emp-name' });
     const sub = h('p', { className: 'pref-hint' });
     const talk = key('Talk', act(async () => {
-      const { cwd, command } = await api.employees.talk(id);
-      talking.set(openPanel('terminal', { cwd, command }).id, { emp: id, seen: false });
+      const { cwd, command, ptyId } = await api.employees.talk(id); // main ends Talk when that PTY exits
+      openCommandTerminal(cwd, command, ptyId);
     }), { className: 'key key--go', title: 'Pause background turns and open this session in a terminal' });
     const interrupt = key('Interrupt', act(() => api.employees.interrupt(id), 'Interrupted.'));
     const openers = h('span', { className: 'emp-open' });

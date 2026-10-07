@@ -1,0 +1,18 @@
+#!/bin/sh
+# MyIDE employee worktrees point core.hooksPath here. Every hook name is this same script: it runs the
+# repository's own hook of that name (same args and stdin). commit-msg first drops AI attribution
+# lines, using the patterns in attribution-patterns beside it.
+dir=$(dirname "$0")
+name=$(basename "$0")
+if [ "$name" = commit-msg ] && [ -r "$dir/attribution-patterns" ]; then
+  grep -Eiv -f "$dir/attribution-patterns" "$1" > "$1.myide"
+  # 0: lines kept, 1: nothing left; 2: grep failed, so leave the message alone.
+  [ $? -lt 2 ] && awk 'NF { for (; n > 0; n--) print ""; print; next } { n++ }' "$1.myide" > "$1"
+  rm -f "$1.myide"
+fi
+
+hp=$(git config --local core.hooksPath 2>/dev/null || git config --global core.hooksPath || echo "$(git rev-parse --git-common-dir 2>/dev/null)/hooks")
+case $hp in "~/"*) hp="$HOME/${hp#"~/"}" ;; esac
+own="$hp/$name"
+if [ -f "$own" ] && [ -x "$own" ] && [ "$own" != "$0" ]; then exec "$own" "$@"; fi
+exit 0

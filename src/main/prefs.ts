@@ -90,6 +90,10 @@ export function registerPrefsIpc(): void {
       detail: `Projects, preferences and layouts are replaced by the ones in ${file} (${c.projects?.length ?? 0} projects, ${Object.keys(l.named ?? {}).length} named layouts). MyIDE restarts and open terminals close.`,
     });
     if (response !== 0) return null;
+    // A terminal never runs a program from a file: drop any `command` param.
+    for (const layout of [...Object.values(l.perProject ?? {}), ...Object.values(l.named ?? {})]) {
+      for (const p of Object.values((layout as { panels?: Record<string, { params?: Record<string, unknown> }> })?.panels ?? {})) delete p?.params?.command;
+    }
     writeConfig(c);
     saveLayouts(l);
     // Quitting stops the closing windows from saving their layouts over the imported ones.

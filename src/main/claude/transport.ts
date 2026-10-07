@@ -9,15 +9,12 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 export interface TurnOpts {
   cwd: string; prompt: string; sessionId?: string; model: string; effort?: string;
   settingsPath: string; mcpConfigPath: string; appendSystemPrompt?: string; prevTasks?: TaskState;
-  args?: string[]; // more CLI flags, e.g. --permission-mode plan, --allowedTools "Bash(npm test)"
+  onEvent?(e: ClaudeEvent): void;
 }
-export interface Turn { onEvent(cb: (e: ClaudeEvent) => void): void; done: Promise<Result>; interrupt(): void }
+export interface Turn { done: Promise<Result>; interrupt(): void }
 
+// Never --bare (skips the user's own setup) or --tools "" (inlines every MCP schema and overflows the prompt).
 export function runTurn(o: TurnOpts): Turn {
-  const extra = o.args ?? [];
-  // --bare skips the user's own setup; --tools "" inlines every MCP schema and overflows the prompt.
-  if (extra.some((a, i) => a === '--bare' || a.startsWith('--tools=') || (a === '--tools' && !extra[i + 1])))
-    throw new Error('runTurn: --bare and --tools "" are not allowed');
   const args = [
     '-p', o.prompt.startsWith('-') ? ' ' + o.prompt : o.prompt, // a leading dash would read as a flag
     '--output-format', 'stream-json', '--verbose',
@@ -26,12 +23,10 @@ export function runTurn(o: TurnOpts): Turn {
     '--settings', o.settingsPath, '--mcp-config', o.mcpConfigPath,
     '--permission-prompt-tool', 'mcp__myide__approve',
     ...(o.appendSystemPrompt ? ['--append-system-prompt', o.appendSystemPrompt] : []),
-    ...extra,
-    '--disallowedTools', 'Task', // after the caller's flags: a variadic flag must not swallow anything after it
+    '--disallowedTools', 'Task', 'ScheduleWakeup', 'CronCreate', 'RemoteTrigger', // no subagents, no self-wakeups that keep a -p turn alive; last: a variadic flag must not swallow anything after it
   ];
 
-  const cbs: ((e: ClaudeEvent) => void)[] = [];
-  const emit = (e: ClaudeEvent) => { for (const cb of cbs) try { cb(e); } catch (err) { console.error(err); } };
+  const emit = (e: ClaudeEvent) => { try { o.onEvent?.(e); } catch (err) { console.error(err); } };
   const parser = makeParser(o.prevTasks);
   let child: ChildProcess | undefined;
   let sigint = false;
@@ -71,7 +66,6 @@ export function runTurn(o: TurnOpts): Turn {
   });
 
   return {
-    onEvent: (cb) => { cbs.push(cb); },
     done,
     interrupt: () => { sigint = true; child?.kill('SIGINT'); },
   };

@@ -23,8 +23,8 @@ export function registerPanel(id: string, def: PanelDef): void {
   defs.set(id, def);
 }
 
-/** Adds a new instance of a registered panel, as a tab in the active group unless `place` says where. */
-export function openPanel(id: string, params: Record<string, unknown> = {}, place: { position?: AddPanelPositionOptions; initialWidth?: number } = {}) {
+/** Adds a new instance of a registered panel, as a tab in the active group unless `place` says where. `place.id` picks the panel id. */
+export function openPanel(id: string, params: Record<string, unknown> = {}, place: { position?: AddPanelPositionOptions; initialWidth?: number; id?: string } = {}) {
   const def = defs.get(id);
   if (!def) throw new Error(`No panel registered as "${id}"`);
   return dock.addPanel({ id: `${id}-${crypto.randomUUID().slice(0, 8)}`, component: id, title: def.title, params, ...place });

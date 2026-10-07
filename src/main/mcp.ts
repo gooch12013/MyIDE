@@ -1,12 +1,13 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { createServer, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { isDeepStrictEqual } from 'node:util';
 
 // One streamable-HTTP MCP server for every employee, JSON responses only (no SSE), hand-rolled like
 // spikes A and N. /mcp/<employeeId>?token=… serves `approve` and `ask_human`; /mcp/control?token=…
 // serves whatever registerControlTool added.
 
 // timedOut: the CLI could not wait any longer, so `approve` already answered deny ("waiting for David").
-// The item stays pending; on allow, E adds the command to --allowedTools for the next turn.
+// The item stays pending; an allow then grants that exact call once (see `grants`).
 export type Approval = { id: string; employeeId: string; tool: string; input: unknown; kind: 'permission' | 'plan' | 'question'; text?: string; createdAt: number; timedOut?: boolean };
 
 // `claude -p` gives up on an MCP tool call after 60 s unless MCP_TOOL_TIMEOUT is set (measured on
@@ -20,19 +21,22 @@ let port = 0;
 const controlToken = randomBytes(24).toString('hex');
 const tokens = new Map<string, string>(); // employeeId -> token
 const pending = new Map<string, { a: Approval; answer(allow: boolean, message?: string): void }>();
-const newCbs: ((a: Approval) => void)[] = [];
-const goneCbs: ((id: string) => void)[] = [];
+let onNew: (a: Approval) => void = () => {};
+let onGone: (id: string) => void = () => {};
+// Late allows: the next `approve` for the same employee, tool and input is allowed at once, then forgotten.
+const grants: { employeeId: string; tool: string; input: unknown }[] = [];
 const control = new Map<string, Tool>();
 let seq = 0;
 
-export function onApproval(cb: (a: Approval) => void): void { newCbs.push(cb); }
+export function onApproval(cb: (a: Approval) => void): void { onNew = cb; }
 // Fires when a pending item disappears without resolveApproval (the turn was interrupted and the CLI hung up).
-export function onApprovalGone(cb: (id: string) => void): void { goneCbs.push(cb); }
+export function onApprovalGone(cb: (id: string) => void): void { onGone = cb; }
 export function pendingApprovals(): Approval[] { return [...pending.values()].map((p) => p.a); }
 export function resolveApproval(id: string, allow: boolean, message?: string): void {
   const p = pending.get(id);
   if (!p) return;
   pending.delete(id);
+  if (p.a.timedOut && allow && p.a.kind !== 'question') grants.push({ employeeId: p.a.employeeId, tool: p.a.tool, input: p.a.input });
   p.answer(allow, message);
 }
 
@@ -66,10 +70,10 @@ function hold(res: ServerResponse, a: Omit<Approval, 'id' | 'createdAt'>, reply:
     res.on('close', () => {
       clearTimeout(timer);
       if (approval.timedOut || !pending.delete(approval.id)) return;
-      for (const cb of goneCbs) cb(approval.id);
+      onGone(approval.id);
       resolve(undefined);
     });
-    for (const cb of newCbs) cb(approval);
+    onNew(approval);
   });
 }
 
@@ -82,6 +86,8 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
         const tool = String(args?.tool_name ?? '');
         const input = args?.input ?? {};
         const plan = tool === 'ExitPlanMode';
+        const g = grants.findIndex((x) => x.employeeId === employeeId && x.tool === tool && isDeepStrictEqual(x.input, input));
+        if (g >= 0) { grants.splice(g, 1); return text(JSON.stringify({ behavior: 'allow', updatedInput: input })); }
         return hold(res, {
           employeeId, tool, input,
           kind: plan ? 'plan' : 'permission',
@@ -101,8 +107,9 @@ function employeeTools(employeeId: string, res: ServerResponse): Map<string, Too
 }
 
 function sameToken(a: string | null, b: string | undefined): boolean {
-  if (!a || !b || a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  if (!a || !b) return false;
+  const x = Buffer.from(a), y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
 }
 
 async function rpc(m: any, tools: Map<string, Tool>): Promise<object> {
@@ -122,27 +129,40 @@ async function rpc(m: any, tools: Map<string, Tool>): Promise<object> {
   throw Object.assign(new Error(`Method not found: ${m.method}`), { code: -32601 });
 }
 
-export function startMcp(): Promise<{ port: number }> {
-  registerControlTool('ping', 'Check that MyIDE is reachable.', { type: 'object', properties: {} }, async () => 'pong');
-  const server = createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-    const id = /^\/mcp\/([^/]+)$/.exec(url.pathname)?.[1];
-    const key = id && decodeURIComponent(id);
-    const tok = url.searchParams.get('token');
-    if (!key || !sameToken(tok, key === 'control' ? controlToken : tokens.get(key))) { res.writeHead(401).end(); return; }
-    if (req.method !== 'POST') { res.writeHead(405).end(); return; } // no server-initiated SSE stream
-    let body = '';
-    req.on('data', (c) => { body += c; if (body.length > 4e6) req.destroy(); });
-    req.on('end', async () => {
+const reply = (res: ServerResponse, status: number) => { if (!res.headersSent) res.writeHead(status).end(); };
+
+function handle(req: IncomingMessage, res: ServerResponse): void {
+  // Only the local CLI may call: a browser page sends Origin, and a DNS-rebound one a foreign Host.
+  if (req.headers.origin !== undefined || req.headers.host !== `127.0.0.1:${port}`) return reply(res, 403);
+  const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+  const id = /^\/mcp\/([^/]+)$/.exec(url.pathname)?.[1];
+  let key: string | undefined;
+  try { key = id && decodeURIComponent(id); } catch { return reply(res, 400); }
+  const tok = url.searchParams.get('token');
+  if (!key || !sameToken(tok, key === 'control' ? controlToken : tokens.get(key))) return reply(res, 401);
+  if (req.method !== 'POST') return reply(res, 405); // no server-initiated SSE stream
+  let body = '';
+  req.on('error', () => {}); // a client hanging up mid-body
+  req.on('data', (c) => { body += c; if (body.length > 4e6) req.destroy(); });
+  req.on('end', async () => {
+    try {
       let m: any;
-      try { m = JSON.parse(body); } catch { res.writeHead(400).end(); return; }
-      if (m.id === undefined) { res.writeHead(202).end(); return; } // notification
-      const tools = key === 'control' ? control : employeeTools(key, res);
+      try { m = JSON.parse(body); } catch { return reply(res, 400); }
+      if (!m || typeof m !== 'object') return reply(res, 400);
+      if (m.id === undefined) return reply(res, 202); // notification
+      const tools = key === 'control' ? control : employeeTools(key!, res);
       let out: object;
       try { out = { jsonrpc: '2.0', id: m.id, result: await rpc(m, tools) }; }
       catch (e: any) { out = { jsonrpc: '2.0', id: m.id, error: { code: e.code ?? -32603, message: e.message } }; }
       if (!res.writableEnded && !res.destroyed) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
-    });
+    } catch (e) { console.error('MCP request failed', e); reply(res, 500); }
+  });
+}
+
+export function startMcp(): Promise<{ port: number }> {
+  registerControlTool('ping', 'Check that MyIDE is reachable.', { type: 'object', properties: {} }, async () => 'pong');
+  const server = createServer((req, res) => {
+    try { handle(req, res); } catch (e) { console.error('MCP request failed', e); reply(res, 500); }
   });
   // Approvals hold a response open for as long as David takes.
   server.requestTimeout = 0;

@@ -1,5 +1,5 @@
 import { app, dialog } from 'electron';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -28,11 +28,34 @@ export function readJSON<T>(name: string, fallback: T): T {
   }
 }
 
+/** Writes a file only its owner can read, creating owner-only folders. ~/.myide holds session ids and MCP tokens. */
+export function writePrivate(file: string, text: string): void {
+  mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  writeFileSync(file, text, { mode: 0o600 });
+  chmodSync(file, 0o600); // mode only applies when the file is created
+}
+
 /** Writes `~/.myide/<name>` atomically: temp file in the same dir, then rename. */
 export function writeJSON(name: string, data: unknown): void {
   const file = join(STATE_DIR, name);
-  mkdirSync(dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n');
+  writePrivate(tmp, JSON.stringify(data, null, 2) + '\n');
   renameSync(tmp, file);
+}
+
+/** At launch: folders under ~/.myide 0700, files 0600 (0700 if executable, e.g. hooks). Worktrees and
+ *  Electron's own folder are locked at their root only; their contents keep the modes they have. */
+export function lockDown(dir = STATE_DIR): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    try {
+      const st = lstatSync(p);
+      if (st.isDirectory()) {
+        if (existsSync(join(p, '.git')) || (dir === STATE_DIR && name === 'electron')) chmodSync(p, 0o700);
+        else lockDown(p);
+      } else if (st.isFile()) chmodSync(p, st.mode & 0o100 ? 0o700 : 0o600);
+    } catch { /* vanished or not ours */ }
+  }
 }

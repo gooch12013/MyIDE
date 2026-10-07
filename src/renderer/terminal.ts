@@ -2,7 +2,7 @@ import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Terminal } from '@xterm/xterm';
-import { isParking, registerPanel } from './registry';
+import { isParking, openPanel, registerPanel } from './registry';
 
 const { pty, terminal } = window.myide;
 let settings = terminal.settings();
@@ -11,6 +11,16 @@ const terms = new Map<string, { term: Terminal; write(d: string): void; info(i: 
 pty.onData((id, data) => terms.get(id)?.write(data));
 pty.onExit((id, code) => terms.get(id)?.write(`\r\n\x1b[2m[process exited with code ${code}]\x1b[0m\r\n`));
 pty.onInfo((id, info) => terms.get(id)?.info(info));
+
+// A program for a new terminal to type once (Talk, Log in), by panel id. Kept in memory only, so a
+// saved layout, a named layout or an imported settings file can never make a terminal run anything.
+const commands = new Map<string, string>();
+
+/** Opens a terminal in `cwd` (home if unset) that runs `command` once. `id` picks the panel (= PTY) id. */
+export function openCommandTerminal(cwd: string | undefined, command: string, id = `terminal-${crypto.randomUUID().slice(0, 8)}`) {
+  commands.set(id, command);
+  return openPanel('terminal', { cwd }, { id });
+}
 
 /** Applies the current terminal font (Preferences or Ghostty) to every open terminal. */
 export function reloadTerminalSettings(): void {
@@ -114,12 +124,9 @@ registerPanel('terminal', {
     refit();
     void pty.spawn(id, { cwd: cwd || undefined, cols: term.cols, rows: term.rows }).then(async (info) => {
       onInfo(info);
-      // A panel opened to run a program (Talk, Log in) types it once; the saved layout forgets it.
-      if (typeof params.command === 'string' && !info.replay?.length) {
-        pty.write(id, `${params.command}\r`);
-        delete params.command;
-        api.updateParameters({ ...params, cwd });
-      }
+      const command = commands.get(id);
+      commands.delete(id);
+      if (command && !info.replay?.length) pty.write(id, `${command}\r`);
       if (info.replay?.length) {
         // Reattached to a running shell: redraw its recent output at the sizes it was drawn for.
         state = 'replaying';

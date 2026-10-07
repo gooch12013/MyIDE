@@ -87,9 +87,8 @@ const api = {
     /** Applies on the next turn; now: interrupt and resume with the new model/effort. */
     setModel: (id: string, o: { model?: string; effort?: string; now?: boolean }): Promise<void> => ipcRenderer.invoke('employees:set-model', id, o),
     interrupt: (id: string): Promise<void> => ipcRenderer.invoke('employees:interrupt', id),
-    /** Pauses the employee; open a terminal in cwd running command. Call talkDone when it closes. */
-    talk: (id: string): Promise<{ cwd: string; command: string }> => ipcRenderer.invoke('employees:talk', id),
-    talkDone: (id: string): Promise<void> => ipcRenderer.invoke('employees:talk-done', id),
+    /** Pauses the employee; open terminal ptyId in cwd running command. Talk ends when that PTY exits. */
+    talk: (id: string): Promise<{ cwd: string; command: string; ptyId: string }> => ipcRenderer.invoke('employees:talk', id),
     fire: (id: string, o: { removeWorktree: boolean }): Promise<void> => ipcRenderer.invoke('employees:fire', id, o),
     transcript: (id: string): Promise<{ role: 'user' | 'assistant' | 'tool'; text: string; at?: string }[]> => ipcRenderer.invoke('employees:transcript', id),
     onChange: (cb: (e: Employee) => void) => on('employees:change', cb),
@@ -107,8 +106,6 @@ const api = {
     info: (): Promise<{ version: string | null; tested: boolean; testedVersion: string }> => ipcRenderer.invoke('claude:info'),
     /** One tiny haiku turn in a temp folder. */
     test: (): Promise<{ ok: boolean; detail: string }> => ipcRenderer.invoke('claude:test'),
-    /** Open a terminal in cwd running command; the CLI does its own login. */
-    login: (): Promise<{ cwd: string; command: string }> => ipcRenderer.invoke('claude:login'),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

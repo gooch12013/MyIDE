@@ -2,14 +2,14 @@
 // Unknown event types and malformed lines are ignored, so a newer CLI that adds events keeps working.
 
 type Status = 'pending' | 'in_progress' | 'completed';
-export type TaskState = { id: string; subject: string; status: string }[];
+export type TaskState = { id: string; subject: string; status: Status }[];
 export type ClaudeEvent =
   | { type: 'init'; sessionId: string; model: string; tools: string[]; mcpServers: { name: string; status: string }[] }
   | { type: 'text'; text: string }
   | { type: 'tool'; name: string; input: unknown }
-  | { type: 'tasks'; tasks: { id: string; subject: string; status: Status }[] }
+  | { type: 'tasks'; tasks: TaskState }
   | { type: 'rate'; fiveHour?: number; sevenDay?: number; resetsAt?: string }
-  | { type: 'result'; ok: boolean; interrupted: boolean; text: string; sessionId: string; costUsd?: number };
+  | { type: 'result'; ok: boolean; interrupted: boolean; text: string; sessionId: string };
 
 // The CLI tracks progress with TaskCreate/TaskUpdate/TaskList, one task per call. A task's id only
 // arrives in the TaskCreate result, so each call is held by tool_use_id until its result comes back.
@@ -17,7 +17,8 @@ export type ClaudeEvent =
 export function makeParser(prevTasks: TaskState = []): { push(line: string): ClaudeEvent[]; tasks(): TaskState } {
   const tasks = new Map(prevTasks.map((t) => [String(t.id), { ...t, id: String(t.id) }]));
   const calls = new Map<string, { name: string; input: any }>();
-  const snapshot = (): ClaudeEvent => ({ type: 'tasks', tasks: [...tasks.values()].map((t) => ({ ...t, status: t.status as Status })) });
+  const list = (): TaskState => [...tasks.values()].map((t) => ({ ...t }));
+  const snapshot = (): ClaudeEvent => ({ type: 'tasks', tasks: list() });
 
   function push(line: string): ClaudeEvent[] {
     let ev: any;
@@ -37,11 +38,6 @@ export function makeParser(prevTasks: TaskState = []): { push(line: string): Cla
         if (c.type !== 'tool_use') continue;
         out.push({ type: 'tool', name: c.name, input: c.input });
         if (c.name === 'TaskCreate' || c.name === 'TaskUpdate') calls.set(c.id, { name: c.name, input: c.input ?? {} });
-        if (c.name === 'TodoWrite' && Array.isArray(c.input?.todos)) { // older CLIs: the whole list each call
-          tasks.clear();
-          c.input.todos.forEach((t: any, n: number) => tasks.set(String(n + 1), { id: String(n + 1), subject: t.content, status: t.status }));
-          out.push(snapshot());
-        }
       }
     } else if (ev.type === 'user') {
       const r = ev.tool_use_result;
@@ -81,12 +77,12 @@ export function makeParser(prevTasks: TaskState = []): { push(line: string): Cla
       // SIGINT still ends with a result: error_during_execution, terminal_reason "aborted_streaming".
       const interrupted = ev.subtype === 'error_during_execution' && /^abort/.test(ev.terminal_reason ?? '');
       out.push({
-        type: 'result', ok: !ev.is_error, interrupted, sessionId: ev.session_id ?? '', costUsd: ev.total_cost_usd,
+        type: 'result', ok: !ev.is_error, interrupted, sessionId: ev.session_id ?? '',
         text: typeof ev.result === 'string' ? ev.result : (ev.errors ?? []).join('\n'),
       });
     }
     return out;
   }
 
-  return { push, tasks: () => [...tasks.values()].map((t) => ({ ...t })) };
+  return { push, tasks: list };
 }
