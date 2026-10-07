@@ -1,0 +1,471 @@
+import { BrowserWindow, ipcMain, shell } from 'electron';
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { stripAttribution } from './attribution';
+import { assignIssue } from './employees';
+import { getToken, removeToken, setToken } from './keychain';
+import { listProjects, readConfig, writeConfig, type Project } from './projects';
+import { spawnEnv } from './pty';
+import { readJSON, STATE_DIR, writeJSON } from './store';
+
+// Forge issues: GitHub and Forgejo over REST with fetch. One cache file per project
+// (~/.myide/projects/<id>/issues.json) holds the last list, the URL that worked, linked PRs,
+// drafted issues and the outbox of write-backs that wait for the forge to come back.
+
+export type Provider = 'github' | 'forgejo';
+export interface ForgeLink { provider: Provider; repo: string; urls: string[] }
+export interface IssueRef { provider: Provider; repo: string; number: number; title: string; url: string }
+export interface Issue { number: number; title: string; body: string; url: string; state: string; labels: string[]; assignees: string[]; author: string; updatedAt: string }
+export interface PrLink { number: number; url: string; state: string; merged: boolean }
+export interface Draft { id: string; employeeId: string; employeeName: string; title: string; body: string; labels: string[]; at: number }
+type OpKind = 'comment' | 'labels' | 'add_labels' | 'assign_self' | 'open_pr' | 'create_issue';
+interface Op { id: string; kind: OpKind; issue?: number; args: any; at: number }
+interface Cache {
+  fetchedAt?: number; via?: string; me?: string; offline?: boolean; error?: string; lastError?: string;
+  issues: Issue[]; prs: Record<string, PrLink>; outbox: Op[]; drafts: Draft[];
+}
+/** What forgeAction and startWriteBack need from an employee. */
+type Holder = { id: string; projectId: string; name: string; branch: string; issue?: IssueRef };
+type Sent = { msg: string; number?: number; url?: string };
+
+const TIMEOUT_MS = 5000;
+const POLL_MS = 5 * 60_000;
+const START_COMMENT = 'Picking this up now.';
+
+export class Offline extends Error {}
+class Rejected extends Error {}
+
+// ---- config ----
+
+type P = Project & { forge?: ForgeLink };
+const projects = () => listProjects() as P[];
+const urlsOf = (f: ForgeLink) => (f.urls.length ? f.urls : f.provider === 'github' ? ['https://api.github.com'] : []);
+/** The keychain account for a forge: github.com, or the host of the first Forgejo URL. */
+export const tokenHost = (f: ForgeLink): string => (f.provider === 'github' ? 'github.com' : new URL(urlsOf(f)[0]).host);
+const service = (p: Provider) => `myide-${p}`;
+const forgeName = (f: ForgeLink) => (f.provider === 'github' ? 'GitHub' : 'Forgejo');
+
+function linked(projectId: string): { p: P; f: ForgeLink } {
+  const p = projects().find((x) => x.id === projectId);
+  if (!p?.forge) throw new Error(`${p?.name ?? 'That project'} has no forge linked (Preferences > Forges).`);
+  return { p, f: p.forge };
+}
+
+/** Checks and normalises a forge link from the Preferences form; null unlinks. */
+export function cleanLink(x: any): ForgeLink | null {
+  if (!x) return null;
+  if (x.provider !== 'github' && x.provider !== 'forgejo') throw new Error('Pick GitHub or Forgejo.');
+  const repo = String(x.repo ?? '').trim().replace(/\.git$/, '');
+  if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) throw new Error('Repo is owner/name.');
+  const urls = (Array.isArray(x.urls) ? x.urls : []).map((u: unknown) => String(u).trim().replace(/\/+$/, '')).filter(Boolean);
+  for (const u of urls) {
+    let ok = false;
+    try { ok = /^https?:$/.test(new URL(u).protocol); } catch { /* not a URL */ }
+    if (!ok) throw new Error(`${u} is not an http(s) URL.`);
+  }
+  if (x.provider === 'forgejo' && !urls.length) throw new Error('Forgejo needs at least one URL.');
+  return { provider: x.provider, repo, urls };
+}
+
+function setLink(projectId: string, link: unknown): void {
+  const c = readConfig();
+  const list = (c.projects ?? []) as P[];
+  const p = list.find((x) => x.id === projectId);
+  if (!p) throw new Error('No such project');
+  const f = cleanLink(link);
+  if (f) p.forge = f; else delete p.forge;
+  writeConfig({ ...c, projects: list });
+  update(projectId, (k) => { k.via = undefined; k.me = undefined; k.fetchedAt = undefined; });
+  changed(projectId);
+}
+
+// ---- cache ----
+
+const cacheFile = (id: string) => join('projects', id, 'issues.json');
+function cache(id: string): Cache {
+  return { issues: [], prs: {}, outbox: [], drafts: [], ...readJSON<Partial<Cache>>(cacheFile(id), {}) };
+}
+/** Synchronous read-modify-write, so awaits elsewhere never write back a stale copy. */
+function update(id: string, fn: (c: Cache) => void): Cache {
+  const c = cache(id);
+  fn(c);
+  writeJSON(cacheFile(id), c);
+  return c;
+}
+function changed(id: string): void {
+  for (const w of BrowserWindow.getAllWindows?.() ?? []) if (!w.webContents.isDestroyed()) w.webContents.send('forge:change', id);
+}
+
+// ---- REST ----
+
+/** One request, trying each URL in order (the one that last worked first), 5 s each. Network errors
+ *  and 5xx move to the next URL; all failing throws Offline. Other HTTP errors throw at once. */
+async function call(f: ForgeLink, method: string, path: string, body?: unknown, projectId?: string): Promise<any> {
+  const urls = urlsOf(f);
+  const via = projectId ? cache(projectId).via : undefined;
+  const order = via && urls.includes(via) ? [via, ...urls.filter((u) => u !== via)] : urls;
+  const token = await getToken(service(f.provider), tokenHost(f));
+  const headers: Record<string, string> = { accept: f.provider === 'github' ? 'application/vnd.github+json' : 'application/json', 'user-agent': 'MyIDE' };
+  if (token) headers.authorization = f.provider === 'github' ? `Bearer ${token}` : `token ${token}`;
+  let payload: BodyInit | undefined;
+  if (body instanceof FormData) payload = body;
+  else if (body !== undefined) { headers['content-type'] = 'application/json'; payload = JSON.stringify(body); }
+  const fails: string[] = [];
+  for (const u of order) {
+    const base = f.provider === 'github' ? u : `${u}/api/v1`;
+    let res: Response, text: string;
+    try {
+      res = await fetch(base + path, { method, headers, body: payload, signal: AbortSignal.timeout(TIMEOUT_MS) });
+      text = await res.text();
+    } catch (e) { fails.push(`${new URL(u).host}: ${(e as Error).name === 'TimeoutError' ? 'no answer in 5 s' : (e as Error).message}`); continue; }
+    if (res.status >= 500) { fails.push(`${new URL(u).host}: HTTP ${res.status}`); continue; }
+    if (projectId && via !== u) update(projectId, (c) => { c.via = u; });
+    if (!res.ok) {
+      let m = text.slice(0, 300);
+      try { m = JSON.parse(text).message ?? m; } catch { /* not JSON */ }
+      throw new Rejected(`${forgeName(f)} said ${res.status} to ${method} ${path.split('?')[0]}: ${m}`);
+    }
+    return text ? JSON.parse(text) : null;
+  }
+  throw new Offline(fails.join('; ') || 'No URL configured');
+}
+
+const norm = (x: any): Issue => ({
+  number: x.number, title: x.title ?? '', body: x.body ?? '', url: x.html_url ?? '', state: x.state ?? 'open',
+  labels: (x.labels ?? []).map((l: any) => l.name), author: x.user?.login ?? '', updatedAt: x.updated_at ?? '',
+  assignees: (x.assignees ?? (x.assignee ? [x.assignee] : [])).map((a: any) => a.login),
+});
+
+async function whoami(id: string, f: ForgeLink): Promise<string> {
+  const c = cache(id);
+  if (c.me) return c.me;
+  const me = (await call(f, 'GET', '/user', undefined, id))?.login;
+  if (!me) throw new Rejected('The forge did not say who the token belongs to.');
+  update(id, (k) => { k.me = me; });
+  return me;
+}
+
+const last = new Map<string, number>();
+
+/** Refreshes one project's issues and linked PRs, then replays its outbox. Never throws; the result is in the cache. */
+export async function fetchIssues(id: string, force = false): Promise<void> {
+  let f: ForgeLink;
+  try { f = linked(id).f; } catch { return; }
+  if (!force && Date.now() - (last.get(id) ?? 0) < 30_000) return; // panel focus can fire often; GitHub allows 60 anonymous calls an hour
+  last.set(id, Date.now());
+  try {
+    const raw = await call(f, 'GET', f.provider === 'github'
+      ? `/repos/${f.repo}/issues?state=all&per_page=100&sort=updated`
+      : `/repos/${f.repo}/issues?state=all&type=issues&limit=50`, undefined, id);
+    const issues = (raw as any[]).filter((x) => !x.pull_request).map(norm);
+    const hasToken = !!(await getToken(service(f.provider), tokenHost(f)));
+    if (hasToken) await whoami(id, f).catch(() => {});
+    const prs: Record<string, PrLink> = {};
+    for (const [n, pr] of Object.entries(cache(id).prs)) {
+      if (pr.state !== 'open') continue;
+      const x = await call(f, 'GET', `/repos/${f.repo}/pulls/${pr.number}`, undefined, id);
+      prs[n] = { ...pr, state: x.state, merged: !!(x.merged || x.merged_at) };
+    }
+    update(id, (c) => { Object.assign(c, { issues, fetchedAt: Date.now(), offline: false, error: undefined }); Object.assign(c.prs, prs); });
+  } catch (e) {
+    update(id, (c) => { c.offline = e instanceof Offline; c.error = (e as Error).message; });
+  }
+  changed(id);
+  if (!cache(id).offline) await drain(id);
+}
+
+/** Every linked project, one after another; nothing else waits on this. */
+export async function pollAll(force = false): Promise<void> {
+  for (const p of projects()) if (p.forge) await fetchIssues(p.id, force);
+}
+
+// ---- writes and the outbox ----
+
+async function labelIds(id: string, f: ForgeLink, names: string[]): Promise<number[]> {
+  const have: { id: number; name: string }[] = await call(f, 'GET', `/repos/${f.repo}/labels?limit=100`, undefined, id);
+  const out: number[] = [];
+  for (const n of names) {
+    const hit = have.find((l) => l.name.toLowerCase() === n.toLowerCase());
+    out.push(hit ? hit.id : (await call(f, 'POST', `/repos/${f.repo}/labels`, { name: n, color: '#ffb21a' }, id)).id);
+  }
+  return out;
+}
+
+async function send(id: string, op: Op): Promise<Sent> {
+  const { f } = linked(id);
+  if (!(await getToken(service(f.provider), tokenHost(f)))) throw new Rejected(`No ${forgeName(f)} token for ${tokenHost(f)}; add one in Preferences > Forges.`);
+  const R = `/repos/${f.repo}`;
+  const n = op.issue;
+  const labels = async (names: string[]) => (f.provider === 'github' ? names : labelIds(id, f, names));
+  switch (op.kind) {
+    case 'comment':
+      await call(f, 'POST', `${R}/issues/${n}/comments`, { body: op.args.body }, id);
+      return { msg: `Commented on #${n}.` };
+    case 'labels':
+    case 'add_labels':
+      await call(f, op.kind === 'labels' ? 'PUT' : 'POST', `${R}/issues/${n}/labels`, { labels: await labels(op.args.labels) }, id);
+      return { msg: `Labels on #${n}: ${op.args.labels.join(', ') || 'none'}.` };
+    case 'assign_self': {
+      const me = await whoami(id, f);
+      if (f.provider === 'github') await call(f, 'POST', `${R}/issues/${n}/assignees`, { assignees: [me] }, id);
+      else {
+        const cur = norm(await call(f, 'GET', `${R}/issues/${n}`, undefined, id)).assignees;
+        await call(f, 'PATCH', `${R}/issues/${n}`, { assignees: [...new Set([...cur, me])] }, id);
+      }
+      return { msg: `Assigned #${n} to ${me}.` };
+    }
+    case 'open_pr': {
+      const base = op.args.base || (await call(f, 'GET', R, undefined, id)).default_branch;
+      const pr = await call(f, 'POST', `${R}/pulls`, { title: op.args.title, body: op.args.body, head: op.args.head, base }, id);
+      if (n) update(id, (c) => { c.prs[n] = { number: pr.number, url: pr.html_url, state: 'open', merged: false }; });
+      return { msg: `Opened PR #${pr.number}: ${pr.html_url}`, number: pr.number, url: pr.html_url };
+    }
+    case 'create_issue': {
+      const x = await call(f, 'POST', `${R}/issues`, { title: op.args.title, body: op.args.body, labels: await labels(op.args.labels) }, id);
+      update(id, (c) => { c.issues = [norm(x), ...c.issues.filter((i) => i.number !== x.number)]; });
+      return { msg: `Filed #${x.number}: ${x.html_url}`, number: x.number, url: x.html_url };
+    }
+  }
+}
+
+const results = new Map<string, Sent | Error>();
+const draining = new Map<string, Promise<void>>();
+
+/** Sends the outbox front to back; stops (keeping the rest) at the first Offline. A rejected op is dropped and noted. */
+function drain(id: string): Promise<void> {
+  const next = (draining.get(id) ?? Promise.resolve()).then(async () => {
+    for (let op = cache(id).outbox[0]; op; op = cache(id).outbox[0]) {
+      try { results.set(op.id, await send(id, op)); } catch (e) {
+        if (e instanceof Offline) { update(id, (c) => { c.offline = true; c.error = e.message; }); changed(id); return; }
+        results.set(op.id, e as Error);
+        update(id, (c) => { c.lastError = `${op.kind}${op.issue ? ` #${op.issue}` : ''}: ${(e as Error).message}`; });
+      }
+      const sent = op.id;
+      update(id, (c) => { c.outbox = c.outbox.filter((o) => o.id !== sent); });
+      changed(id);
+    }
+  });
+  draining.set(id, next.catch(() => {}));
+  return next;
+}
+
+/** Queues a write behind anything already waiting and sends what it can. While the forge is known to be
+ *  down it only queues; the next poll that reaches it replays the outbox in order. */
+async function write(id: string, kind: OpKind, issue: number | undefined, args: object): Promise<Sent> {
+  const { f } = linked(id);
+  const op: Op = { id: randomUUID(), kind, issue, args, at: Date.now() };
+  const c = update(id, (k) => { k.outbox.push(op); });
+  changed(id);
+  if (!c.offline) await drain(id);
+  const r = results.get(op.id);
+  results.delete(op.id);
+  if (r instanceof Error) throw r;
+  return r ?? { msg: `Queued: ${forgeName(f)} is unreachable, so this goes out in order when it is back.` };
+}
+
+const strip = (s: unknown) => stripAttribution(String(s ?? '')).trim();
+const cleanLabels = (x: unknown): string[] => (Array.isArray(x) ? x : typeof x === 'string' ? x.split(',') : [])
+  .map((l) => String(l).trim()).filter(Boolean).slice(0, 20);
+
+/** The employees' one path to a forge. Every body is stripped of attribution. There is no close action. */
+export async function forgeAction(emp: Holder, action: 'comment' | 'open_pr' | 'set_labels' | 'draft_issue', args: any): Promise<string> {
+  const a = args ?? {};
+  if (action === 'draft_issue') {
+    const title = strip(a.title);
+    if (!title) throw new Error('A draft needs a title.');
+    linked(emp.projectId);
+    update(emp.projectId, (c) => {
+      c.drafts.push({ id: randomUUID(), employeeId: emp.id, employeeName: emp.name, title, body: strip(a.body), labels: cleanLabels(a.labels), at: Date.now() });
+    });
+    changed(emp.projectId);
+    return 'Drafted. Nothing was posted; it waits in NEEDS YOU until David files it.';
+  }
+  const iss = emp.issue;
+  if (!iss) throw new Error('You hold no issue, so there is nothing to write back to.');
+  if (action === 'comment') {
+    const body = strip(a.body);
+    if (!body) throw new Error('The comment is empty.');
+    return (await write(emp.projectId, 'comment', iss.number, { body })).msg;
+  }
+  if (action === 'set_labels') return (await write(emp.projectId, 'labels', iss.number, { labels: cleanLabels(a.labels) })).msg;
+  if (action === 'open_pr') {
+    const title = strip(a.title) || iss.title;
+    let body = strip(a.body);
+    if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?):? +#${iss.number}\\b`, 'i').test(body)) body = `${body}\n\nCloses #${iss.number}`.trim();
+    return (await write(emp.projectId, 'open_pr', iss.number, { title, body, head: String(a.head || emp.branch), base: a.base ? String(a.base) : undefined })).msg;
+  }
+  throw new Error(`No forge action "${action}". There is no close: an issue closes when its PR merges.`);
+}
+
+/** On assignment: a start comment, the token owner as assignee and an "in progress" label. Throws once, after trying all three. */
+export async function startWriteBack(emp: Holder): Promise<void> {
+  const iss = emp.issue;
+  if (!iss) return;
+  const errs: string[] = [];
+  for (const [kind, args] of [['comment', { body: strip(START_COMMENT) }], ['assign_self', {}], ['add_labels', { labels: ['in progress'] }]] as const) {
+    try { await write(emp.projectId, kind, iss.number, args); } catch (e) { errs.push((e as Error).message); }
+  }
+  if (errs.length) throw new Error(errs.join('\n'));
+}
+
+// ---- filing and assigning ----
+
+type Image = { name: string; type: string; data: Uint8Array };
+type Assign = { employeeId?: string; role?: string; note?: string };
+
+/** David's New issue form. GitHub with images opens the browser's new-issue page instead (no upload API). */
+export async function createIssue(o: { projectId: string; title: string; body?: string; labels?: unknown; images?: Image[]; assign?: Assign }):
+  Promise<{ number: number; url: string; opened?: boolean; queued?: boolean; warning?: string }> {
+  const { f } = linked(o.projectId);
+  const title = strip(o.title);
+  if (!title) throw new Error('Give the issue a title.');
+  let body = strip(o.body);
+  const labels = cleanLabels(o.labels);
+  const images = o.images ?? [];
+  if (images.length && f.provider === 'github') {
+    const q = new URLSearchParams({ title, body, ...(labels.length ? { labels: labels.join(',') } : {}) });
+    const url = `https://github.com/${f.repo}/issues/new?${q}`;
+    await shell.openExternal(url);
+    return { number: 0, url, opened: true };
+  }
+  const r = await write(o.projectId, 'create_issue', undefined, { title, body, labels });
+  if (!r.number) return { number: 0, url: '', queued: true, warning: images.length || o.assign ? 'Queued without images or assignment.' : undefined };
+  let warning: string | undefined;
+  if (images.length) {
+    try {
+      const links: string[] = [];
+      for (const img of images) {
+        const form = new FormData();
+        form.append('attachment', new Blob([new Uint8Array(img.data)], { type: img.type }), img.name.replace(/[^\w.-]/g, '_') || 'image.png');
+        const a = await call(f, 'POST', `/repos/${f.repo}/issues/${r.number}/assets`, form, o.projectId);
+        links.push(`![${a.name}](${a.browser_download_url})`);
+      }
+      body = [body, ...links].filter(Boolean).join('\n\n');
+      const x = await call(f, 'PATCH', `/repos/${f.repo}/issues/${r.number}`, { body }, o.projectId);
+      update(o.projectId, (c) => { c.issues = c.issues.map((i) => (i.number === x.number ? norm(x) : i)); });
+    } catch (e) { warning = `Filed, but the images did not upload: ${(e as Error).message}`; }
+  }
+  changed(o.projectId);
+  if (o.assign && (o.assign.employeeId || o.assign.role)) {
+    const w = (await assign({ projectId: o.projectId, number: r.number, title, url: r.url!, ...o.assign })).warning;
+    warning = [warning, w].filter(Boolean).join('\n') || undefined;
+  }
+  return { number: r.number, url: r.url!, warning };
+}
+
+/** The quick-add script's path: project matched by name, case-insensitive. Number 0 means queued (forge unreachable). */
+export async function quickAddIssue(projectName: string, title: string): Promise<{ number: number; url: string }> {
+  const name = String(projectName ?? '').trim().toLowerCase();
+  const p = projects().find((x) => x.name.toLowerCase() === name);
+  if (!p) throw new Error(`No project named ${projectName}. Projects: ${projects().map((x) => x.name).join(', ') || 'none'}.`);
+  const r = await createIssue({ projectId: p.id, title });
+  return { number: r.number, url: r.url };
+}
+
+/** Hands an issue to an employee (or a new hire from a role), then writes back the start. */
+export async function assign(o: { projectId: string; number: number; title?: string; url?: string } & Assign): Promise<{ employeeId: string; warning?: string }> {
+  const { f } = linked(o.projectId);
+  const known = cache(o.projectId).issues.find((i) => i.number === o.number);
+  const issue: IssueRef = { provider: f.provider, repo: f.repo, number: o.number, title: known?.title ?? o.title ?? '', url: known?.url ?? o.url ?? '' };
+  const emp = await assignIssue({ projectId: o.projectId, issue, employeeId: o.employeeId, role: o.role, note: o.note });
+  try { await startWriteBack({ ...emp, issue: emp.issue ?? issue }); } catch (e) { return { employeeId: emp.id, warning: `Assigned, but the forge write-back failed: ${(e as Error).message}` }; }
+  return { employeeId: emp.id };
+}
+
+async function fileDraft(projectId: string, id: string): Promise<{ number: number; url: string; warning?: string }> {
+  const d = cache(projectId).drafts.find((x) => x.id === id);
+  if (!d) throw new Error('That draft is gone.');
+  const r = await createIssue({ projectId, title: d.title, body: d.body, labels: d.labels });
+  update(projectId, (c) => { c.drafts = c.drafts.filter((x) => x.id !== id); });
+  changed(projectId);
+  return r;
+}
+
+// ---- tokens ----
+
+function ghToken(): Promise<string | null> {
+  return spawnEnv().then((env) => new Promise((resolve) => {
+    execFile('gh', ['auth', 'token', '--hostname', 'github.com'], { env, timeout: 5000 }, (err, out) => resolve(err ? null : out.trim() || null));
+  }), () => null);
+}
+
+/** Every forge host that can hold a token: github.com always, plus each linked Forgejo. */
+async function tokenRows(): Promise<{ provider: Provider; host: string; has: boolean; projects: string[] }[]> {
+  const rows = new Map<string, { provider: Provider; host: string; has: boolean; projects: string[] }>();
+  rows.set('github:github.com', { provider: 'github', host: 'github.com', has: false, projects: [] });
+  for (const p of projects()) {
+    if (!p.forge) continue;
+    let host: string;
+    try { host = tokenHost(p.forge); } catch { continue; }
+    const k = `${p.forge.provider}:${host}`;
+    if (!rows.has(k)) rows.set(k, { provider: p.forge.provider, host, has: false, projects: [] });
+    rows.get(k)!.projects.push(p.name);
+  }
+  for (const r of rows.values()) r.has = !!(await getToken(service(r.provider), r.host));
+  return [...rows.values()];
+}
+
+async function testConnection(provider: Provider, host: string): Promise<string> {
+  const f = provider === 'github' ? { provider, repo: '', urls: [] } : projects().map((p) => p.forge).find((x) => x?.provider === provider && tokenHost(x) === host);
+  if (!f) throw new Error(`No project links ${host}.`);
+  if (!(await getToken(service(provider), host))) throw new Error('No token saved.');
+  const me = await call(f, 'GET', '/user');
+  return `Connected as ${me.login}.`;
+}
+
+// ---- wiring ----
+
+/** Snapshot for the Issues panel: every linked project, or one. */
+function snapshot(projectId?: string) {
+  return projects().filter((p) => p.forge && (!projectId || p.id === projectId)).map((p) => {
+    const c = cache(p.id);
+    let host = '';
+    try { host = c.via ? new URL(c.via).host : tokenHost(p.forge!); } catch { /* bad URL */ }
+    return {
+      projectId: p.id, provider: p.forge!.provider, repo: p.forge!.repo, urls: p.forge!.urls, host,
+      fetchedAt: c.fetchedAt, offline: !!c.offline, error: c.error, lastError: c.lastError, me: c.me,
+      issues: c.issues, prs: c.prs, outbox: c.outbox.length, drafts: c.drafts,
+    };
+  });
+}
+export type ForgeSnapshot = ReturnType<typeof snapshot>[number];
+
+export function registerForgeIpc(): void {
+  // The quick-add script: ~/.myide/bin/issue PROJECT "title".
+  try {
+    mkdirSync(join(STATE_DIR, 'bin'), { recursive: true, mode: 0o700 });
+    copyFileSync(join(__dirname, 'bin', 'issue'), join(STATE_DIR, 'bin', 'issue'));
+    chmodSync(join(STATE_DIR, 'bin', 'issue'), 0o700);
+  } catch (e) { console.error('Could not install the issue script', e); }
+
+  setTimeout(() => void pollAll(), 3000);
+  setInterval(() => void pollAll(), POLL_MS);
+
+  const h = (channel: string, fn: (...a: any[]) => unknown) => ipcMain.handle(channel, (_e, ...a) => fn(...a));
+  h('forge:issues', (projectId?: string) => snapshot(projectId));
+  h('forge:refresh', async (projectId?: string, force?: boolean) => {
+    if (projectId) await fetchIssues(projectId, !!force); else await pollAll(!!force);
+  });
+  h('forge:set-link', (projectId: string, link: unknown) => setLink(projectId, link));
+  h('forge:tokens', async () => ({ rows: await tokenRows(), gh: !!(await ghToken()) }));
+  h('forge:set-token', async (provider: Provider, host: string, token: string) => {
+    await setToken(service(provider), host, String(token ?? '').trim());
+    for (const p of projects()) if (p.forge?.provider === provider) update(p.id, (c) => { c.me = undefined; });
+  });
+  h('forge:remove-token', (provider: Provider, host: string) => removeToken(service(provider), host));
+  h('forge:import-gh', async () => {
+    const t = await ghToken();
+    if (!t) throw new Error('gh has no token for github.com.');
+    await setToken('myide-github', 'github.com', t);
+  });
+  h('forge:test', testConnection);
+  h('forge:create', createIssue);
+  h('forge:assign', assign);
+  h('forge:file-draft', fileDraft);
+  h('forge:discard-draft', (projectId: string, id: string) => {
+    update(projectId, (c) => { c.drafts = c.drafts.filter((x) => x.id !== id); });
+    changed(projectId);
+  });
+}

@@ -10,6 +10,7 @@ export interface TurnOpts {
   cwd: string; prompt: string; sessionId?: string; model: string; effort?: string;
   settingsPath: string; mcpConfigPath: string; appendSystemPrompt?: string; prevTasks?: TaskState;
   onEvent?(e: ClaudeEvent): void;
+  env?: Record<string, string>; // the account's env (CLAUDE_CONFIG_DIR for extra accounts; empty for the default)
 }
 export interface Turn { done: Promise<Result>; interrupt(): void }
 
@@ -45,7 +46,7 @@ export function runTurn(o: TurnOpts): Turn {
     };
     void spawnEnv().then((env) => {
       if (sigint) return finish('Interrupted before start');
-      env = { ...env, MCP_TOOL_TIMEOUT: String(MCP_TOOL_TIMEOUT_MS) }; // otherwise an approval is dropped after 60 s
+      env = { ...env, ...o.env, MCP_TOOL_TIMEOUT: String(MCP_TOOL_TIMEOUT_MS) }; // otherwise an approval is dropped after 60 s
       child = spawn('claude', args, { cwd: o.cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
       let stderr = '';
       child.stderr!.on('data', (d) => { stderr = (stderr + d).slice(-4000); });

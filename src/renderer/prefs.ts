@@ -5,6 +5,8 @@ import { activeProject, allProjects, loadProjects } from './projects';
 import { registerPanel } from './registry';
 import { api as staff, led } from './employees';
 import { openCommandTerminal, reloadTerminalSettings } from './terminal';
+import { forgesSection } from './issues';
+import { accountsSection } from './accounts';
 
 const api = window.myide;
 type Info = Awaited<ReturnType<typeof api.prefs.get>>;
@@ -32,7 +34,7 @@ function colourWarning(colour: string, id: string): string {
   return twin.colour.toLowerCase() === colour.toLowerCase() ? `Same colour as ${twin.name}.` : `Hard to tell apart from ${twin.name}.`;
 }
 
-const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['advanced', 'Advanced']] as const;
+const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['accounts', 'AI accounts'], ['forges', 'Forges'], ['advanced', 'Advanced']] as const;
 type Section = (typeof SECTIONS)[number][0];
 
 registerPanel('preferences', {
@@ -190,6 +192,10 @@ registerPanel('preferences', {
           })),
         ];
       },
+
+      forges: (_info, say) => forgesSection(say),
+
+      accounts: (_info, say) => accountsSection(say, () => void show()),
 
       advanced({ dataDir }, say) {
         return [

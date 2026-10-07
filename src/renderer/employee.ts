@@ -1,6 +1,7 @@
+import { employeeAi } from './accounts';
 import { errText, h, key } from './dom';
 import { api, chip, cue, led, openEmployees, type Employee } from './employees';
-import { modelPicker } from './hire';
+import { ceilingNote, fmtPick, modelPicker, modePicker } from './hire';
 import { allProjects } from './projects';
 import { registerPanel } from './registry';
 import { openCommandTerminal } from './terminal';
@@ -63,6 +64,15 @@ registerPanel('employee', {
       h('span', { textContent: 'Applies on the next turn.' }),
       key('Apply now', act(async () => { await api.employees.setModel(id, { ...pick.get(), now: true }); pending.hidden = true; }, 'Applied now.')));
     const pick = modelPicker('', '', act(async () => { await api.employees.setModel(id, pick.get()); pending.hidden = false; }));
+    // Mode: pinned uses the picker above; manager and auto choose per task (the chip shows the current pick).
+    const mode = modePicker('pinned', act(async () => {
+      await api.employees.setModel(id, { mode: mode.get() });
+      pending.hidden = true;
+      pick.el.hidden = mode.get() !== 'pinned';
+    }));
+    const ceil = h('p', { className: 'pref-hint' });
+    const aiLine = h('p', { className: 'pref-hint' }); // which AI account it runs on
+    const held = h('p', { className: 'pref-warn', hidden: true });
 
     // Worktree.
     const tree = h('dl', { className: 'kv' });
@@ -93,7 +103,7 @@ registerPanel('employee', {
     const box = (title: string, ...kids: Node[]) => h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: title }), ...kids);
     el.append(head, status3, last, h('div', { className: 'emp-grid' },
       h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, h('div', { className: 'pref-ctl' }, send))),
-      h('div', { className: 'emp-col' }, box('Model & effort', pick.el, pending), box('Worktree', tree), transcript)),
+      h('div', { className: 'emp-col' }, box('Model & effort', aiLine, mode.el, pick.el, pending, held, ceil), box('Worktree', tree), transcript)),
     status, fireSheet);
 
     function render(e: Employee): void {
@@ -103,10 +113,15 @@ registerPanel('employee', {
       const proj = allProjects().find((p) => p.id === e.projectId);
       if (proj) el.style.setProperty('--proj', proj.colour);
       name.replaceChildren(e.name, led(e.state), chip(e));
-      sub.textContent = `${e.role}${proj ? ` · ${proj.name}` : ''}`;
+      const rank = e.contractor ? 'Contractor' : e.lead ? 'Lead' : e.parentId ? `Report, level ${e.depth}` : '';
+      sub.textContent = [e.issue ? `Working #${e.issue.number}: ${e.issue.title}` : '', e.role, rank, proj?.name].filter(Boolean).join(' · ');
       talk.disabled = e.state === 'talking';
       interrupt.disabled = !['working', 'needs-you'].includes(e.state);
-      if (first) pick.set(e.model, e.effort);
+      void employeeAi(e, { pick, talk, line: aiLine, first });
+      if (first) { pick.set(e.model, e.effort); mode.set(e.mode); pick.el.hidden = e.mode !== 'pinned'; }
+      held.hidden = !e.held;
+      held.textContent = e.held ? `Waiting for your approval to run on ${fmtPick(e.held)}, above the ceiling. It is in Needs you.` : '';
+      void api.org.get().then((o) => { ceil.textContent = ceilingNote(o.projects.find((p) => p.id === e.projectId)?.ceiling); });
 
       const p = e.progress;
       const c = cue(e);

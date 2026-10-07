@@ -17,13 +17,19 @@ assert.equal(stripAttribution('Summary\n\nGenerated with [Claude Code](https://c
 assert.equal(stripAttribution('Co-authored-by: Ann <a@b.c>\n'), 'Co-authored-by: Ann <a@b.c>\n'); // people stay
 assert.equal(stripAttribution(human), human);
 assert.equal(stripAttribution(prose), prose);
+const codex = 'Fix\n\nCo-authored-by: Codex <noreply@openai.com>\n';
+const codexPr = 'Summary\n\nGenerated with [Codex](https://openai.com/codex/).\nGenerated with Codex.\n';
+const codexProse = 'Fix\n\nGenerated with Codex fixtures, see notes\n';
+assert.equal(stripAttribution(codex), 'Fix\n');
+assert.equal(stripAttribution(codexPr), 'Summary\n');
+assert.equal(stripAttribution(codexProse), codexProse);
 
 const dir = mkdtempSync(join(tmpdir(), 'myide-hook-'));
 try {
   installHooks('build/hooks/chain', dir);
   const file = join(dir, 'MSG');
   const hook = (text) => { writeFileSync(file, text); execFileSync(join(dir, 'commit-msg'), [file], { cwd: dir }); return readFileSync(file, 'utf8'); };
-  for (const t of [msg, pr, human, prose]) assert.equal(hook(t), stripAttribution(t));
+  for (const t of [msg, pr, human, prose, codex, codexPr, codexProse]) assert.equal(hook(t), stripAttribution(t));
   rmSync(join(dir, 'attribution-patterns'));
   assert.equal(hook(msg), msg); // no patterns: the message is left alone
 } finally { rmSync(dir, { recursive: true, force: true }); }

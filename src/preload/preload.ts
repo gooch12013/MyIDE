@@ -6,8 +6,16 @@ import type { MenuState } from '../main/menu';
 import type { LayoutsFile } from '../main/layouts';
 import type { Project } from '../main/projects';
 import type { Prefs } from '../main/prefs';
-import type { Employee, Role } from '../main/employees';
+import type { Employee, Mode, ProjectOrg, Role } from '../main/employees';
 import type { Approval } from '../main/mcp';
+import type { Account, Provider, Usage } from '../main/accounts';
+import type { Providers } from '../main/transports';
+import type { ForgeLink, ForgeSnapshot } from '../main/forge';
+
+export type OrgState = {
+  caps: { global: number; perProject: number; maxReports: number; maxDepth: number };
+  projects: (ProjectOrg & { id: string; priority: number; paused: boolean; maxDepth: number })[];
+};
 
 /** Subscribes to a main-to-renderer channel; returns the unsubscribe function. */
 function on<A extends unknown[]>(channel: string, cb: (...args: A) => void): () => void {
@@ -81,11 +89,11 @@ const api = {
   employees: {
     list: (projectId?: string): Promise<Employee[]> => ipcRenderer.invoke('employees:list', projectId),
     roles: (projectId: string): Promise<Role[]> => ipcRenderer.invoke('employees:roles', projectId),
-    hire: (o: { projectId: string; role: string; task: string; model?: string; effort?: string }): Promise<Employee> => ipcRenderer.invoke('employees:hire', o),
+    hire: (o: { projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; accountId?: string }): Promise<Employee> => ipcRenderer.invoke('employees:hire', o),
     /** Next turn; queued if busy, talking or over the caps. */
     send: (id: string, text: string): Promise<void> => ipcRenderer.invoke('employees:send', id, text),
     /** Applies on the next turn; now: interrupt and resume with the new model/effort. */
-    setModel: (id: string, o: { model?: string; effort?: string; now?: boolean }): Promise<void> => ipcRenderer.invoke('employees:set-model', id, o),
+    setModel: (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }): Promise<void> => ipcRenderer.invoke('employees:set-model', id, o),
     interrupt: (id: string): Promise<void> => ipcRenderer.invoke('employees:interrupt', id),
     /** Pauses the employee; open terminal ptyId in cwd running command. Talk ends when that PTY exits. */
     talk: (id: string): Promise<{ cwd: string; command: string; ptyId: string }> => ipcRenderer.invoke('employees:talk', id),
@@ -95,6 +103,13 @@ const api = {
     onRemoved: (cb: (id: string) => void) => on('employees:removed', cb),
     /** A notification was clicked: show this employee. */
     onOpen: (cb: (id: string) => void) => on('employees:open', cb),
+  },
+  // Org: caps, per-project priority, pause and model defaults/ceiling.
+  org: {
+    get: (): Promise<OrgState> => ipcRenderer.invoke('org:get'),
+    /** priority/paused go to config.json; the rest to the project's state.json. paused: true stops its running turns. */
+    setProject: (id: string, patch: { [K in keyof ProjectOrg]?: ProjectOrg[K] | null } & { priority?: number; paused?: boolean }): Promise<void> => ipcRenderer.invoke('org:set-project', id, patch),
+    onChange: (cb: (s: OrgState) => void) => on('org:change', cb),
   },
   approvals: {
     list: (): Promise<Approval[]> => ipcRenderer.invoke('approvals:list'),
@@ -106,6 +121,40 @@ const api = {
     info: (): Promise<{ version: string | null; tested: boolean; testedVersion: string }> => ipcRenderer.invoke('claude:info'),
     /** One tiny haiku turn in a temp folder. */
     test: (): Promise<{ ok: boolean; detail: string }> => ipcRenderer.invoke('claude:test'),
+  },
+  // AI accounts (feature 22): which login each employee runs on, its usage gauge, and the capability table.
+  accounts: {
+    list: (): Promise<(Account & { usage?: Usage })[]> => ipcRenderer.invoke('accounts:list'),
+    add: (o: { name?: string; provider: Provider; ownLogin?: boolean }): Promise<Account> => ipcRenderer.invoke('accounts:add', o),
+    update: (id: string, patch: { name?: string; cap?: number; allowAuto?: boolean }): Promise<void> => ipcRenderer.invoke('accounts:update', id, patch),
+    remove: (id: string): Promise<void> => ipcRenderer.invoke('accounts:remove', id),
+    /** The command that runs the CLI's own login with the account's env, for a terminal. */
+    login: (id: string): Promise<{ command: string }> => ipcRenderer.invoke('accounts:login', id),
+    status: (id: string): Promise<{ loggedIn: boolean; detail: string }> => ipcRenderer.invoke('accounts:status', id),
+    /** One tiny turn on the account. */
+    test: (id: string): Promise<{ ok: boolean; detail: string }> => ipcRenderer.invoke('accounts:test', id),
+    providers: (): Promise<Providers> => ipcRenderer.invoke('providers:get'),
+    codexInfo: (): Promise<{ path: string | null; version: string | null; tested: boolean; testedVersion: string }> => ipcRenderer.invoke('codex:info'),
+    onUsage: (cb: (id: string, u: Usage) => void) => on('accounts:usage', cb),
+  },
+  // Forge issues: GitHub and Forgejo links, tokens (kept in the Keychain, never sent here), issues, drafts.
+  forge: {
+    issues: (projectId?: string): Promise<ForgeSnapshot[]> => ipcRenderer.invoke('forge:issues', projectId),
+    /** Re-fetches; without force a fetch in the last 30 s is reused. */
+    refresh: (projectId?: string, force?: boolean): Promise<void> => ipcRenderer.invoke('forge:refresh', projectId, force),
+    setLink: (projectId: string, link: ForgeLink | null): Promise<void> => ipcRenderer.invoke('forge:set-link', projectId, link),
+    tokens: (): Promise<{ rows: { provider: ForgeLink['provider']; host: string; has: boolean; projects: string[] }[]; gh: boolean }> => ipcRenderer.invoke('forge:tokens'),
+    setToken: (provider: ForgeLink['provider'], host: string, token: string): Promise<void> => ipcRenderer.invoke('forge:set-token', provider, host, token),
+    removeToken: (provider: ForgeLink['provider'], host: string): Promise<void> => ipcRenderer.invoke('forge:remove-token', provider, host),
+    importGh: (): Promise<void> => ipcRenderer.invoke('forge:import-gh'),
+    test: (provider: ForgeLink['provider'], host: string): Promise<string> => ipcRenderer.invoke('forge:test', provider, host),
+    create: (o: { projectId: string; title: string; body?: string; labels?: string; images?: { name: string; type: string; data: Uint8Array }[]; assign?: { employeeId?: string; role?: string } }):
+      Promise<{ number: number; url: string; opened?: boolean; queued?: boolean; warning?: string }> => ipcRenderer.invoke('forge:create', o),
+    assign: (o: { projectId: string; number: number; employeeId?: string; role?: string; note?: string }): Promise<{ employeeId: string; warning?: string }> => ipcRenderer.invoke('forge:assign', o),
+    fileDraft: (projectId: string, id: string): Promise<{ number: number; url: string; warning?: string }> => ipcRenderer.invoke('forge:file-draft', projectId, id),
+    discardDraft: (projectId: string, id: string): Promise<void> => ipcRenderer.invoke('forge:discard-draft', projectId, id),
+    /** A project's issues, drafts or outbox changed. */
+    onChange: (cb: (projectId: string) => void) => on('forge:change', cb),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

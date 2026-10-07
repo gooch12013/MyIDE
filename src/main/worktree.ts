@@ -27,10 +27,10 @@ export async function checkRepo(path: string, name: string): Promise<void> {
 export const branchExists = (repo: string, branch: string): Promise<boolean> =>
   git(repo, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`).then(() => true, () => false);
 
-/** New worktree on a new branch from HEAD, with the MyIDE hooks set for that worktree only. */
-export async function addWorktree(repo: string, dir: string, branch: string, hooksDir: string): Promise<void> {
+/** New worktree on a new branch from HEAD (or `from`, e.g. a lead's branch), with the MyIDE hooks set for that worktree only. */
+export async function addWorktree(repo: string, dir: string, branch: string, hooksDir: string, from?: string): Promise<void> {
   mkdirSync(dirname(dir), { recursive: true });
-  await git(repo, 'worktree', 'add', dir, '-b', branch);
+  await git(repo, 'worktree', 'add', dir, '-b', branch, ...(from ? [from] : []));
   await git(repo, 'config', 'extensions.worktreeConfig', 'true');
   await git(dir, 'config', '--worktree', 'core.hooksPath', hooksDir);
 }

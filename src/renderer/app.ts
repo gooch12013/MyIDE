@@ -6,6 +6,7 @@ import './files';
 import './prefs';
 import './employees';
 import './employee';
+import './issues';
 import { startWorkspace } from './layouts';
 import { activeProject } from './projects';
 

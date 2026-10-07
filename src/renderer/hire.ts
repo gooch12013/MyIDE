@@ -1,3 +1,4 @@
+import { accountPicker } from './accounts';
 import { h } from './dom';
 import { activeProject } from './projects';
 
@@ -35,6 +36,40 @@ export function modelPicker(model: string, effort: string | undefined, onchange?
   };
 }
 
+// ---- mode: pinned, manager picks, auto ----
+
+type Mode = 'pinned' | 'manager' | 'auto';
+type Pick = { model: string; effort?: string };
+export const MODE_TEXT: Record<Mode, string> = { pinned: 'Pinned', manager: 'Manager picks', auto: 'Auto' };
+const MODE_HINT: Record<Mode, string> = {
+  pinned: 'You pick the exact model and effort.',
+  manager: 'Its lead picks per task when it assigns work.',
+  auto: 'MyIDE picks from each task: lint, rename, format to Haiku; architecture, design, plan to Opus; else Sonnet.',
+};
+export const fmtPick = (p: Pick): string => `${p.model[0].toUpperCase()}${p.model.slice(1)}${p.effort ? ` · ${p.effort}` : ''}`;
+
+/** "Ceiling Sonnet · high": what a lead or auto may pick without asking. */
+export function ceilingNote(ceiling?: Pick): string {
+  return ceiling
+    ? `Ceiling ${fmtPick(ceiling)}: a lead or auto mode picking above it waits for your approval.`
+    : 'No project ceiling: a lead picking above its own model waits for your approval.';
+}
+
+/** Mode dropdown with its one-line hint; the model picker is only used in Pinned. */
+export function modePicker(mode: Mode, onchange?: () => void) {
+  const s = select(Object.entries(MODE_TEXT), mode);
+  s.setAttribute('aria-label', 'Mode');
+  const hint = h('p', { className: 'pref-hint' });
+  const sync = () => { hint.textContent = MODE_HINT[s.value as Mode]; };
+  s.onchange = () => { sync(); onchange?.(); };
+  sync();
+  return {
+    el: h('div', { className: 'mode-pick' }, h('label', { className: 'field' }, h('span', { className: 'legend', textContent: 'Mode' }), s), hint),
+    get: () => s.value as Mode,
+    set(m: Mode) { s.value = m; sync(); },
+  };
+}
+
 let sheet: HTMLDialogElement | undefined;
 
 /** The hire sheet: role, task, model and effort (defaults from the role). */
@@ -42,20 +77,29 @@ export async function openHire(): Promise<void> {
   const project = activeProject();
   if (!project) return;
   sheet?.remove();
-  const roles = await api.employees.roles(project.id);
+  const [roles, org] = await Promise.all([api.employees.roles(project.id), api.org.get()]);
+  const po = org.projects.find((p) => p.id === project.id);
   const role = select(roles.map((r) => [r.name, `${r.name}${r.source === 'project' ? ' (project)' : ''}`]), roles[0]?.name ?? '');
   role.id = 'hire-role';
   const desc = h('p', { className: 'pref-hint' });
   const task = h('textarea', { id: 'hire-task', className: 'input', rows: 4, required: true, placeholder: 'What should this employee do?' });
   const pick = modelPicker('', '');
+  const acct = await accountPicker(pick.el); // the AI account is fixed at hire
+  const mode = modePicker('pinned', () => { pick.el.hidden = mode.get() === 'auto'; });
+  const lead = h('input', { type: 'checkbox', className: 'switch', id: 'hire-lead' });
+  const leadRow = h('label', { className: 'check', htmlFor: 'hire-lead' }, lead, h('span', { textContent: `Lead: can hire reports (up to ${org.caps.maxReports} at once, ${po?.maxDepth ?? org.caps.maxDepth} levels deep)` }));
+  const ceiling = h('p', { className: 'pref-hint', textContent: ceilingNote(po?.ceiling) });
   const status = h('p', { className: 'pref-warn' });
   status.setAttribute('aria-live', 'polite');
   const fromRole = () => {
     const r = roles.find((x) => x.name === role.value);
     desc.textContent = r?.description ?? '';
-    pick.set(r?.model || 'sonnet', r?.effort);
+    pick.set(po?.model || r?.model || 'sonnet', po?.effort || r?.effort);
+    mode.set(po?.mode || r?.mode || 'pinned');
+    pick.el.hidden = mode.get() === 'auto';
   };
   role.onchange = fromRole;
+  role.addEventListener('change', () => void acct.sync());
   fromRole();
   const hire = h('button', { className: 'btn btn--primary', value: 'hire', textContent: 'Hire' });
   const form = h('form', { method: 'dialog' },
@@ -65,7 +109,11 @@ export async function openHire(): Promise<void> {
       : h('p', { className: 'pref-hint', textContent: 'No roles found. A role is an agent file in ~/.claude/agents or this project\'s .claude/agents.' }),
     desc,
     h('label', { className: 'field', htmlFor: 'hire-task' }, h('span', { className: 'legend', textContent: 'Task' }), task),
+    acct.el,
+    mode.el,
     pick.el,
+    leadRow,
+    ceiling,
     status,
     h('div', { className: 'sheet-keys' }, h('button', { className: 'btn', value: 'cancel', formNoValidate: true, textContent: 'Cancel' }), hire));
   hire.disabled = !roles.length;
@@ -74,7 +122,7 @@ export async function openHire(): Promise<void> {
     ev.preventDefault();
     hire.disabled = true;
     try {
-      await api.employees.hire({ projectId: project.id, role: role.value, task: task.value.trim(), ...pick.get() });
+      await api.employees.hire({ projectId: project.id, role: role.value, task: task.value.trim(), ...acct.get(), mode: mode.get(), lead: lead.checked, ...(mode.get() === 'auto' ? {} : pick.get()) });
       sheet?.close();
     } catch (e) {
       status.textContent = (e as Error).message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');

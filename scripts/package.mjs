@@ -26,7 +26,9 @@ const [dir] = await packager({
   // Ship only the bundle and runtime modules; drop node-pty's Windows and Intel binaries (~60 MB).
   ignore: (p) =>
     !(p === '' || p === '/package.json' || p.startsWith('/dist') || p.startsWith('/node_modules')) ||
-    /^\/node_modules\/node-pty\/(deps|third_party|prebuilds\/(?!darwin-arm64))/.test(p),
+    /^\/node_modules\/node-pty\/(deps|third_party|prebuilds\/(?!darwin-arm64))/.test(p) ||
+    // Never ship a codex binary: the Codex ACP adapter's dependency carries one; MyIDE runs the user's own (CODEX_PATH).
+    p.startsWith('/node_modules/@openai/'),
 });
 const app = `${dir}/MyIDE.app`;
 

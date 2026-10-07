@@ -1,0 +1,47 @@
+{
+  "claude": {
+    "label": "Claude Code",
+    "chip": "",
+    "models": [["opus", "Opus"], ["sonnet", "Sonnet"], ["haiku", "Haiku"]],
+    "efforts": [["low", "Low"], ["medium", "Medium"], ["high", "High"], ["xhigh", "XHigh"], ["max", "Max"]],
+    "testModel": "haiku",
+    "voice": [true, "/voice in a MyIDE terminal (spike C)."],
+    "planMode": [true, "--permission-mode plan; the plan comes to NEEDS YOU (spike N)."],
+    "liveModel": [true, "Next turn, or now by interrupting and resuming (spike B)."],
+    "effort": [true, "--effort; Haiku has none (spike B)."],
+    "todos": [true, "TaskCreate and TaskUpdate drive the cue list (spike D)."],
+    "resume": [true, "claude --resume with the same session id (spike E)."],
+    "images": [true, "Image blocks in the prompt."],
+    "computerUse": [false, "Interactive only: use it through Talk, one session at a time; background turns (-p) cannot."]
+  },
+  "codex": {
+    "label": "OpenAI Codex",
+    "chip": "Codex",
+    "models": [["gpt-6-astra", "GPT-6 Astra"], ["gpt-6-sol", "GPT-6 Sol"], ["gpt-6-luna", "GPT-6 Luna"], ["gpt-5.6-sol", "GPT-5.6 Sol"], ["gpt-5.6-terra", "GPT-5.6 Terra"], ["gpt-5.6-luna", "GPT-5.6 Luna"]],
+    "efforts": [["low", "Low"], ["medium", "Medium"], ["high", "High"], ["xhigh", "XHigh"], ["max", "Max"]],
+    "testModel": "gpt-6-luna",
+    "voice": [false, "Codex has no voice command; use macOS dictation in the message box."],
+    "planMode": [true, "collaboration_mode=plan; the plan comes to NEEDS YOU (spike K)."],
+    "liveModel": [true, "Between turns, same session (spike K)."],
+    "effort": [true, "reasoning_effort (spike K)."],
+    "todos": [false, "Codex 0.157.1 exposes no plan tool, so there is no cue list; the last tool shows instead (spike K)."],
+    "resume": [true, "codex resume with the same session id (spike K)."],
+    "images": [true, "ACP image blocks (spike K)."],
+    "computerUse": ["unknown", "Not tested."]
+  },
+  "gemini": {
+    "label": "Gemini CLI",
+    "chip": "Gemini",
+    "models": [],
+    "efforts": [],
+    "testModel": "",
+    "voice": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "planMode": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "liveModel": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "effort": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "todos": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "resume": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "images": ["unknown", "Untested: Gemini CLI is not wired up yet."],
+    "computerUse": ["unknown", "Untested: Gemini CLI is not wired up yet."]
+  }
+}

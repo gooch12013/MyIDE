@@ -9,6 +9,10 @@ export const ATTRIBUTION = [
   '^ *(🤖 *)?Generated with \\[Claude Code\\]\\(',
   '^ *🤖 *Generated with Claude Code',
   '^ *Claude-Session:',
+  // Codex (strings in codex-cli 0.157.1): its trailer by address, and its footer.
+  '^ *Co-Authored-By:.*<noreply@openai\\.com>',
+  '^ *(🤖 *)?Generated with \\[Codex\\]\\(',
+  '^ *(🤖 *)?Generated with Codex\\.? *$',
 ];
 const res = ATTRIBUTION.map((p) => new RegExp(p, 'i'));
 

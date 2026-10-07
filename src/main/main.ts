@@ -11,6 +11,8 @@ import './mic';
 import { registerPrefsIpc } from './prefs';
 import { STATE_DIR } from './store';
 import { registerEmployeesIpc, stopAllTurns } from './employees';
+import { registerAiIpc } from './transports';
+import { registerForgeIpc } from './forge';
 
 // One MyIDE at a time. The lock lives in userData, so a dev or test run with its own MYIDE_HOME
 // gets its own userData and runs beside the installed app.
@@ -86,6 +88,8 @@ app.whenReady().then(() => {
   registerOpenerIpc();
   registerPrefsIpc();
   registerEmployeesIpc(() => mainWindow);
+  registerAiIpc();
+  registerForgeIpc();
   createMainWindow();
 });
 

@@ -1,0 +1,18 @@
+#!/bin/sh
+# issue PROJECT "title": files an issue on PROJECT's forge through the running MyIDE
+# (same attribution strip and outbox as the New issue form). Installed by MyIDE into ~/.myide/bin.
+set -u
+[ $# -eq 2 ] && [ -n "$2" ] || { echo 'usage: issue PROJECT "title"' >&2; exit 2; }
+ep="${MYIDE_HOME:-$HOME/.myide}/issue-endpoint.json"
+[ -r "$ep" ] || { echo 'MyIDE is not running.' >&2; exit 1; }
+url=$(sed -n 's/.*"url": *"\([^"]*\)".*/\1/p' "$ep")
+token=$(sed -n 's/.*"token": *"\([^"]*\)".*/\1/p' "$ep")
+json=$(osascript -l JavaScript -e 'function run(a){return JSON.stringify({project:a[0],title:a[1]})}' "$1" "$2") || exit 1
+body=$(printf '%s' "$json" | curl -sS --max-time 60 -H "Authorization: Bearer $token" -H 'Content-Type: application/json' --data-binary @- "$url" 2>/dev/null) \
+  || { echo 'MyIDE is not running.' >&2; exit 1; }
+out=$(osascript -l JavaScript -e 'function run(a){var r;try{r=JSON.parse(a[0])}catch(e){return "error: MyIDE refused the request (restart it if this persists)."}
+  if(r.error)return "error: "+r.error;return r.number?"#"+r.number+" "+r.url:"Queued: the forge is unreachable; MyIDE files it when it is back."}' "$body")
+case $out in
+  error:*) echo "${out#error: }" >&2; exit 1 ;;
+  *) echo "$out" ;;
+esac
