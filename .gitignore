@@ -1,0 +1,13 @@
+.DS_Store
+.idea/
+node_modules/
+
+# Planning, design, research and mockups stay local. The repo holds only the product.
+features.md
+BUILD_PLAN.md
+PRODUCT.md
+DESIGN.md
+mockups/
+reports/
+research_notes/
+.impeccable/
