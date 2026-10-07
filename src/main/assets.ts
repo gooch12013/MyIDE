@@ -343,9 +343,10 @@ async function refresh(): Promise<Catalog> {
     writeJSON(CATALOG, { fetchedAt: 0, models: [], ...catalog(), server: c.server ?? 'none', checkedAt: Date.now() });
     broadcast('assets:change', '');
   }
-  if (!c.server) throw new Error('Higgsfield is not connected to Claude Code. Connect it at claude.ai (Settings, Connectors), then refresh.');
-  if (!c.items?.length) throw new Error(`Higgsfield is ${c.server} but returned no models${r.ok ? '' : `: ${r.text.slice(0, 300)}`}`);
-  const cat: Catalog = { fetchedAt: Date.now(), checkedAt: Date.now(), server: c.server, credits: c.balance?.credits, plan: c.balance?.subscription_plan_type, models: compact(c.items) };
+  if (!c.server) throw new Error('Higgsfield is not connected to Claude Code. Connect it at claude.ai (Customize, Connectors), then refresh.');
+  if (!c.items?.length) throw new Error(c.server === 'pending' ? 'Higgsfield was still connecting. Refresh again in a moment.' : `Higgsfield is ${c.server} but returned no models${r.ok ? '' : `: ${r.text.slice(0, 300)}`}`);
+  // init often reports 'pending' because the connector finishes connecting mid-turn; answering tools proves it connected
+  const cat: Catalog = { fetchedAt: Date.now(), checkedAt: Date.now(), server: 'connected', credits: c.balance?.credits, plan: c.balance?.subscription_plan_type, models: compact(c.items) };
   writeJSON(CATALOG, cat);
   broadcast('assets:change', '');
   return cat;
