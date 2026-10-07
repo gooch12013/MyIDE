@@ -79,9 +79,9 @@ registerPanel('assets', {
       model.replaceChildren(...(cat?.models ?? []).map((m) => new Option(`${m.name}${m.provider ? ` · ${m.provider}` : ''}`, m.id)));
       if (cat?.models.some((m) => m.id === was)) model.value = was;
       else if (cat?.models.some((m) => m.id === 'nano_banana_pro')) model.value = 'nano_banana_pro';
-      modelNote.replaceChildren(cat ? led('done', 'Live') : led('idle', 'Not loaded'),
-        cat ? ` ${cat.models.length} image models from Higgsfield at ${clock(cat.fetchedAt)}.` : ' Load the model list from Higgsfield (a read-only check, no credits).');
-      refreshKey.textContent = cat ? 'Refresh' : 'Load models';
+      modelNote.replaceChildren(cat?.models.length ? led('done', 'Live') : led('idle', 'Not loaded'),
+        cat?.models.length ? ` ${cat.models.length} image models from Higgsfield at ${clock(cat.fetchedAt)}.` : ' Load the model list from Higgsfield (a read-only check, no credits).');
+      refreshKey.textContent = cat?.models.length ? 'Refresh' : 'Load models';
       drawOptions();
       drawBalance();
     }
@@ -292,7 +292,11 @@ registerPanel('assets', {
     }
 
     const offs = [
-      api.assets.onChange((id) => { if (id === projectId) { void load(); void api.assets.catalog().then((c) => { cat = c.catalog; drawBalance(); }); } }),
+      api.assets.onChange((id) => {
+        if (id === projectId) void load();
+        // '' is a catalog or approval-line change (Preferences > Higgsfield included).
+        void api.assets.catalog().then((c) => { cat = c.catalog; if (document.activeElement !== lineInput) lineInput.value = String(c.approveAbove); if (id) drawBalance(); else drawModels(); });
+      }),
       api.employees.onChange((e) => { if (e.projectId === projectId && e.role === 'designer' && e.state !== 'working') say(`Designer: ${e.state}${e.error ? `, ${e.error}` : ''}.`, e.state === 'failed'); }),
     ];
     void api.assets.catalog().then((c) => { cat = c.catalog; lineInput.value = String(c.approveAbove); drawModels(); });
@@ -301,3 +305,50 @@ registerPanel('assets', {
     return { onShow: () => void load(), dispose: () => offs.forEach((off) => off()) };
   },
 });
+
+// The Higgsfield status from the last refresh's init line ('none' when it was missing), or Unknown before one.
+const hfStatus = (server?: string): [string, string] =>
+  !server ? ['idle', 'Unknown'] : server === 'connected' ? ['done', 'Connected'] : server === 'pending' ? ['queued', 'Pending'] : ['failed', 'Not connected'];
+// The newest Higgsfield section redraws on catalog or approval-line changes, even while its tab is hidden.
+let redrawHf = () => {};
+api.assets.onChange((id) => { if (!id) redrawHf(); });
+const when = (t?: number) => (t ? new Date(t).toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'never');
+
+/** Preferences > Higgsfield: the studio's connector status, balance, approval line, designer role and model cache. */
+export async function higgsfieldSection(say: (t: string) => void): Promise<Node[]> {
+  const root = h('div', { className: 'psec' });
+  const row = (name: string, hint: string, ...ctl: (Node | string)[]) => h('div', { className: 'pref' },
+    h('div', { className: 'pref-label' }, h('span', { className: 'pref-name', textContent: name }), h('span', { className: 'pref-hint', textContent: hint })),
+    h('div', { className: 'pref-ctl' }, ...ctl));
+  const line = h('input', { type: 'number', min: '0', step: '1', className: 'input num' });
+  line.setAttribute('aria-label', 'Approval line in credits');
+  line.onchange = () => void api.assets.setLine(Number(line.value)).then(() => say(`Approval line: ${line.value} credits.`), (e) => say(errText(e)));
+  const refreshKeys: HTMLButtonElement[] = [];
+  const refresh = async () => {
+    refreshKeys.forEach((k) => { k.disabled = true; });
+    say('Asking Higgsfield for your balance and models (read-only, one small Claude turn)…');
+    try { const c = await api.assets.refresh(); say(`Checked: ${c.models.length} models, ${c.credits ?? '?'} credits.`); }
+    catch (e) { say(errText(e)); }
+    finally { refreshKeys.forEach((k) => { k.disabled = false; }); }
+  };
+  const refreshKey = (label: string) => { const k = key(label, () => void refresh(), { title: 'Read-only: calls balance and models_explore in one small Claude turn. Spends no Higgsfield credits.' }); refreshKeys.push(k); return k; };
+
+  async function draw(): Promise<void> {
+    const { catalog: c, approveAbove, role } = await api.assets.catalog();
+    const [state, label] = hfStatus(c?.server);
+    if (document.activeElement !== line) line.value = String(approveAbove);
+    root.replaceChildren(
+      row('Connector', `From the last refresh. Last checked ${when(c?.checkedAt ?? c?.fetchedAt)}.`, led(state, label),
+        key('Manage connector on claude.ai', () => void api.terminal.openUrl('https://claude.ai/settings/connectors'))),
+      row('Plan and credits', 'Refresh uses one small Claude turn and only reads; it never generates.',
+        h('span', { className: 'pref-value', textContent: c?.plan ? `${c.plan} plan` : 'Plan ?' }), h('span', { className: 'pref-value', textContent: `${c?.credits ?? '?'} credits` }), refreshKey('Refresh')),
+      row('Approval line', 'Above this many credits a request waits for you. The asset studio uses the same setting.', line, h('span', { className: 'pref-unit', textContent: 'credits' })),
+      row('Designer role', 'The contractor that runs Higgsfield for the asset studio (~/.claude/agents/designer.md).',
+        role ? led('done', 'Installed') : key('Install designer role', async () => { try { say(await api.assets.installRole()); void draw(); } catch (e) { say(errText(e)); } })),
+      row('Model cache', c?.models.length ? `${c.models.length} image models, fetched ${when(c.fetchedAt)}.` : 'No models cached yet.', refreshKey('Refresh models')),
+    );
+  }
+  redrawHf = () => void draw();
+  await draw();
+  return [h('p', { className: 'psec-lede', textContent: 'Higgsfield is connected through your claude.ai account, so MyIDE stores no Higgsfield key.' }), root];
+}

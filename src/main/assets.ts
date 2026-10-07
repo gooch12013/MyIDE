@@ -18,7 +18,7 @@ import { spawnEnv } from './pty';
 import { broadcast, handle, readJSON, STATE_DIR, writeJSON } from './store';
 
 export interface ModelInfo { id: string; name: string; provider: string; description: string; ratios: string[]; params: { name: string; options: string[]; default?: string }[]; refs: string[] }
-export interface Catalog { fetchedAt: number; server: string; credits?: number; plan?: string; models: ModelInfo[] }
+export interface Catalog { fetchedAt: number; checkedAt?: number; server: string; credits?: number; plan?: string; models: ModelInfo[] }
 export interface Version { file: string; jobId?: string; url?: string }
 export interface AssetRequest {
   id: string; projectId: string; createdAt: number; type: string; model: string; modelName: string;
@@ -339,10 +339,15 @@ async function refresh(): Promise<Catalog> {
   const ask = `Load the tools with ToolSearch query "select:${HF}balance,${HF}models_explore". Then call ${HF}balance with {}, and ${HF}models_explore with {"action":"list","type":"image","limit":100}. Call nothing else. Then reply with exactly: ok`;
   const r = await oneShot(ask, ['--model', 'haiku', '--allowedTools', 'ToolSearch', `${HF}balance`, `${HF}models_explore`, '--disallowedTools', 'Task', 'Bash', 'Write', 'Edit', ...SPENDERS]);
   const c = readCapture(r.lines);
+  if (!c.server || !c.items?.length) { // keep the last model list; only the connector status is new
+    writeJSON(CATALOG, { fetchedAt: 0, models: [], ...catalog(), server: c.server ?? 'none', checkedAt: Date.now() });
+    broadcast('assets:change', '');
+  }
   if (!c.server) throw new Error('Higgsfield is not connected to Claude Code. Connect it at claude.ai (Settings, Connectors), then refresh.');
   if (!c.items?.length) throw new Error(`Higgsfield is ${c.server} but returned no models${r.ok ? '' : `: ${r.text.slice(0, 300)}`}`);
-  const cat: Catalog = { fetchedAt: Date.now(), server: c.server, credits: c.balance?.credits, plan: c.balance?.subscription_plan_type, models: compact(c.items) };
+  const cat: Catalog = { fetchedAt: Date.now(), checkedAt: Date.now(), server: c.server, credits: c.balance?.credits, plan: c.balance?.subscription_plan_type, models: compact(c.items) };
   writeJSON(CATALOG, cat);
+  broadcast('assets:change', '');
   return cat;
 }
 
@@ -377,8 +382,9 @@ async function writePrompt(o: { model: string; type: string; ratio: string; sett
 }
 
 /** Copies the shipped designer role into ~/.claude/agents, only when David clicks; never over an existing file. */
+const roleFile = () => join(homedir(), '.claude', 'agents', 'designer.md');
 function installRole(): string {
-  const dst = join(homedir(), '.claude', 'agents', 'designer.md');
+  const dst = roleFile();
   if (existsSync(dst)) return `A designer role already exists at ${dst}; left as it is.`;
   mkdirSync(dirname(dst), { recursive: true });
   copyFileSync(join(__dirname, 'agents', 'designer.md'), dst);
@@ -444,7 +450,7 @@ function registerTools(): void {
 export function registerAssetsIpc(): void {
   registerTools();
   setApproveGate(spendGate);
-  handle('assets:catalog', () => ({ catalog: catalog(), approveAbove: approveAbove() }));
+  handle('assets:catalog', () => ({ catalog: catalog(), approveAbove: approveAbove(), role: existsSync(roleFile()) }));
   handle('assets:refresh', refresh);
   handle('assets:guide', (model: string) => guide(String(model)));
   handle('assets:write-prompt', writePrompt);
@@ -461,6 +467,7 @@ export function registerAssetsIpc(): void {
     if (!(Number.isInteger(n) && n >= 0)) throw new Error('A whole number of credits');
     const c = readConfig() as Record<string, any>;
     writeConfig({ ...c, assets: { ...c.assets, approveAbove: n } } as ReturnType<typeof readConfig>);
+    broadcast('assets:change', '');
   });
   handle('assets:install-role', installRole);
 }

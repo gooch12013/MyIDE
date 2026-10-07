@@ -263,7 +263,7 @@ const api = {
   },
   // Asset studio (Higgsfield): model list and balance, prompt writing, requests, gallery, save to project.
   assets: {
-    catalog: (): Promise<{ catalog: Catalog | null; approveAbove: number }> => ipcRenderer.invoke('assets:catalog'),
+    catalog: (): Promise<{ catalog: Catalog | null; approveAbove: number; role: boolean }> => ipcRenderer.invoke('assets:catalog'),
     /** One read-only haiku turn: balance and image models. */
     refresh: (): Promise<Catalog> => ipcRenderer.invoke('assets:refresh'),
     guide: (model: string): Promise<{ file: string; text: string }> => ipcRenderer.invoke('assets:guide', model),

@@ -8,6 +8,7 @@ import { openCommandTerminal, reloadTerminalSettings } from './terminal';
 import { forgesSection } from './issues';
 import { accountsSection } from './accounts';
 import { componentsSection, voiceSection } from './speech';
+import { higgsfieldSection } from './assets';
 
 const api = window.myide;
 type Info = Awaited<ReturnType<typeof api.prefs.get>>;
@@ -35,7 +36,7 @@ function colourWarning(colour: string, id: string): string {
   return twin.colour.toLowerCase() === colour.toLowerCase() ? `Same colour as ${twin.name}.` : `Hard to tell apart from ${twin.name}.`;
 }
 
-const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['accounts', 'AI accounts'], ['forges', 'Forges'], ['voice', 'Voice & read-back'], ['components', 'Optional components'], ['advanced', 'Advanced']] as const;
+const SECTIONS = [['appearance', 'Appearance'], ['projects', 'Projects'], ['layouts', 'Layouts'], ['startup', 'Startup'], ['claude', 'Claude'], ['accounts', 'AI accounts'], ['forges', 'Forges'], ['higgsfield', 'Higgsfield'], ['voice', 'Voice & read-back'], ['components', 'Optional components'], ['advanced', 'Advanced']] as const;
 type Section = (typeof SECTIONS)[number][0];
 
 registerPanel('preferences', {
@@ -197,6 +198,8 @@ registerPanel('preferences', {
       forges: (_info, say) => forgesSection(say),
 
       accounts: (_info, say) => accountsSection(say, () => void show()),
+
+      higgsfield: (_info, say) => higgsfieldSection(say),
 
       voice: (_info, say) => voiceSection(say),
 
