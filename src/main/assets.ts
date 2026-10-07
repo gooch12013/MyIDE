@@ -313,23 +313,37 @@ export async function saveToProject(projectId: string, id: string, version: numb
 
 // ---- one-off claude -p turns ----
 
-/** One `claude -p` turn in a throwaway folder on the user's own CLI and login; resolves with every stream-json line.
- *  `dir`: run there instead and leave it (the role wizard resumes its session from the same folder). */
-export async function oneShot(prompt: string, args: string[], timeoutMs = 180_000, dir?: string): Promise<{ lines: any[]; ok: boolean; text: string }> {
-  const cwd = dir ?? mkdtempSync(join(tmpdir(), 'myide-assets-'));
+/** Claude Code's own switch for the claude.ai connectors (it reads ENABLE_CLAUDEAI_MCP_SERVERS as falsy). */
+export const NO_CONNECTORS = { ENABLE_CLAUDEAI_MCP_SERVERS: 'false' };
+
+/** Claude Code's transcripts of a one-off turn that ran in `cwd`, a MyIDE temp folder: ~/.claude/projects/<realpath with
+ *  every non-alphanumeric as '-'> (checked against the folder claude 2.1.292 created). Call while `cwd` still exists. */
+export function dropTranscript(cwd: string): void {
   try {
-    const child = spawn('claude', ['-p', prompt, '--output-format', 'stream-json', '--verbose', ...args], { cwd, env: await spawnEnv(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const real = realpathSync(cwd);
+    if (!/^myide-(wizard|assets)-/.test(real.split(sep).pop() ?? '')) return; // only MyIDE's own temp folders
+    rmSync(join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects', real.replace(/[^a-zA-Z0-9]/g, '-')), { recursive: true, force: true });
+  } catch { /* gone already */ }
+}
+
+/** One `claude -p` turn in a throwaway folder on the user's own CLI and login; resolves with every stream-json line.
+ *  `dir`: run there instead and leave it (the role wizard resumes its session from the same folder). `signal` kills the turn.
+ *  The prompt goes after `--`, so text starting with '-' is never read as an option. */
+export async function oneShot(prompt: string, args: string[], o: { timeoutMs?: number; dir?: string; env?: Record<string, string>; signal?: AbortSignal } = {}): Promise<{ lines: any[]; ok: boolean; text: string }> {
+  const cwd = o.dir ?? mkdtempSync(join(tmpdir(), 'myide-assets-'));
+  try {
+    const child = spawn('claude', ['-p', '--output-format', 'stream-json', '--verbose', ...args, '--', prompt], { cwd, env: { ...await spawnEnv(), ...o.env }, stdio: ['ignore', 'pipe', 'pipe'], signal: o.signal });
     const lines: any[] = [];
     let stderr = '';
     child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-2000); });
     createInterface({ input: child.stdout }).on('line', (l) => { try { lines.push(JSON.parse(l)); } catch { /* not JSON */ } });
-    const timer = setTimeout(() => child.kill('SIGINT'), timeoutMs);
+    const timer = setTimeout(() => child.kill('SIGINT'), o.timeoutMs ?? 180_000);
     await new Promise<void>((done) => { child.on('close', () => done()); child.on('error', (e) => { stderr = e.message; done(); }); });
     clearTimeout(timer);
     const result = lines.find((l) => l.type === 'result');
     return { lines, ok: !!result && !result.is_error, text: typeof result?.result === 'string' ? result.result : stderr.trim() || 'claude gave no result' };
   } finally {
-    if (!dir) rmSync(cwd, { recursive: true, force: true });
+    if (!o.dir) { dropTranscript(cwd); rmSync(cwd, { recursive: true, force: true }); }
   }
 }
 
@@ -378,7 +392,7 @@ async function writePrompt(o: { model: string; type: string; ratio: string; sett
   ].join('\n');
   // No MCP servers at all (the claude.ai connectors included), and Higgsfield denied by name too.
   const r = await oneShot(ask, ['--model', 'sonnet', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
-    '--disallowedTools', 'Task', 'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', HF_SERVER, ...SPENDERS]);
+    '--disallowedTools', 'Task', 'Bash', 'Write', 'Edit', 'NotebookEdit', 'WebFetch', 'WebSearch', HF_SERVER, ...SPENDERS], { env: NO_CONNECTORS });
   if (!r.ok) throw new Error(r.text.slice(0, 300));
   return { prompt: r.text.trim(), guide: g.file };
 }

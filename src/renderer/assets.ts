@@ -1,5 +1,5 @@
 import type { AssetRequest, Catalog, ModelInfo } from '../main/assets';
-import { ask, errText, h, key } from './dom';
+import { ask, errText, h, key, seg } from './dom';
 import { led } from './employees';
 import { activeProject } from './projects';
 import { registerPanel } from './registry';
@@ -10,20 +10,6 @@ type Listed = AssetRequest & { thumbs: string[]; dir: string };
 const TYPES = ['Logo', 'App icon', 'Illustration', 'Photo', 'Background', 'Banner'];
 const clock = (t: number) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const day = (t: number) => new Date(t).toLocaleDateString([], { day: 'numeric', month: 'short' });
-let segN = 0;
-
-/** A row of radio keys; `get` reads the checked value. */
-function seg(label: string, options: string[], value: string, onchange?: () => void): { el: HTMLFieldSetElement; get(): string } {
-  const name = `as-seg-${++segN}`;
-  const el = h('fieldset', { className: 'seg' }, h('legend', { className: 'legend', textContent: label }));
-  for (const o of options) {
-    const id = `${name}-${o.replace(/\W/g, '_')}`;
-    el.append(h('input', { type: 'radio', name, id, value: o, checked: o === value, onchange: onchange ?? null }), h('label', { className: 'key key--sm', htmlFor: id, textContent: o }));
-  }
-  if (!options.includes(value) && el.querySelector('input')) (el.querySelector('input') as HTMLInputElement).checked = true;
-  return { el, get: () => (el.querySelector('input:checked') as HTMLInputElement | null)?.value ?? '' };
-}
-
 const field = (label: string, ...kids: (Node | string)[]) => h('label', { className: 'field' }, h('span', { className: 'legend', textContent: label }), ...kids);
 const box = (title: string, ...kids: (Node | string)[]) => h('section', { className: 'as-box' }, h('h2', { className: 'legend as-box-title', textContent: title }), ...kids);
 

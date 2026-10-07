@@ -1,9 +1,9 @@
 // Role wizard panel: pick a template (or blank), a short interview with the AI (its structured questions are controls,
 // the settings one card), then a review form with a live preview of the role file, save, and "Hire one now?".
 import type { Draft, Settings } from '../main/role-file';
-import { check, draftOf, renderRole, settingsOf } from '../main/role-file';
+import { check, draftOf, efforts as effortsOf, renderRole, settingsOf } from '../main/role-file';
 import type { Ctx } from '../main/wizard';
-import { ask, errText, field, h, key } from './dom';
+import { ask, errText, field, h, key, seg } from './dom';
 import { MODE_TEXT, openHire } from './hire';
 import { activeProject, allProjects } from './projects';
 import { openPanel, registerPanel } from './registry';
@@ -18,17 +18,6 @@ export function openWizard(o: { projectId?: string; edit?: string } = {}): void 
   openPanel('role-wizard', { projectId: o.projectId ?? activeProject()?.id ?? '', edit: o.edit ?? '' });
 }
 
-let segN = 0;
-function seg(label: string, options: [string, string][], value: string, onpick: (v: string) => void, disabled: string[] = []): HTMLFieldSetElement {
-  const name = `wz-seg-${++segN}`;
-  const el = h('fieldset', { className: 'seg' }, h('legend', { className: 'legend', textContent: label }));
-  for (const [v, l] of options) {
-    const id = `${name}-${v}`;
-    el.append(h('input', { type: 'radio', name, id, value: v, checked: v === value, disabled: disabled.includes(v), onchange: () => onpick(v) }),
-      h('label', { className: 'key key--sm', htmlFor: id, textContent: l }));
-  }
-  return el;
-}
 const select = (label: string, options: [string, string, boolean?][], value: string, onpick: (v: string) => void): HTMLLabelElement => {
   const s = h('select', { className: 'input select', onchange: () => onpick(s.value) }, ...options.map(([v, l, off]) => Object.assign(new Option(l, v), { disabled: !!off })));
   s.value = value;
@@ -44,21 +33,22 @@ const check1 = (label: string, on: boolean, onset: (b: boolean) => void): HTMLLa
 
 /** The settings card: every structured choice as a control, prefilled with the AI's suggestions. A value David
  *  changed is his: later suggestions leave it alone. The same card moves into the review form. */
-function settingsCard(ctx: Ctx, init: Settings, where: Where, onchange: () => void): Card {
+function settingsCard(ctx: Ctx, init: Partial<Draft>, where: Where, onchange: () => void): Card {
+  const orig = init.orig; // the edited file's own model stays a choice
   let v: Settings & { where: Where } = { ...settingsOf(init, ctx), where: ctx.project ? where : 'user' };
   const mine = new Set<string>();
   const el = h('section', { className: 'wz-card' });
   el.setAttribute('aria-label', 'Role settings');
   const set = (k: string, val: unknown, redraw = false) => {
     mine.add(k);
-    v = { ...settingsOf({ ...v, [k]: val }, ctx), where: k === 'where' ? val as Where : v.where };
+    v = { ...settingsOf({ ...v, [k]: val, orig }, ctx), where: k === 'where' ? val as Where : v.where };
     if (k === 'provider') mine.add('account');
     if (redraw) draw();
     onchange();
   };
   const draw = () => {
     const p = ctx.providers[v.provider];
-    const efforts = /haiku/i.test(v.model) ? [] : p?.efforts ?? [];
+    const efforts = (p?.efforts ?? []).filter(([e]) => effortsOf(ctx, v.provider, v.model).includes(e));
     const models = p?.models.some(([m]) => m === v.model) ? p.models : [...(p?.models ?? []), [v.model, v.model]];
     const fileName = `${ctx.project && v.where === 'project' ? '<repo>/' : '~/'}.claude/agents/<name>.md`;
     el.replaceChildren(
@@ -70,13 +60,13 @@ function settingsCard(ctx: Ctx, init: Settings, where: Where, onchange: () => vo
         select('Model', models.map(([m, l]) => [m, l]), v.model, (x) => set('model', x, true)),
         ...(efforts.length ? [select('Effort', [['', 'Default'], ...efforts.map(([e, l]) => [e, l] as [string, string])], v.effort ?? '', (x) => set('effort', x || undefined))] : []),
         num('Max turns', v.maxTurns, 'No limit', (n) => set('maxTurns', n))),
-      seg('Mode', Object.entries(MODE_TEXT), v.mode, (x) => set('mode', x)),
-      seg('Staff', [['staff', 'Project staff'], ['shared', 'Contractor (released after it reports)']], v.shared ? 'shared' : 'staff', (x) => set('shared', x === 'shared')),
+      seg('Mode', Object.entries(MODE_TEXT), v.mode, (x) => set('mode', x)).el,
+      seg('Staff', [['staff', 'Project staff'], ['shared', 'Contractor (released after it reports)']], v.shared ? 'shared' : 'staff', (x) => set('shared', x === 'shared')).el,
       h('div', { className: 'wz-row' },
         check1('Lead: can hire reports', v.lead, (b) => set('lead', b, true)),
         ...(v.lead ? [num('Max reports', v.maxReports, '3', (n) => set('maxReports', n ?? 3))] : []),
         check1('Read-only: no file edits', v.readOnly, (b) => set('readOnly', b))),
-      seg('Save to', [['user', 'All projects'], ['project', ctx.project ? `This project (${ctx.project.name})` : 'This project']], v.where, (x) => set('where', x, true), ctx.project ? [] : ['project']),
+      seg('Save to', [['user', 'All projects'], ['project', ctx.project ? `This project (${ctx.project.name})` : 'This project']], v.where, (x) => set('where', x, true), ctx.project ? [] : ['project']).el,
       h('p', { className: 'pref-hint', textContent: v.where === 'project' ? `${fileName}: inside the repo, so it is committed and shared with it.` : `${fileName}: for every project on this Mac.` }));
   };
   draw();
@@ -85,7 +75,7 @@ function settingsCard(ctx: Ctx, init: Settings, where: Where, onchange: () => vo
     get: () => v,
     apply(s) {
       const fresh = Object.fromEntries(Object.entries(s ?? {}).filter(([k]) => !mine.has(k)));
-      v = { ...settingsOf({ ...v, ...fresh }, ctx), where: v.where };
+      v = { ...settingsOf({ ...v, ...fresh, orig }, ctx), where: v.where };
       draw();
     },
   };
@@ -104,6 +94,7 @@ registerPanel('role-wizard', {
     const say = (t: string) => { status.textContent = t; };
     let ctx: Ctx;
     let base: Draft | undefined; // the template or the role being edited
+    let templateFile: string | undefined;
     let editFile: string | undefined;
     let editWhere: Where | undefined;
     let where: Where = project ? 'project' : 'user';
@@ -151,9 +142,9 @@ registerPanel('role-wizard', {
         ...(opts.length ? [h('div', { className: 'wz-choices' }, ...opts)] : []), other);
     };
     const showCard = (s: Record<string, unknown> | undefined) => {
+      if (card) return s && card.apply(s);
       if (!s) return;
-      if (card) return card.apply(s);
-      card = settingsCard(ctx, settingsOf(s, ctx), where, () => { answered = true; refresh(); });
+      card = settingsCard(ctx, s, where, () => { answered = true; refresh(); });
       line('Wizard', 'My suggested settings. Change anything here; it goes with your next message.', card.el);
     };
     const send = async (text: string, drafting = false) => {
@@ -181,7 +172,7 @@ registerPanel('role-wizard', {
         talked = true;
         wait.remove();
         const rep = r.reply;
-        if (!rep) { line('Wizard', r.text || r.raw); say('The AI did not answer in the expected form. Answer again, or press Draft it.'); return; }
+        if (!rep) { line('Wizard', r.text || 'No answer.'); say('The AI did not answer in the expected form. Answer again, or press Draft it.'); return; }
         line('Wizard', r.text, ...rep.ask.map(question));
         showCard(rep.settings);
         if (rep.draft) review(rep.draft);
@@ -212,8 +203,7 @@ registerPanel('role-wizard', {
     // ---- review ----
     const review = (raw: Draft) => {
       draft = raw;
-      if (!card) showCard(raw as unknown as Record<string, unknown>);
-      else card.apply(raw as unknown as Record<string, unknown>);
+      showCard(raw as unknown as Record<string, unknown>);
       const name = h('input', { className: 'input', value: raw.name, maxLength: 60 });
       const desc = h('input', { className: 'input', value: raw.description, maxLength: 300 });
       const job = h('textarea', { className: 'input wz-job', rows: 14, value: raw.body });
@@ -223,7 +213,8 @@ registerPanel('role-wizard', {
       const problems = h('div', { className: 'wz-problems' });
       problems.setAttribute('aria-live', 'polite');
       const save = h('button', { type: 'button', className: 'key key--go', textContent: 'Save role' });
-      const current = () => draftOf({ ...draft, name: name.value, description: desc.value, body: job.value, rules: rules.value, firstTask: task.value, ...card!.get() }, ctx);
+      // the file's own extra keys and originals: main re-reads them from disk when saving
+      const current = () => draftOf({ ...draft, extra: base?.extra, orig: base?.orig, name: name.value, description: desc.value, body: job.value, rules: rules.value, firstTask: task.value, ...card!.get() }, ctx);
       refresh = () => {
         const d = current();
         const w = card!.get().where;
@@ -253,11 +244,16 @@ registerPanel('role-wizard', {
     const doSave = async (d: Draft) => {
       const w = card!.get().where;
       const file = editFile && w === editWhere ? editFile : undefined;
+      const o: Parameters<typeof api.wizard.save>[1] = { where: w, projectId, file, template: file ? undefined : templateFile };
       try {
-        let r = await api.wizard.save(d, { where: w, projectId, file });
+        let r = await api.wizard.save(d, o);
+        if (r.rename) {
+          if (!(await ask(`Rename ${editName} to ${d.name}?`, `Saves ${d.name}.md and removes ${r.rename}.`, 'Rename', true))) return;
+          r = await api.wizard.save(d, { ...o, rename: true });
+        }
         if (r.exists) {
           if (!(await ask(`Replace ${d.name}?`, `${r.exists} already exists. Saving replaces that file.`, 'Replace', true))) return;
-          r = await api.wizard.save(d, { where: w, projectId, file, overwrite: true });
+          r = await api.wizard.save(d, { ...o, rename: true, overwrite: true });
         }
         void api.wizard.end(id);
         answered = false;
@@ -278,19 +274,24 @@ registerPanel('role-wizard', {
         ctx = await api.wizard.context(projectId);
         if (editName) {
           const r = await api.wizard.read(projectId, editName);
+          if (!r.draft) {
+            return body.replaceChildren(h('section', { className: 'wz-done' },
+              h('p', { textContent: 'This role uses advanced frontmatter; edit the file by hand.' }), h('p', { className: 'path', textContent: r.file }),
+              h('div', { className: 'sheet-keys' }, key('Close', () => panel.close()), key('Reveal in Finder', () => void api.wizard.reveal(projectId, editName), { className: 'key key--go' }))));
+          }
           base = r.draft;
           editFile = r.file;
           where = editWhere = r.where;
           return startChat();
         }
         const list = await api.wizard.templates();
-        const pick = (d?: Draft) => { base = d; startChat(); };
+        const pick = (t?: { file: string; draft: Draft }) => { base = t?.draft; templateFile = t?.file; startChat(); };
         const meta = (d: Draft) => `${d.model}${d.effort ? ` · ${d.effort}` : ''} · ${MODE_TEXT[d.mode]}${d.lead ? ' · lead' : ''}${d.readOnly ? ' · read-only' : ''}`;
         body.replaceChildren(h('section', { className: 'wz-templates' },
           h('h3', { className: 'legend', textContent: 'Start from' }),
           h('div', { className: 'wz-tpl-list' },
             h('button', { type: 'button', className: 'key wz-tpl', onclick: () => pick() }, h('span', { className: 'btn-label', textContent: 'Start blank' }), h('span', { className: 'wz-tpl-sub', textContent: 'The wizard asks about the job from scratch.' })),
-            ...list.map((t) => h('button', { type: 'button', className: 'key wz-tpl', title: t.file, onclick: () => pick(t.draft) },
+            ...list.map((t) => h('button', { type: 'button', className: 'key wz-tpl', title: t.file, onclick: () => pick(t) },
               h('span', { className: 'btn-label', textContent: t.draft.name }), h('span', { className: 'wz-tpl-sub', textContent: t.draft.description }),
               h('span', { className: 'wz-tpl-meta', textContent: meta(t.draft) })))),
           h('p', { className: 'pref-hint', textContent: 'Your own templates go in ~/.myide/role-templates (role files; names starting with _ are skipped).' }),

@@ -41,6 +41,21 @@ export function formSheet(title: string, body: HTMLElement[], submit: () => Prom
   return dlg;
 }
 
+let segN = 0;
+/** A row of radio keys; options are values or [value, label]. `get` reads the checked one; the first is checked when `value` is none of them. */
+export function seg(label: string, options: (string | [string, string])[], value: string, onpick?: (v: string) => void, disabled: string[] = []): { el: HTMLFieldSetElement; get(): string } {
+  const name = `seg-${++segN}`;
+  const el = h('fieldset', { className: 'seg' }, h('legend', { className: 'legend', textContent: label }));
+  options.forEach((o, i) => {
+    const [v, l] = typeof o === 'string' ? [o, o] : o;
+    el.append(h('input', { type: 'radio', name, id: `${name}-${i}`, value: v, checked: v === value, disabled: disabled.includes(v), onchange: () => onpick?.(v) }),
+      h('label', { className: 'key key--sm', htmlFor: `${name}-${i}`, textContent: l }));
+  });
+  const first = el.querySelector('input');
+  if (first && !el.querySelector('input:checked')) first.checked = true;
+  return { el, get: () => (el.querySelector('input:checked') as HTMLInputElement | null)?.value ?? '' };
+}
+
 /** A labelled form field, with an optional hint under it. */
 export const field = (label: string, ctl: HTMLElement, hint?: string): HTMLLabelElement =>
   h('label', { className: 'field' }, h('span', { className: 'legend', textContent: label }), ctl, ...(hint ? [h('span', { className: 'pref-hint', textContent: hint })] : []));

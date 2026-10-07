@@ -1,30 +1,33 @@
 // The role wizard: an interview as one-off `claude -p` turns (no MCP servers, no tools, resumed in its own temp folder),
 // then a role file saved to ~/.claude/agents or the project's .claude/agents. The pure part is in role-file.ts.
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { app, shell } from 'electron';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join, relative, sep } from 'node:path';
 import { listAccounts } from './accounts';
 import { codexInfo } from './acp/codex';
 import { geminiInfo } from './acp/gemini';
-import { oneShot } from './assets';
+import { dropTranscript, NO_CONNECTORS, oneShot } from './assets';
 import { claudeInfo } from './claude/version';
 import { MAC, parseRole, roles } from './employees';
 import { projectById, readConfig } from './projects';
-import { draftOf, check, parseRoleText, prose, renderRole, replyOf, type Draft, type WizardCtx } from './role-file';
+import { ADVANCED, draftOf, check, parseRoleText, prose, renderRole, replyOf, type Draft, type Reply, type WizardCtx } from './role-file';
 import { handle, STATE_DIR } from './store';
 import { providers } from './transports';
 
 type Where = 'user' | 'project';
 export type Ctx = WizardCtx & { project?: { id: string; name: string }; taken: Record<Where, string[]>; model: string };
 
-// Every built-in tool that reads, writes, runs or fetches: the interview only talks.
+// Every built-in tool: the interview only talks. With these denied, claude 2.1.292's init lists no tools at all (checked).
 const NO_TOOLS = ['Task', 'Agent', 'Bash', 'BashOutput', 'KillShell', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Read', 'Glob', 'Grep', 'LS',
-  'WebFetch', 'WebSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'ToolSearch', 'Skill', 'SlashCommand', 'ExitPlanMode', 'EnterWorktree',
+  'WebFetch', 'WebSearch', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskStop', 'ToolSearch', 'Skill', 'SlashCommand', 'ExitPlanMode', 'EnterWorktree',
   'ExitWorktree', 'Monitor', 'CronCreate', 'CronDelete', 'CronList', 'DesignSync', 'ListAgents', 'PushNotification', 'RemoteTrigger', 'ReportFindings',
-  'ScheduleWakeup', 'SendMessage', 'Workflow'];
-// ponytail: a list by name (claude 2.1.292's built-ins); a new built-in that acts still meets -p's permission check, which has no
-// prompt tool here, so it is refused, and the folder is an empty temp dir. --tools "" would be tighter but is off limits.
-const sessions = new Map<string, { cwd: string; sessionId?: string }>();
+  'ScheduleWakeup', 'SendMessage', 'Workflow', 'Artifact', 'ArtifactData', 'ArtifactComments'];
+// ponytail: a list by name; a new built-in that acts still meets permission mode "default", which has no prompt tool in -p,
+// so it is refused, and the folder is an empty temp dir. --tools "" would be tighter but is off limits.
+const LOCKDOWN = ['--permission-mode', 'default', '--setting-sources', 'project,local', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disallowedTools', ...NO_TOOLS];
+type Session = { cwd: string; sessionId?: string; ac: AbortController };
+const sessions = new Map<string, Session>();
 
 const project = (id?: string) => (id === MAC.id ? MAC : projectById(id));
 const dirFor = (where: Where, projectId?: string): string => {
@@ -87,29 +90,41 @@ function systemPrompt(ctx: Ctx, projectId?: string): string {
   ].join('\n');
 }
 
-export async function turn(o: { id: string; projectId?: string; message: string }): Promise<{ text: string; reply: ReturnType<typeof replyOf>; raw: string }> {
+export async function turn(o: { id: string; projectId?: string; message: string }): Promise<{ text: string; reply?: Reply }> {
   if (typeof o?.message !== 'string' || !o.message.trim()) throw new Error('Say something first');
   let s = sessions.get(o.id);
-  if (!s) sessions.set(o.id, (s = { cwd: mkdtempSync(join(tmpdir(), 'myide-wizard-')) }));
+  if (!s) sessions.set(o.id, (s = { cwd: mkdtempSync(join(tmpdir(), 'myide-wizard-')), ac: new AbortController() }));
   const ctx = await context(o.projectId);
-  const r = await oneShot(o.message, ['--model', ctx.model, '--system-prompt', systemPrompt(ctx, o.projectId), '--max-turns', '2',
-    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disallowedTools', ...NO_TOOLS, ...(s.sessionId ? ['--resume', s.sessionId] : [])], 240_000, s.cwd);
-  if (!r.ok) throw new Error(r.text.slice(0, 300));
-  s.sessionId = r.lines.find((l) => l.type === 'result')?.session_id ?? s.sessionId;
-  return { text: prose(r.text), reply: replyOf(r.text, ctx), raw: r.text };
+  try {
+    const r = await oneShot(o.message, ['--model', ctx.model, '--system-prompt', systemPrompt(ctx, o.projectId), '--max-turns', '2', ...LOCKDOWN,
+      ...(s.sessionId ? ['--resume', s.sessionId] : [])], { timeoutMs: 240_000, dir: s.cwd, env: NO_CONNECTORS, signal: s.ac.signal });
+    if (s.ac.signal.aborted) throw new Error('Cancelled');
+    if (!r.ok) throw new Error(r.text.slice(0, 300));
+    s.sessionId = r.lines.find((l) => l.type === 'result')?.session_id ?? s.sessionId;
+    return { text: prose(r.text), reply: replyOf(r.text, ctx) };
+  } finally {
+    if (sessions.get(o.id) !== s) clean(s); // ended while the turn ran: the killed child may have written more
+  }
 }
 
+function clean(s: Session): void {
+  s.ac.abort();
+  dropTranscript(s.cwd);
+  rmSync(s.cwd, { recursive: true, force: true });
+}
+/** Ends an interview: kills a running turn, removes its temp folder and Claude Code's transcript of it. */
 export function end(id: string): void {
   const s = sessions.get(id);
   sessions.delete(id);
-  if (s) rmSync(s.cwd, { recursive: true, force: true });
+  if (s) clean(s);
 }
 
 /** An existing role as a draft, for "Edit role with wizard". */
-async function read(projectId: string | undefined, name: string): Promise<{ draft: Draft; where: Where; file: string }> {
+async function read(projectId: string | undefined, name: string): Promise<{ draft?: Draft; advanced?: true; where: Where; file: string }> {
   const r = roles(projectId ?? '').find((x) => x.name === name);
   if (!r) throw new Error(`No role named ${name}`);
-  return { draft: parseRoleText(readFileSync(r.file, 'utf8'), await context(projectId)), where: r.source, file: r.file };
+  try { return { draft: parseRoleText(readFileSync(r.file, 'utf8'), await context(projectId)), where: r.source, file: r.file }; }
+  catch (e) { if ((e as Error).message === ADVANCED) return { advanced: true, where: r.source, file: r.file }; throw e; }
 }
 
 /** Templates to start from: David's own in ~/.myide/role-templates (not starting with "_"), then the shipped roles. */
@@ -124,21 +139,39 @@ async function templates(): Promise<{ file: string; draft: Draft }[]> {
   });
 }
 
+/** realpath of `p`'s deepest existing ancestor, with the rest appended: where a write there would really land. */
+function landing(p: string): string {
+  let x = p;
+  while (!existsSync(x) && dirname(x) !== x) x = dirname(x);
+  return join(realpathSync(x), relative(x, p));
+}
+
 /** Writes the role file (0644, like Claude Code's own agents). An existing file is only replaced with overwrite: true;
- *  otherwise the answer is { exists } and David is asked. `file`: the role being edited, kept in place. */
-async function save(raw: Draft, o: { where: Where; projectId?: string; file?: string; overwrite?: boolean }): Promise<{ file?: string; exists?: string }> {
+ *  otherwise the answer is { exists } and David is asked. `file`: the role being edited; a new name there answers
+ *  { rename } first, and with rename: true writes <new>.md and then removes the old file. `template`: the template it
+ *  started from. Frontmatter the wizard does not edit comes only from those files, re-read here, never from `raw`. */
+async function save(raw: Draft, o: { where: Where; projectId?: string; file?: string; template?: string; overwrite?: boolean; rename?: boolean }): Promise<{ file?: string; exists?: string; rename?: string }> {
   const where: Where = o?.where === 'project' ? 'project' : 'user';
   const ctx = await context(o.projectId);
-  const d = draftOf(raw, ctx);
   const dir = dirFor(where, o.projectId);
-  const editing = o.file && dirname(o.file) === dir ? o.file : undefined;
+  const editing = o.file && dirname(o.file) === dir && existsSync(o.file) ? o.file : undefined;
+  const source = editing ?? (await templates()).find((t) => t.file === o.template)?.file;
+  const disk = source ? parseRoleText(readFileSync(source, 'utf8'), ctx) : undefined;
+  const d = draftOf({ ...raw, extra: disk?.extra, orig: disk?.orig }, ctx);
   const own = editing ? (parseRole(editing, 'user')?.name ?? '') : '';
-  const { errors } = check(d, ctx, ctx.taken[where].filter((n) => n !== own && `${n}.md` !== editing?.slice(dir.length + 1)));
+  const { errors } = check(d, ctx, ctx.taken[where].filter((n) => n !== own && `${n}.md` !== (editing && basename(editing))));
   if (errors.length) throw new Error(errors.join(' '));
-  const file = editing ?? join(dir, `${d.name}.md`);
-  if (existsSync(file) && o.overwrite !== true) return { exists: file };
+  const renamed = !!editing && d.name !== own && join(dir, `${d.name}.md`) !== editing;
+  if (renamed && o.rename !== true) return { rename: editing };
+  const file = editing && !renamed ? editing : join(dir, `${d.name}.md`);
+  const root = where === 'user' ? join(homedir(), '.claude') : project(o.projectId)!.path;
+  if (!(landing(dir) + sep).startsWith(landing(root) + sep)) throw new Error(`${dir} leads outside ${root} through a link; MyIDE does not write there`);
+  const st = lstatSync(file, { throwIfNoEntry: false });
+  if (st?.isSymbolicLink()) throw new Error(`${file} is a symbolic link; MyIDE does not write through links`);
+  if (st && o.overwrite !== true) return { exists: file };
   mkdirSync(dir, { recursive: true });
-  writeFileSync(file, renderRole(d), { mode: 0o644 });
+  writeFileSync(file, renderRole(d), { mode: 0o644, flag: st ? 'w' : 'wx' });
+  if (renamed) rmSync(editing!, { force: true });
   return { file };
 }
 
@@ -149,4 +182,6 @@ export function registerWizardIpc(): void {
   handle('wizard:read', read);
   handle('wizard:templates', templates);
   handle('wizard:save', save);
+  handle('wizard:reveal', (projectId: string | undefined, name: string) => { const r = roles(projectId ?? '').find((x) => x.name === name); if (r) shell.showItemInFolder(r.file); });
+  app.on('before-quit', () => { for (const id of [...sessions.keys()]) end(id); });
 }

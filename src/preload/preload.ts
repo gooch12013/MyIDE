@@ -16,7 +16,7 @@ import type { Row as ComponentRow } from '../main/components';
 import type { Clip, Clone, SpeechOptions, SpeechPatch, SpeechStatus } from '../main/speech';
 import type { Button, PaletteItem, Schedule } from '../main/buttons';
 import type { AssetRequest, Catalog } from '../main/assets';
-import type { Draft } from '../main/role-file';
+import type { Draft, Reply } from '../main/role-file';
 import type { Ctx } from '../main/wizard';
 import type { Todo } from '../main/todos';
 
@@ -313,12 +313,16 @@ const api = {
   // The role wizard: interview turns, templates, an existing role as a draft, and saving the role file.
   wizard: {
     context: (projectId?: string): Promise<Ctx> => ipcRenderer.invoke('wizard:context', projectId),
-    turn: (o: { id: string; projectId?: string; message: string }): Promise<{ text: string; reply?: { ask: { q: string; choices?: string[]; multi?: boolean }[]; settings?: Record<string, unknown>; draft?: Draft }; raw: string }> => ipcRenderer.invoke('wizard:turn', o),
+    turn: (o: { id: string; projectId?: string; message: string }): Promise<{ text: string; reply?: Reply }> => ipcRenderer.invoke('wizard:turn', o),
+    /** Kills a running turn and removes the interview's temp folder and transcript. */
     end: (id: string): Promise<void> => ipcRenderer.invoke('wizard:end', id),
     templates: (): Promise<{ file: string; draft: Draft }[]> => ipcRenderer.invoke('wizard:templates'),
-    read: (projectId: string | undefined, name: string): Promise<{ draft: Draft; where: 'user' | 'project'; file: string }> => ipcRenderer.invoke('wizard:read', projectId, name),
-    /** { exists } when the file is there and overwrite is not true: ask David, then call again. */
-    save: (d: Draft, o: { where: 'user' | 'project'; projectId?: string; file?: string; overwrite?: boolean }): Promise<{ file?: string; exists?: string }> => ipcRenderer.invoke('wizard:save', d, o),
+    /** { advanced } instead of a draft when the frontmatter is more than the wizard can rewrite losslessly. */
+    read: (projectId: string | undefined, name: string): Promise<{ draft?: Draft; advanced?: true; where: 'user' | 'project'; file: string }> => ipcRenderer.invoke('wizard:read', projectId, name),
+    reveal: (projectId: string | undefined, name: string): Promise<void> => ipcRenderer.invoke('wizard:reveal', projectId, name),
+    /** { exists } when the file is there and overwrite is not true, { rename } when an edit changed the name: ask David, then call again.
+     *  Frontmatter the wizard does not edit is re-read in main from `file` or `template`, never taken from `d`. */
+    save: (d: Draft, o: { where: 'user' | 'project'; projectId?: string; file?: string; template?: string; overwrite?: boolean; rename?: boolean }): Promise<{ file?: string; exists?: string; rename?: string }> => ipcRenderer.invoke('wizard:save', d, o),
   },
   menuState: (state: MenuState): void => ipcRenderer.send('menu:state', state),
   /** App commands from keyboard shortcuts, e.g. 'new-terminal' (Cmd+T). */

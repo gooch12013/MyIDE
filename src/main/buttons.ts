@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import type { Employee } from './employees';
 import { hireEmployee, listEmployees, onEmployeeChange, sendToEmployee } from './employees';
 import { listProjects, projectById } from './projects';
+import { parseFrontmatter } from './role-file';
 import { due, fingerprint, nextRun, type Schedule } from './schedules';
 import { broadcast, handle, readJSON, slug, STATE_DIR, writeJSON, writePrivate } from './store';
 
@@ -24,10 +25,7 @@ const CLAUDE = join(homedir(), '.claude');
 
 /** A markdown file's YAML frontmatter as flat `key: value` strings (quotes stripped); {} if it has none or cannot be read. */
 export function frontmatter(file: string): Record<string, string> {
-  try {
-    const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(readFileSync(file, 'utf8'));
-    return Object.fromEntries((m?.[1] ?? '').split('\n').map((l) => /^([\w-]+):\s*(.*)$/.exec(l)).filter((x) => !!x).map((x) => [x![1], x![2].trim().replace(/^(['"])(.*)\1$/, '$2')]));
-  } catch { return {}; }
+  try { return parseFrontmatter(readFileSync(file, 'utf8')); } catch { return {}; }
 }
 const ls = (dir: string) => { try { return readdirSync(dir); } catch { return []; } };
 
