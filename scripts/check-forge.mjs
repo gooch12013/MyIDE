@@ -71,7 +71,7 @@ const fake = createServer((req, res) => {
     }
     if ((m = /^\/repos\/o\/r\/issues\/(\d+)$/.exec(path))) {
       const i = issues.get(+m[1]);
-      if (req.method === 'PATCH') { if (body.body !== undefined) i.body = body.body; if (body.assignees) i.assignees = body.assignees.map((login) => ({ login })); }
+      if (req.method === 'PATCH') { if (body.body !== undefined) i.body = body.body; if (body.assignees) i.assignees = body.assignees.map((login) => ({ login })); if (body.state) i.state = body.state; }
       return json(200, withUrl(i));
     }
     if ((m = /^\/repos\/o\/r\/issues\/(\d+)\/comments$/.exec(path))) {
@@ -142,7 +142,7 @@ const stubs = { electron: 'electron', './employees': 'employees', './pty': 'pty'
 const out = join(tmp, 'forge.cjs');
 await build({
   // forge.ts plus mcp.ts's startMcp, so the issue script can be run against the real /issue endpoint.
-  stdin: { contents: "export * from './src/main/forge.ts'; export { startMcp, employeeMcpConfig } from './src/main/mcp.ts';", resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
+  stdin: { contents: "export * from './src/main/forge.ts'; export { startMcp, employeeMcpConfig, pendingApprovals, resolveApproval } from './src/main/mcp.ts';", resolveDir: process.cwd(), loader: 'ts' }, bundle: true, platform: 'node', format: 'cjs', outfile: out, logLevel: 'warning',
   plugins: [{
     name: 'stubs',
     setup(b) {
@@ -223,11 +223,31 @@ try {
   assert.equal((await call('forge:tokens')).rows.find((r) => r.provider === 'forgejo').has, true);
   assert.equal(await call('forge:test', 'forgejo', `127.0.0.1:${hangPort}`), 'Connected as david.');
 
-  // Strip on every body; no close action.
+  // Strip on every body; close only on David's approval.
   const signed = 'Fixed the teardown.\n\nCo-Authored-By: Claude Opus <noreply@anthropic.com>\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n';
   assert.equal(await forge.forgeAction(emp, 'comment', { body: signed }), 'Commented on #1.');
   assert.deepEqual(log.at(-1), { m: 'POST', path: '/repos/o/r/issues/1/comments', body: { body: 'Fixed the teardown.' }, ct: 'application/json' });
-  await assert.rejects(forge.forgeAction(emp, 'close', {}), /no close/);
+  // close: a card for David; Deny tells the employee, Approve posts the comment and then closes.
+  log.length = 0;
+  const closeCard = () => forge.pendingApprovals().find((x) => x.tool === 'close_issue');
+  const toldMatch = async (re) => { for (let i = 0; i < 100 && !told.some((x) => re.test(x.text)); i++) await new Promise((r) => setTimeout(r, 20)); return told.find((x) => re.test(x.text)); };
+  assert.match(await forge.forgeAction(emp, 'close', { reason: 'not_planned' }), /Asked David to approve closing #1/);
+  assert.deepEqual(closeCard().input, { number: 1, reason: 'not_planned', comment: '' });
+  forge.resolveApproval(closeCard().id, false);
+  assert.ok(await toldMatch(/did not approve closing #1/));
+  assert.equal(log.length, 0, 'a denied close sends nothing');
+  assert.match(await forge.forgeAction(emp, 'close', { comment: signed }), /Asked David/);
+  assert.match(closeCard().text, /^Close #1 as completed, posting this comment first:\n\nFixed the teardown\.$/);
+  forge.resolveApproval(closeCard().id, true);
+  assert.ok(await toldMatch(/approved closing #1\. Closed #1\./));
+  assert.deepEqual(log.map((l) => `${l.m} ${l.path}`), ['POST /repos/o/r/issues/1/comments', 'PATCH /repos/o/r/issues/1']);
+  assert.deepEqual(log[1].body, { state: 'closed' }, 'Forgejo: no state_reason');
+  assert.equal(cache().issues.find((i) => i.number === 1).state, 'closed');
+  await assert.rejects(forge.forgeAction({ ...emp, issue: undefined }, 'close', {}), /Name the issue/);
+  log.length = 0;
+  told.length = 0;
+  issues.get(1).state = 'open'; // reopened on the forge; the next poll sees it
+  await call('forge:refresh', 'p1', true);
   await assert.rejects(forge.forgeAction({ ...emp, issue: undefined }, 'comment', { body: 'x' }), /hold no issue/);
 
   // open_pr: stripped body gains "Closes #N"; the PR is linked and the next poll sees it merged.

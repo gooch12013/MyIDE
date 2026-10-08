@@ -7,7 +7,7 @@ import { stripAttribution } from './attribution';
 import { assignIssue, listEmployees, tell } from './employees';
 import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
-import { onIssuePost, registerEmployeeTool } from './mcp';
+import { addApproval, onIssuePost, registerEmployeeTool } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
 import { detect, type Detected } from './remotes';
 import { spawnEnv } from './pty';
@@ -23,7 +23,7 @@ export interface IssueRef { provider: Provider; repo: string; number: number; ti
 export interface Issue { number: number; title: string; body: string; url: string; state: string; labels: string[]; assignees: string[]; author: string; updatedAt: string; createdAt: string; comments: number }
 export interface PrLink { number: number; url: string; state: string; merged: boolean }
 export interface Draft { id: string; employeeId: string; employeeName: string; title: string; body: string; labels: string[]; at: number }
-type OpKind = 'comment' | 'labels' | 'add_labels' | 'assign_self' | 'open_pr' | 'create_issue';
+type OpKind = 'comment' | 'labels' | 'add_labels' | 'assign_self' | 'open_pr' | 'create_issue' | 'close';
 // uncertain: a send timed out or got a 5xx, so it may have landed; the replay looks for it on the forge first.
 interface Op { id: string; kind: OpKind; issue?: number; args: any; at: number; employeeId?: string; uncertain?: boolean }
 // blocked: why the outbox stopped although the forge answers (token, rate limit, other refusal); it retries each poll.
@@ -296,6 +296,10 @@ async function send(id: string, op: Op): Promise<Sent> {
     case 'add_labels':
       await call(f, op.kind === 'labels' ? 'PUT' : 'POST', `${R}/issues/${n}/labels`, { labels: await labels(op.args.labels) }, id);
       return { msg: `Labels on #${n}: ${op.args.labels.join(', ') || 'none'}.` };
+    case 'close': // a PATCH, so a replay closes nothing twice; GitHub also records why
+      await call(f, 'PATCH', `${R}/issues/${n}`, { state: 'closed', ...(f.provider === 'github' ? { state_reason: op.args.reason } : {}) }, id);
+      update(id, (c) => { const i = c.issues.find((x) => x.number === n); if (i) i.state = 'closed'; });
+      return { msg: `Closed #${n}.` };
     case 'assign_self': {
       const me = await whoami(id, f);
       if (f.provider === 'github') await call(f, 'POST', `${R}/issues/${n}/assignees`, { assignees: [me] }, id);
@@ -482,6 +486,7 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
     changed(emp.projectId);
     return 'Drafted. Nothing was posted; it waits in NEEDS YOU until David files it.';
   }
+  if (action === 'close') return askToClose(emp, a);
   const iss = emp.issue;
   if (!iss) throw new Error('You hold no issue, so there is nothing to write back to.');
   if (action === 'comment') {
@@ -497,7 +502,28 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
     if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?):? +#${iss.number}\\b`, 'i').test(body)) body = `${body}\n\nCloses #${iss.number}`.trim();
     return (await write(emp.projectId, 'open_pr', iss.number, { title, body, head: String(a.head || emp.branch), base: a.base ? String(a.base) : undefined }, emp.id)).msg;
   }
-  throw new Error(`No forge action "${action}". There is no close: an issue closes when its PR merges.`);
+  throw new Error(`No forge action "${action}".`);
+}
+
+/** close never happens on an employee's word. David sees the issue, the reason and the comment on a card; on Approve
+ *  the comment is posted and then the issue closed (in that order, through the outbox), and the employee is told. */
+function askToClose(emp: Holder, a: any): string {
+  const number = a.number === undefined ? emp.issue?.number : Number(a.number);
+  if (!number || !Number.isInteger(number) || number < 1) throw new Error('Name the issue: close {number, comment, reason}.');
+  const reason = a.reason === 'not_planned' ? 'not_planned' : 'completed';
+  const comment = strip(a.comment);
+  linked(emp.projectId);
+  addApproval({
+    employeeId: emp.id, tool: 'close_issue', input: { number, reason, comment }, kind: 'permission',
+    text: `Close #${number} as ${reason === 'completed' ? 'completed' : 'not planned'}${comment ? `, posting this comment first:\n\n${comment}` : ', with no comment.'}`,
+  }, (allow) => {
+    if (!allow) return tell(emp.id, `David did not approve closing #${number}, so it stays open.`);
+    (async () => {
+      if (comment) await write(emp.projectId, 'comment', number, { body: comment }, emp.id);
+      return write(emp.projectId, 'close', number, { reason }, emp.id);
+    })().then((r) => tell(emp.id, `David approved closing #${number}. ${r.msg}`), (e) => tell(emp.id, `Closing #${number} failed: ${(e as Error).message}`));
+  });
+  return `Asked David to approve closing #${number}. His answer arrives as your next turn, so don't wait or poll.`;
 }
 
 /** On assignment: a start comment, the token owner as assignee and an "in progress" label. Throws once, after trying all three. */
@@ -644,8 +670,10 @@ export function registerForgeIpc(): void {
   registerEmployeeTool('forge',
     'The project\'s GitHub or Forgejo, through MyIDE. Reads: list_issues {state: open|closed|all, labels, assignee (a login or "none")}, '
     + 'get_issue {number} (body, comments, linked PRs), list_prs (open PRs, head branch, checks), pr_status {number} (mergeable, checks, reviews). '
-    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body, or "Refs #N" to leave the issue open), set_labels. draft_issue {title, body, labels}: David files it. There is no close.',
-    { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
+    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body, or "Refs #N" to leave the issue open), set_labels. '
+    + 'close {number (default: the issue you hold), comment, reason: completed or not_planned}: waits for David to approve; the comment is posted just before the close. '
+    + 'draft_issue {title, body, labels}: David files it.',
+    { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'close', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
     async (employeeId, a) => {
       const e = listEmployees().find((x) => x.id === employeeId);
       if (!e) throw new Error('No such employee');
