@@ -1,4 +1,4 @@
-import { h, key } from './dom';
+import { h, key, sheet } from './dom';
 import { openHire } from './hire';
 import { openWizard } from './wizard';
 import { activeProject, allProjects, scopeOf } from './projects';
@@ -77,41 +77,58 @@ const inputSummary = (input: unknown): string => {
 };
 const KIND = { permission: 'Permission', plan: 'Approve plan', question: 'Question' };
 
-/** One NEEDS YOU card: who, what, and the keys that answer it. */
+// What an approval says, in full (the card shows it in a small box, Open at reading size), and the line Read aloud speaks.
+const needText = (a: Approval): string =>
+  a.kind === 'plan' ? a.text ?? String((a.input as { plan?: unknown })?.plan ?? '') : a.kind === 'question' ? a.text ?? '' : a.text ?? `Wants to use ${a.tool}`;
+const needSpoken = (a: Approval, who: string): string =>
+  `${who} ${a.kind === 'plan' ? 'has a plan for you to approve.' : `${a.kind === 'question' ? 'asks' : 'wants approval'}: ${a.text ?? `to use ${a.tool}`}`}`;
+
+/** The keys that answer an approval: an answer box and Answer for a question, else Approve and Deny. While one
+ *  is sent every button in `scope` is disabled; `done` runs once it went through. */
+function needKeys(a: Approval, who: string, scope: HTMLElement, rows: number, done: () => void = () => {}): Node[] {
+  const busy = (fn: () => Promise<void>) => async () => {
+    const all = scope.querySelectorAll('button');
+    all.forEach((b) => (b.disabled = true));
+    try { await fn(); done(); } catch { all.forEach((b) => (b.disabled = false)); }
+  };
+  if (a.kind === 'question') {
+    const answer = h('textarea', { className: 'input need-answer', rows, placeholder: 'Your answer' });
+    answer.setAttribute('aria-label', `Answer for ${who}`);
+    return [answer, key('Answer', busy(() => api.approvals.resolve(a.id, true, answer.value.trim())), { className: 'key key--sm key--lit' })];
+  }
+  return [
+    key(a.kind === 'plan' ? 'Approve plan' : 'Approve', busy(() => api.approvals.resolve(a.id, true)), { className: 'key key--sm key--lit' }),
+    key('Deny', busy(() => api.approvals.resolve(a.id, false, 'David denied this.'))),
+  ];
+}
+
+/** A NEEDS YOU item at reading size: the whole text, the full tool input, a tall answer box and the same keys. */
+function openNeed(a: Approval, who: string): void {
+  const o = (a.input ?? {}) as Record<string, unknown>;
+  const input = a.kind === 'permission' ? [h('pre', { className: 'need-input', textContent: typeof o.command === 'string' ? o.command : JSON.stringify(a.input, null, 2) })] : [];
+  const form = h('form', { method: 'dialog', className: 'need-big' },
+    h('div', { className: 'need-head' }, led('needs-you', KIND[a.kind]), h('span', { className: 'need-who', textContent: who }), speakButton(() => needSpoken(a, who), 'Read aloud')),
+    h('div', { className: 'need-big-text', textContent: needText(a) }), ...input);
+  const d = sheet(`${KIND[a.kind]}: ${who}`, form, 'need-sheet');
+  form.append(h('div', { className: 'need-keys' }, ...needKeys(a, who, form, 8, () => d.close()), key('Close', () => d.close())));
+}
+
+/** One NEEDS YOU card: who, what, and the keys that answer it. Open, or a click on its text, shows it full size. */
 export function needCard(a: Approval, who: string, colour: string | undefined): HTMLElement {
   const card = h('article', { className: 'need' });
   if (colour) card.style.setProperty('--proj', colour);
   card.setAttribute('aria-label', `${KIND[a.kind]}: ${who}`);
-  const body: Node[] = [];
-  if (a.kind === 'permission') {
-    body.push(h('p', { className: 'need-why', textContent: a.text ?? `Wants to use ${a.tool}` }), h('pre', { className: 'need-input', textContent: inputSummary(a.input) }));
-  } else if (a.kind === 'plan') {
-    const plan = a.text ?? String((a.input as { plan?: unknown })?.plan ?? '');
-    body.push(h('pre', { className: 'need-plan', textContent: plan }));
-  } else {
-    body.push(h('p', { className: 'need-why need-q', textContent: a.text ?? '' }));
-  }
-  const busy = (fn: () => Promise<void>) => async () => {
-    const all = card.querySelectorAll('button');
-    all.forEach((b) => (b.disabled = true));
-    try { await fn(); } catch { all.forEach((b) => (b.disabled = false)); }
-  };
-  let keys: Node[];
-  if (a.kind === 'question') {
-    const answer = h('textarea', { className: 'input need-answer', rows: 2, placeholder: 'Your answer' });
-    answer.setAttribute('aria-label', `Answer for ${who}`);
-    keys = [answer, key('Answer', busy(() => api.approvals.resolve(a.id, true, answer.value.trim())), { className: 'key key--sm key--lit' })];
-  } else {
-    keys = [
-      key(a.kind === 'plan' ? 'Approve plan' : 'Approve', busy(() => api.approvals.resolve(a.id, true)), { className: 'key key--sm key--lit' }),
-      key('Deny', busy(() => api.approvals.resolve(a.id, false, 'David denied this.'))),
-    ];
-  }
+  const open = () => openNeed(a, who);
+  const text = a.kind === 'plan' ? h('pre', { className: 'need-plan', textContent: needText(a) })
+    : h('p', { className: a.kind === 'question' ? 'need-why need-q' : 'need-why', textContent: needText(a) });
+  text.onclick = open;
+  text.title = 'Open full size';
+  const body: Node[] = [text, ...(a.kind === 'permission' ? [h('pre', { className: 'need-input', textContent: inputSummary(a.input) })] : [])];
   card.append(
     h('div', { className: 'need-head' }, led('needs-you', KIND[a.kind]), h('span', { className: 'need-who', textContent: who }),
-      speakButton(() => `${who} ${a.kind === 'plan' ? 'has a plan for you to approve.' : `${a.kind === 'question' ? 'asks' : 'wants approval'}: ${a.text ?? `to use ${a.tool}`}`}`, 'Read aloud')),
+      key('Open', open, { title: 'Read it full size and answer there' }), speakButton(() => needSpoken(a, who), 'Read aloud')),
     ...body,
-    h('div', { className: 'need-keys' }, ...keys),
+    h('div', { className: 'need-keys' }, ...needKeys(a, who, card, 2)),
   );
   return card;
 }
@@ -348,17 +365,22 @@ registerPanel('employees', {
     };
 
     let seq = 0;
+    // Cards by approval or draft id: a redraw reuses them, so a half-typed answer or a line being read aloud survives it.
+    const cards = new Map<string, HTMLElement>();
     const drawNeeds = async () => {
       const n = ++seq;
       const [pending, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
       if (n !== seq) return;
-      const drafts = forges.filter((f) => mine(f.projectId)).flatMap((f) => f.drafts.map((d) => draftCard(f, d)));
+      const keep = (id: string, make: () => HTMLElement) => { const c = cards.get(id) ?? make(); cards.set(id, c); live.add(id); return c; };
+      const live = new Set<string>();
+      const drafts = forges.filter((f) => mine(f.projectId)).flatMap((f) => f.drafts.map((d) => keep(`d:${d.id}`, () => draftCard(f, d))));
       const asks = pending.flatMap((a) => {
         const e = everyone.find((x) => x.id === a.employeeId);
         if (!mine(e?.projectId)) return [];
         const p = allProjects().find((x) => x.id === e?.projectId);
-        return [needCard(a, all ? `${p?.name ?? (e?.projectId === 'mac' ? 'This Mac' : '?')} / ${e?.name ?? a.employeeId}` : e?.name ?? a.employeeId, p?.colour)];
+        return [keep(`a:${a.id}`, () => needCard(a, all ? `${p?.name ?? (e?.projectId === 'mac' ? 'This Mac' : '?')} / ${e?.name ?? a.employeeId}` : e?.name ?? a.employeeId, p?.colour))];
       });
+      for (const id of cards.keys()) if (!live.has(id)) cards.delete(id);
       needs.hidden = !asks.length && !drafts.length;
       needs.replaceChildren(h('h2', { className: 'needs-title', textContent: `Needs you · ${asks.length + drafts.length}` }), ...asks, ...drafts);
     };

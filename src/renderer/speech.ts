@@ -71,9 +71,19 @@ function playKey(label: string, run: () => Promise<string>, onNote?: (note: stri
   return b;
 }
 
+/** A fallback note or an error from a speak key whose panel has no place for it: beside the key, for ten seconds. */
+function noteBeside(b: HTMLElement, note: string): void {
+  if (!note || !b.isConnected) return;
+  b.parentElement?.querySelector(':scope > .sp-note')?.remove();
+  const n = h('span', { className: 'sp-note', textContent: note });
+  n.setAttribute('role', 'status');
+  b.after(n);
+  setTimeout(() => n.remove(), 10_000);
+}
+
 /** A speaker key that reads `textFn()` aloud, or stops it. Give it summaries only, never code or transcripts. `force` works while read-back is off (Test voice); `onNote` gets any fallback note. */
 export function speakButton(textFn: () => string, label = 'Read aloud', force = false, onNote?: (note: string) => void): HTMLButtonElement {
-  const b = playKey(label, () => api.speech.speak(textFn(), force), onNote);
+  const b = playKey(label, () => api.speech.speak(textFn(), force), onNote ?? ((note) => noteBeside(b, note)));
   if (!force) { b.hidden = !status.on; speakers.add(new WeakRef(b)); }
   return b;
 }

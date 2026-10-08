@@ -468,7 +468,12 @@ export function registerSpeechIpc(): void {
     const s = settings();
     if (!s.on && !force) return '';
     if (voice && !(await engineVoices(s.engine)).some((v) => v.id === voice)) throw new Error(`${engineName(s.engine)} has no voice ${voice}.`);
-    return speak(String(text ?? ''), { engine: s.engine, voice: voice || s.voice, rate: s.rate, out: process.env.MYIDE_SAY_OUT }); // MYIDE_SAY_OUT: tests write audio to a file instead of playing it
+    const out = process.env.MYIDE_SAY_OUT; // tests write audio to a file instead of playing it
+    // An engine that throws (rather than replying with an error) still reads the line, in the system voice, and says why.
+    return speak(String(text ?? ''), { engine: s.engine, voice: voice || s.voice, rate: s.rate, out }).catch((err: Error) => {
+      console.error('Read-back failed:', err);
+      return speak(String(text ?? ''), { rate: s.rate, out }).then(() => `${engineName(s.engine)} failed (${err.message}), so this used the macOS system voice.`);
+    });
   });
   // Cloned voices. Each change tells every window, so voice lists refresh.
   const changed = <T>(v: T): T => { broadcast('speech:change', status()); return v; };

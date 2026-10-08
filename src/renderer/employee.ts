@@ -54,6 +54,28 @@ registerPanel('employee', {
       speakButton(() => (emp ? `${emp.name}. On: ${onDd.textContent}. ${progDd.textContent}. Next: ${leftDd.textContent}.` : ''), 'Read status aloud'));
     const last = h('p', { className: 'emp-last' });
     const lastBlock = h('div', { className: 'emp-said emp-said--last' }, last, speakButton(() => emp?.lastText ?? '', 'Read last message aloud'));
+    // A grip under the last message: drag (or arrow keys) to make it taller; the height is kept for every employee.
+    const LAST_H = 'myide.empLastHeight';
+    const grip = h('div', { className: 'emp-grip', tabIndex: 0, title: 'Drag to resize the last message' });
+    grip.setAttribute('role', 'separator');
+    grip.setAttribute('aria-label', 'Resize the last message');
+    const sizeLast = (px: number, keep = false) => {
+      last.style.maxHeight = 'none';
+      last.style.height = `${Math.max(40, Math.round(px))}px`;
+      if (keep) try { localStorage.setItem(LAST_H, last.style.height); } catch { /* storage off: this panel only */ }
+    };
+    try { const saved = parseFloat(localStorage.getItem(LAST_H) ?? ''); if (saved) sizeLast(saved); } catch { /* storage off: default height */ }
+    grip.onpointerdown = (ev) => {
+      const y0 = ev.clientY, h0 = last.getBoundingClientRect().height;
+      grip.setPointerCapture(ev.pointerId);
+      grip.onpointermove = (m) => sizeLast(h0 + m.clientY - y0);
+      grip.onpointerup = () => { grip.onpointermove = null; sizeLast(last.getBoundingClientRect().height, true); };
+    };
+    grip.onkeydown = (k) => {
+      if (k.key !== 'ArrowUp' && k.key !== 'ArrowDown') return;
+      k.preventDefault();
+      sizeLast(last.getBoundingClientRect().height + (k.key === 'ArrowDown' ? 24 : -24), true);
+    };
     let lastShots: HTMLElement = h('div'); // images its last message mentions, from its worktree
     let shotsKey = '';
     const cues = h('ol', { className: 'cuelist' });
@@ -117,7 +139,7 @@ registerPanel('employee', {
         h('button', { type: 'button', className: 'btn rm', textContent: 'Fire, remove worktree', onclick: doFire(true) }))));
 
     const box = (title: string, ...kids: Node[]) => h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: title }), ...kids);
-    el.append(head, statusBlock, lastBlock, lastShots, h('div', { className: 'emp-grid' },
+    el.append(head, statusBlock, lastBlock, grip, lastShots, h('div', { className: 'emp-grid' },
       h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, micButton(msg, say), send), sent)),
       h('div', { className: 'emp-col' }, box('Model & effort', aiLine, mode.el, pick.el, pending, held, ceil), box('Worktree', tree), transcript)),
     status, fireSheet);
