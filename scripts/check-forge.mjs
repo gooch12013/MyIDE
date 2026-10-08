@@ -240,6 +240,8 @@ try {
   await assert.rejects(forge.forgeAction(emp, 'open_pr', { title: 'x', head: 'unpushed' }), /422.*head branch/);
   await call('forge:refresh', 'p1', true);
   assert.deepEqual(cache().prs['1'], { number: 51, url: 'http://forge/o/r/pulls/51', state: 'closed', merged: true });
+  await forge.forgeAction(emp, 'open_pr', { title: 'Part one', body: 'Refs #1, more to come' });
+  assert.equal(log.at(-1).body.body, 'Refs #1, more to come', 'Refs leaves the issue open: no Closes added');
 
   // Assign: A's assignIssue, then the start comment, assignee (the token owner) and "in progress" label.
   log.length = 0;

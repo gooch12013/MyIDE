@@ -493,7 +493,8 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
   if (action === 'open_pr') {
     const title = strip(a.title) || iss.title;
     let body = strip(a.body);
-    if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?):? +#${iss.number}\\b`, 'i').test(body)) body = `${body}\n\nCloses #${iss.number}`.trim();
+    // "Refs #N" leaves the issue open, for projects that close issues by hand after the deploy.
+    if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?):? +#${iss.number}\\b`, 'i').test(body)) body = `${body}\n\nCloses #${iss.number}`.trim();
     return (await write(emp.projectId, 'open_pr', iss.number, { title, body, head: String(a.head || emp.branch), base: a.base ? String(a.base) : undefined }, emp.id)).msg;
   }
   throw new Error(`No forge action "${action}". There is no close: an issue closes when its PR merges.`);
@@ -643,7 +644,7 @@ export function registerForgeIpc(): void {
   registerEmployeeTool('forge',
     'The project\'s GitHub or Forgejo, through MyIDE. Reads: list_issues {state: open|closed|all, labels, assignee (a login or "none")}, '
     + 'get_issue {number} (body, comments, linked PRs), list_prs (open PRs, head branch, checks), pr_status {number} (mergeable, checks, reviews). '
-    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body), set_labels. draft_issue {title, body, labels}: David files it. There is no close.',
+    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body, or "Refs #N" to leave the issue open), set_labels. draft_issue {title, body, labels}: David files it. There is no close.',
     { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
     async (employeeId, a) => {
       const e = listEmployees().find((x) => x.id === employeeId);
