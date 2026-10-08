@@ -1,10 +1,9 @@
 import { employeeAi } from './accounts';
 import { attachBox, imagePaths, thumb, workImages } from './attach';
-import { errText, h, key } from './dom';
+import { errText, h, key, okKey } from './dom';
 import { linkify } from './editor';
 import { micButton, speakButton } from './speech';
-import { api, chip, cue, led, needCard, openEmployee, openEmployees, type Employee } from './employees';
-import { draftCard } from './issues';
+import { api, chip, cue, led, needsBox, openEmployee, openEmployees, teamOf, type Employee } from './employees';
 import { ceilingNote, fmtPick, modelPicker, modePicker } from './hire';
 import { allProjects } from './projects';
 import { registerPanel } from './registry';
@@ -95,6 +94,7 @@ registerPanel('employee', {
       attach.clear();
       msg.value = '';
     }, 'Sent. It runs as the next turn.'));
+    okKey(msg, send);
 
     // Model and effort, pinned: they apply next turn, or now (interrupt and resume).
     const pending = h('div', { className: 'apply-pending', hidden: true },
@@ -142,33 +142,13 @@ registerPanel('employee', {
     const box = (title: string, ...kids: Node[]) => h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: title }), ...kids);
     // Everything waiting on David from this employee and, for a lead, from everyone under it: NEEDS YOU cards and
     // drafted issues, answered here. Cards are kept by id across redraws. A lead also lists its reports.
-    const needs = h('section', { className: 'needs emp-needs' });
-    needs.setAttribute('aria-label', 'Needs you');
-    needs.hidden = true;
+    const needs = needsBox((everyone) => teamOf([id], everyone));
     const reports = h('ul', { className: 'emp-reports' });
     const reportsBox = h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: 'Reports' }), reports);
     reportsBox.hidden = true;
-    const needCards = new Map<string, HTMLElement>();
-    let drawSeq = 0;
     const drawNeeds = async () => {
-      const n = ++drawSeq;
-      const [pendingList, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
-      if (n !== drawSeq) return;
-      const team = new Set([id]);
-      for (let grew = true; grew;) {
-        grew = false;
-        for (const x of everyone) if (x.parentId && team.has(x.parentId) && !team.has(x.id)) { team.add(x.id); grew = true; }
-      }
-      const nameOf = (eid: string) => everyone.find((x) => x.id === eid)?.name ?? 'This employee';
-      const live = new Set<string>();
-      const keep = (k: string, make: () => HTMLElement) => { const c = needCards.get(k) ?? make(); needCards.set(k, c); live.add(k); return c; };
-      const cards = [
-        ...pendingList.filter((a) => team.has(a.employeeId)).map((a) => keep(`a:${a.id}`, () => needCard(a, nameOf(a.employeeId), undefined))),
-        ...forges.flatMap((f) => f.drafts.filter((d) => team.has(d.employeeId)).map((d) => keep(`d:${d.id}`, () => draftCard(f, d)))),
-      ];
-      for (const k of needCards.keys()) if (!live.has(k)) needCards.delete(k);
-      needs.replaceChildren(...cards);
-      needs.hidden = !cards.length;
+      const everyone = await needs.draw();
+      if (!everyone) return;
       const mine = everyone.filter((x) => x.parentId === id);
       reports.replaceChildren(...mine.map((x) => h('li', { className: 'emp-report' }, led(x.state),
         key(x.name, () => void openEmployee(x.id), { title: `Open ${x.name}: message, approve, fire` }), chip(x),
@@ -176,7 +156,7 @@ registerPanel('employee', {
       reportsBox.hidden = !mine.length;
     };
     void drawNeeds();
-    el.append(head, needs, statusBlock, lastBlock, grip, lastShots, h('div', { className: 'emp-grid' },
+    el.append(head, needs.el, statusBlock, lastBlock, grip, lastShots, h('div', { className: 'emp-grid' },
       h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, micButton(msg, say), send), sent), reportsBox),
       h('div', { className: 'emp-col' }, box('Model & effort', aiLine, mode.el, pick.el, pending, held, ceil), box('Worktree', tree), transcript)),
     status, fireSheet);
@@ -189,7 +169,8 @@ registerPanel('employee', {
       if (proj) el.style.setProperty('--proj', proj.colour);
       name.replaceChildren(e.name, led(e.state), chip(e));
       const rank = e.contractor ? 'Contractor' : e.lead ? 'Lead' : e.parentId ? `Report, level ${e.depth}` : '';
-      sub.textContent = [e.issue ? `Working #${e.issue.number}: ${e.issue.title}` : '', e.role, rank, proj?.name].filter(Boolean).join(' · ');
+      const issues = [e.issue, ...(e.more ?? [])].filter((i) => !!i);
+      sub.textContent = [issues.length ? `Working ${issues.map((i) => `#${i!.number}`).join(', ')}: ${issues[0]!.title}` : '', e.role, rank, proj?.name].filter(Boolean).join(' · ');
       talk.disabled = e.state === 'talking';
       interrupt.disabled = !['working', 'needs-you'].includes(e.state);
       void employeeAi(e, { pick, talk, line: aiLine, first });

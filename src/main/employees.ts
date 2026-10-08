@@ -8,7 +8,7 @@ import { saveAttachments, worktreeImage } from './attach';
 import { installHooks } from './attribution';
 import type { ClaudeEvent, TaskState } from './claude/parse';
 import { runTurn, type Turn, type TurnOpts } from './claude/transport';
-import { account, claudeConfigDir, listAccounts, usageOf } from './accounts';
+import { account, listAccounts, usageOf } from './accounts';
 import { frontmatter } from './buttons';
 import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
@@ -19,9 +19,11 @@ import { listProjects, projectById, readConfig, writeConfig } from './projects';
 import { onPtyExit } from './pty';
 import { broadcast, handle, lockDown, readJSON, slug, STATE_DIR, writeJSON, writePrivate } from './store';
 import { addWorktree, branchExists, checkRepo, git, removeWorktree } from './worktree';
+import * as tracks from './tracks';
 
 export type EmployeeState = 'idle' | 'queued' | 'working' | 'needs-you' | 'done' | 'failed' | 'interrupted' | 'talking';
 export type { Mode, Pick, Usage };
+export type IssueRef = { provider: 'github' | 'forgejo'; repo: string; number: number; title: string; url: string };
 export interface Employee {
   id: string; projectId: string; role: string; name: string; worktree: string; branch: string;
   sessionId?: string; model: string; effort?: string; state: EmployeeState; task?: string;
@@ -29,17 +31,20 @@ export interface Employee {
   lastText?: string; error?: string; updatedAt: number;
   // Org: depth 1 is hired by David; a lead may hire reports (assign_task) up to maxReports running at once.
   parentId?: string; depth: number; lead?: boolean; maxReports?: number; contractor?: boolean; mode: Mode;
-  issue?: { provider: 'github' | 'forgejo'; repo: string; number: number; title: string; url: string };
+  // issue: the forge issue it holds (forge writes go there by default); more: related issues it took on, on the same branch.
+  // forIssue: hired for an issue, so MyIDE fires it and its reports once its issues are closed.
+  issue?: IssueRef; more?: IssueRef[]; forIssue?: boolean;
   accountId: string; provider: 'claude' | 'codex' | 'gemini';
   /** A model above the ceiling, waiting on David's approval; the next turn waits with it. */
   held?: Pick;
   /** This Mac: the plan from its last ExitPlanMode, the commands in it, and when David hit GO. */
   plan?: { text: string; commands: string[]; approvedAt?: number };
 }
-export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; addDirs?: string[]; lead?: boolean; maxReports?: number; readOnly?: boolean; source: 'user' | 'project' }
+// ceiling (myide-ceiling: model or model/effort): the highest pick this role may give its reports without David; else its own model.
+export interface Role { name: string; description: string; model?: string; effort?: string; mode?: Mode; account?: string; shared?: boolean; maxTurns?: number; addDirs?: string[]; lead?: boolean; maxReports?: number; readOnly?: boolean; ceiling?: Pick; source: 'user' | 'project' }
 /** Per-project org settings, kept in that project's state.json. Priority and pause live in config.json projects[]. */
 export interface ProjectOrg { model?: string; effort?: string; mode?: Mode; ceiling?: Pick; maxDepth?: number }
-type Issue = NonNullable<Employee['issue']>;
+type Issue = IssueRef;
 type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // Stored beside the public fields: the role file, the parser's task list, turns waiting to run.
 // paused: David interrupted, so pending turns wait for his next send or talk.
@@ -51,13 +56,14 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 type Pending = string | { text: string; images?: string[]; quiet?: boolean };
 // go: This Mac's next turn runs the approved plan (permission mode default, these commands granted once).
 // goal: what the employee works toward until it says GOAL DONE (goal mode); goalTries: automatic continues spent on it.
-interface Emp extends Employee { goal?: string; goalTries?: number; roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
+// closedOut: the last issue it held was closed (not handed on), so an employee hired for issues can be let go.
+interface Emp extends Employee { goal?: string; goalTries?: number; closedOut?: boolean; roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
 
 const HOOKS = join(STATE_DIR, 'hooks');
 const GOAL_END = 'End the last message of every turn with one of these lines on its own: GOAL DONE (the goal is met), GOAL BLOCKED: <why> (only David can unblock it), or WAITING (reports you lead are still working on it).';
-const GOAL_RULES = 'Goal mode: you have a goal, not a single step. Keep working until it is met. Don\'t stop to ask David unless your role names that stop: '
-  + 'pick the recommended option yourself and carry on. A lead hands its reports goals too: every assign_task says what done means. A message from David overrides or narrows the goal. '
-  + `${GOAL_END} A turn that ends without one of them is sent on automatically.`;
+const GOAL_RULES = 'Goal mode: you have a goal, not a single step. Keep working until it is met. When you have a question, ask David with ask_human '
+  + 'and carry on with his answer: never guess, and never end a turn on a question in your text. A lead hands its reports goals too: every assign_task says what done means. '
+  + `A message from David overrides or narrows the goal. ${GOAL_END} A turn that ends without one of them is sent on automatically.`;
 const TALK_NOTE = 'This is Talk: David is typing to you live in a terminal, so answer him here rather than with ask_human. Your MyIDE tools work here too.';
 const TALK_LEAD_NOTE = 'While Talk is open, your reports\' results wait and reach you as a turn when it ends. list_reports shows their state and last message now.';
 const NO_ATTRIBUTION = 'No AI attribution anywhere: no Co-Authored-By trailer, no "Generated with Claude Code" line and no Claude-Session line in commits, pull requests, issues or comments. Everything goes out as the user.';
@@ -82,7 +88,10 @@ const projDir = (projectId: string) => join('projects', projectId);
 const settingsFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'settings', `${e.id}.json`);
 const mcpFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'mcp', `${e.id}.json`);
 const talkPromptFile = (e: Emp) => join(STATE_DIR, projDir(e.projectId), 'talk', `${e.id}.md`);
-const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, go, ...e }: Emp): Employee => e;
+const view = ({ roleFile, tasks, pending, queuedAt, paused, ended, heldFor, wakeups, go, goal, goalTries, closedOut, ...e }: Emp): Employee => e;
+/** Every issue `e` holds, the main one first. */
+const held = (e: Employee): Issue[] => [e.issue, ...(e.more ?? [])].filter((i): i is Issue => !!i);
+const holds = (e: Employee, n: number) => held(e).some((i) => i.number === n);
 const put = (file: string, data: object) => writePrivate(file, JSON.stringify(data, null, 2));
 
 // ---- This Mac: a built-in pseudo-project, no repo and no worktrees; its employees plan read-only, then run on GO ----
@@ -120,6 +129,8 @@ function macSettings(e: Emp): object {
     },
   };
 }
+const roleOf = (e: Emp) => { try { return e.roleFile ? parseRole(e.roleFile, 'user') : null; } catch { return null; } }; // null: role file gone
+
 // myide-readonly: true in the role denies every file-editing tool (Claude only; the ACP agents ignore the settings file).
 // ponytail: Bash can still write files; the role's own rules say not to. A per-command Bash deny list is the upgrade.
 function settingsFor(e: Emp): object {
@@ -211,6 +222,7 @@ export function parseRole(file: string, source: Role['source']): (Role & { file:
     shared: f['myide-shared'] === 'true' || undefined, maxTurns: Number.isInteger(maxTurns) && maxTurns > 0 ? maxTurns : undefined, source, file,
     lead: f['myide-lead'] === 'true' || undefined, maxReports: Number.isInteger(maxReports) && maxReports > 0 ? maxReports : undefined,
     readOnly: f['myide-readonly'] === 'true' || undefined,
+    ceiling: f['myide-ceiling'] ? { model: f['myide-ceiling'].split('/')[0].trim(), effort: f['myide-ceiling'].split('/')[1]?.trim() || undefined } : undefined,
   };
 }
 
@@ -295,6 +307,7 @@ function start(e: Emp): void {
   const onEvent: TurnOpts['onEvent'] = (ev) => {
     if (ev.type === 'init') {
       e.sessionId = ev.sessionId;
+      tracks.sessionSeen(view(e));
       // --bare (or a future bare default) drops MyIDE's server; working without approvals is worse than stopping.
       if (!ev.mcpServers.some((s) => s.name === 'myide')) { why.set(e.id, 'bare'); turn.interrupt(); }
       emit(e);
@@ -370,7 +383,7 @@ function finish(e: Emp, r: Result): void {
   let waitingOnReports = false;
   if (e.goal && e.state === 'done' && r.ok && !r.interrupted && !w && !e.paused) {
     const step = goalStep(r.text ?? '', e.goalTries ?? 0, teamBusy(e.id));
-    if (step.kind === 'done') { e.goal = undefined; e.goalTries = 0; }
+    if (step.kind === 'done') { e.goal = undefined; e.goalTries = 0; tracks.note(e, `${e.name}: goal done`); }
     else if (step.kind === 'wait') waitingOnReports = true; // its reports wake it; nothing to report or notify yet
     else if (step.kind === 'continue') {
       e.goalTries = (e.goalTries ?? 0) + 1;
@@ -378,11 +391,14 @@ function finish(e: Emp, r: Result): void {
       e.pending.push(quiet ? { text, quiet } : text); // a scheduled run stays quiet
       e.queuedAt ??= Date.now();
       e.state = 'queued';
-    } else if (!(e.parentId && emps.has(e.parentId))) { // with a live lead, the lead hears it in the report
-      e.state = 'interrupted';
-      e.error = step.kind === 'blocked' ? `Goal blocked: ${step.why}` : `Stopped after ${GOAL_TRIES} automatic continues short of its goal.`;
+    } else {
+      const why = step.kind === 'blocked' ? `Goal blocked: ${step.why}` : `Stopped after ${GOAL_TRIES} automatic continues short of its goal.`;
+      tracks.note(e, `${e.name}: ${why}`);
+      if (!(e.parentId && emps.has(e.parentId))) { e.state = 'interrupted'; e.error = why; } // with a live lead, the lead hears it in the report
     }
   }
+  if (e.state === 'failed') tracks.note(e, `${e.name} failed: ${(e.error ?? '').slice(0, 200)}`);
+  tracks.turnEnded(e);
   emit(e);
   // Interrupts MyIDE asked for are not news; one that came from an error is. Nothing is news at quit.
   if (w === 'quit') return;
@@ -394,6 +410,7 @@ function finish(e: Emp, r: Result): void {
     if (e.contractor && e.state === 'done' && !e.goal) void releaseContractor(e);
   } else if ((ended || (e.state === 'interrupted' && !w)) && !(quiet && e.state === 'done')) notify(e);
   schedule();
+  sweepSoon(e.projectId);
 }
 
 /** Pushes a report's final message into its lead's session as the lead's next turn. False if it has no lead.
@@ -528,7 +545,7 @@ function choose(e: Emp, want: Pick, by?: Emp): void {
   // The effective ceiling is the lower of the project's and the lead's own model: whichever `want` goes above.
   const p = providers()[e.provider] ?? providers().claude;
   const lists = [p.models.map(([m]) => m), p.efforts.map(([x]) => x)] as const;
-  const ceiling = [org(e.projectId).ceiling, by && { model: by.model, effort: by.effort }].find((c) => c && aboveCeiling(want, c, ...lists));
+  const ceiling = [org(e.projectId).ceiling, by && (roleOf(by)?.ceiling ?? { model: by.model, effort: by.effort })].find((c) => c && aboveCeiling(want, c, ...lists));
   if ((by || e.mode === 'auto') && ceiling) return hold(e, want, ceiling, by?.name ?? 'Auto mode');
   e.model = want.model;
   if (want.effort !== undefined) e.effort = want.effort || undefined;
@@ -553,7 +570,7 @@ function hold(e: Emp, want: Pick, ceiling: Pick, by: string): void {
 
 interface HireOpts {
   projectId: string; role: string; task: string; model?: string; effort?: string; mode?: Mode; lead?: boolean; maxReports?: number;
-  accountId?: string; provider?: Employee['provider']; issue?: Issue; images?: unknown; quiet?: boolean;
+  accountId?: string; provider?: Employee['provider']; issue?: Issue; forIssue?: boolean; images?: unknown; quiet?: boolean;
 }
 
 // One hire at a time: a lead's parallel assign_task calls would otherwise pick the same free name.
@@ -597,7 +614,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
     id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: mac ? '' : `myide/${name}`,
     model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), goal: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
     depth, parentId: by?.id, lead: (o.lead ?? role.lead) || undefined, maxReports: (o.lead ?? role.lead) ? o.maxReports ?? role.maxReports : undefined, contractor: role.shared,
-    mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
+    mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue, forIssue: o.forIssue || undefined,
   };
   emps.set(e.id, e);
   // The layered pick is the starting point; auto re-picks from the task. Whatever a lead or auto picks meets the ceiling.
@@ -631,6 +648,7 @@ async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: 
   put(mcpFile(e), employeeMcpConfig(e.id));
   writePrivate(talkPromptFile(e), [systemPrompt(e), TALK_NOTE, e.lead ? TALK_LEAD_NOTE : ''].filter(Boolean).join('\n\n'));
   await interrupt(id, 'talk');
+  e.closedOut = undefined; // David is talking to it: it stays until he fires it
   e.state = 'talking';
   e.paused = false;
   e.wakeups = 0;
@@ -660,6 +678,7 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
   clearGrants(id, true); // its late allows go with it
   approvalGone(); // NEEDS YOU drops its cards
   await interrupt(id, 'fire');
+  tracks.fired(view(e)); // after the turn stopped, so the kept copy of its session is whole
   rmSync(settingsFile(e), { force: true });
   rmSync(mcpFile(e), { force: true });
   rmSync(talkPromptFile(e), { force: true });
@@ -671,30 +690,146 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
 const TRIAGE = 'How to read the issue: its title, every comment and its linked PRs together are the issue, and the title alone can be the whole spec. '
   + 'Verify the behaviour it names against the code. Never judge it, close it or call it stale or done by its body. '
   + 'If you find it already done or not planned, stop and say so with ask_human, citing file and line; David decides. '
-  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue) or gh. Write with either: the forge tool (comment, open_pr, set_labels, close, draft_issue) or gh. Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). Close an issue when David tells you to.';
+  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue) or gh. Write with either: the forge tool (comment, open_pr, set_labels, close, draft_issue) or gh. Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). Close an issue when David or your role says to.';
 
-function issuePrompt(i: Issue, note?: string): string {
-  return [`Work on ${i.repo}#${i.number}: ${i.title}`, i.url, note ?? '', TRIAGE].filter(Boolean).join('\n\n');
+function issuePrompt(i: Issue, note?: string, also: Issue[] = []): string {
+  const head = also.length
+    ? `Also work on ${i.repo}#${i.number}: ${i.title}. You hold it now alongside ${also.map((x) => `#${x.number}`).join(', ')}: related issues go on one branch and one PR.`
+    : `Work on ${i.repo}#${i.number}: ${i.title}`;
+  return [head, i.url, note ?? '', TRIAGE].filter(Boolean).join('\n\n');
+}
+/** The goal for everything `e` holds: each issue, then how to read one. */
+const issueGoal = (e: Emp) => [`The issues you hold:`, ...held(e).map((i) => `- ${i.repo}#${i.number}: ${i.title} ${i.url}`), TRIAGE].join('\n');
+
+/** `e` takes issue `i` (its main issue if it holds none; else a related one on the same branch). Whoever held it before lets go. */
+function give(e: Emp, i: Issue, from?: Emp): void {
+  for (const x of emps.values()) {
+    if (x === e || x.projectId !== e.projectId || !holds(x, i.number)) continue;
+    unhold(x, i.number);
+    tracks.released(view(x), i.number, turns.has(x.id));
+    if (x !== from) { // David moved it: the old holder stops (a lead handing it down keeps its own goal)
+      x.goal = held(x).length ? issueGoal(x) : undefined;
+      if (turns.has(x.id) || x.pending.length) tell(x.id, `#${i.number} was given to ${e.name}. Stop work on it.`);
+    }
+    emit(x);
+  }
+  if (!e.issue || e.issue.number === i.number) e.issue = i;
+  else if (!holds(e, i.number)) e.more = [...(e.more ?? []), i];
+  e.closedOut = undefined;
+}
+function unhold(e: Emp, n: number): void {
+  if (e.issue?.number === n) e.issue = e.more?.shift();
+  else e.more = e.more?.filter((x) => x.number !== n);
+  if (!e.more?.length) e.more = undefined;
 }
 
-/** Gives a forge issue to an employee, or hires one from `role` for it. The issue becomes its cue header.
- *  forge.ts's assign() posts the start write-back after this returns. */
+/** Gives a forge issue to an employee, or hires one from `role` for it. A busy employee takes it on beside what it holds,
+ *  on the same branch. forge.ts's assign() posts the start write-back after this returns. */
 export async function assignIssue(o: { projectId: string; issue: Employee['issue']; employeeId?: string; role?: string; note?: string }): Promise<Employee> {
-  if (!o.issue) throw new Error('No issue');
+  const i = o.issue;
+  if (!i) throw new Error('No issue');
+  const at = Date.now();
   let e: Emp;
   if (o.employeeId) {
     e = get(o.employeeId);
-    e.issue = o.issue;
-    e.goal = issuePrompt(o.issue, o.note); // the issue is its new goal
+    const also = held(e).filter((x) => x.number !== i.number);
+    give(e, i);
+    e.goal = issueGoal(e) + (o.note ? `\n\nDavid's note on #${i.number}: ${o.note}` : ''); // everything it holds is its goal
     e.goalTries = 0;
-    send(e.id, issuePrompt(o.issue, o.note));
+    send(e.id, issuePrompt(i, o.note, also));
+    tracks.assigned(view(e), i, also.length ? `Assigned to ${e.name}, beside ${also.map((x) => `#${x.number}`).join(', ')}` : `Assigned to ${e.name}`, at);
   } else {
     if (!o.role) throw new Error('Pick an employee or a role to hire');
-    e = get((await hire({ projectId: o.projectId, role: o.role, task: issuePrompt(o.issue, o.note), issue: o.issue })).id);
+    e = get((await hire({ projectId: o.projectId, role: o.role, task: issuePrompt(i, o.note), issue: i, forIssue: true })).id);
+    give(e, i); // whoever held it before lets go
+    tracks.assigned(view(e), i, `Hired ${e.name} (${e.role}) for it`, at);
   }
-  e.task = `Working #${o.issue.number}: ${o.issue.title}`;
+  e.task = `Working #${i.number}: ${i.title}`;
   emit(e);
   return view(e);
+}
+
+/** An issue's state on the forge changed: closed ones leave whoever holds them. An employee hired for issues whose
+ *  last one closed is let go with its reports (sweep). */
+export function issuesClosed(projectId: string, closed: Set<number>, open?: Set<number>): void {
+  if (open) tracks.forgeStates(projectId, closed, open);
+  for (const e of emps.values()) {
+    if (e.projectId !== projectId) continue;
+    const gone = held(e).filter((i) => closed.has(i.number));
+    if (!gone.length) continue;
+    gone.forEach((i) => unhold(e, i.number));
+    if (held(e).length) e.goal &&= issueGoal(e);
+    else { e.closedOut = true; e.goal = undefined; } // its current turn ends as it will; no more automatic continues
+    emit(e);
+  }
+  sweepSoon(projectId);
+}
+
+/** Everyone under `e`, deepest last. */
+const below = (e: Emp): Emp[] => [...emps.values()].filter((x) => x.parentId === e.id).flatMap((x) => [x, ...below(x)]);
+const still = (x: Emp) => !turns.has(x.id) && !x.pending.length && !x.held && x.state !== 'talking' && x.state !== 'needs-you'
+  && ![...talkPtys.values()].includes(x.id) && !pendingApprovals().some((a) => a.employeeId === x.id);
+const kept = new Set<string>(); // teams David already heard were kept for uncommitted work
+let sweeping: Promise<void> = Promise.resolve();
+const sweepSoon = (projectId: string) => { sweeping = sweeping.then(() => sweep(projectId)).catch((err) => console.error('sweep', err)); };
+
+/** Fires an issue team once its issues are closed: an employee hired for issues whose last one closed, with everyone under
+ *  it, when all of them are still and none holds an open issue. Worktrees go; branches stay (git keeps unmerged ones).
+ *  A worktree with uncommitted changes keeps the whole team, and David hears once. */
+async function sweep(projectId: string): Promise<void> {
+  if (quitting) return;
+  for (const e of [...emps.values()]) {
+    if (e.projectId !== projectId || !e.forIssue || !e.closedOut || held(e).length || !emps.has(e.id)) continue;
+    const team = [e, ...below(e)];
+    if (!team.every((x) => still(x) && !held(x).length)) continue;
+    const dirty: string[] = [];
+    for (const x of team) if (!isMac(x) && existsSync(x.worktree) && await git(x.worktree, 'status', '--porcelain').catch(() => '?')) dirty.push(x.name);
+    if (dirty.length) {
+      if (!kept.has(e.id)) { kept.add(e.id); notify(e, `Its issues are closed, but ${dirty.join(', ')} ${dirty.length === 1 ? 'has' : 'have'} uncommitted changes, so the team was kept. Fire it once the work is saved.`); }
+      continue;
+    }
+    // Each await above or below may have given someone new work: check again right before every fire.
+    for (const x of team.reverse()) {
+      if (!e.closedOut || held(e).length || !emps.has(x.id) || !still(x) || held(x).length) break;
+      await fire(x.id, { removeWorktree: true }).catch((err) => { console.error('sweep fire', err); notify(x, `${x.name} was let go, but its worktree could not be removed: ${(err as Error).message}`); });
+    }
+  }
+}
+
+/** Issues held before tracking began: tracked from the prompt that assigned each, with the holder's reports. */
+function backfill(): void {
+  for (const e of emps.values()) {
+    for (const i of held(e)) {
+      if (tracks.listTracks(e.projectId).some((t) => t.number === i.number)) continue;
+      const lines = e.sessionId && e.provider === 'claude' ? tracks.sessionLines(e.projectId, e.accountId, e.worktree, e.sessionId) : [];
+      const start = lines.filter((l) => l.role === 'user' && l.text.startsWith(`Work on ${i.repo}#${i.number}:`)).at(-1);
+      const at = Date.parse(start?.at ?? '') || e.updatedAt;
+      tracks.assigned(view(e), i, start ? `Assigned to ${e.name}` : `Tracking began: ${e.name} holds it`, at);
+      for (const r of emps.values()) if (r.parentId === e.id) tracks.tasked(view(r), view(e), undefined, at);
+    }
+  }
+}
+
+/** The issue numbered `n` that `by` holds; undefined when `n` is unset. */
+function heldBy(by: Emp, n: unknown): Issue | undefined {
+  if (n === undefined || n === null || n === '') return undefined;
+  const i = held(by).find((x) => x.number === Number(n));
+  if (!i) throw new Error(`You don't hold #${String(n)}. You hold ${held(by).map((x) => `#${x.number}`).join(', ') || 'no issue'}.`);
+  return i;
+}
+
+/** After a lead's assign_task or message: an issue handed down moves to the report; a plain task puts the report on the lead's issues. */
+function handedOn(by: Emp, r: Emp, issue: Issue | undefined, at: number, hired: boolean): void {
+  if (!issue) {
+    tracks.tasked(view(r), view(by), hired ? `${by.name} hired ${r.name} (${r.role}, ${fmt(r)})` : `${by.name} gave ${r.name} a task (${fmt(r)})`, at);
+    return;
+  }
+  const also = held(r).filter((x) => x.number !== issue.number);
+  give(r, issue, by);
+  r.task = `Working #${issue.number}: ${issue.title}`;
+  tracks.assigned(view(r), issue, hired ? `${by.name} hired ${r.name} (${r.role}, ${fmt(r)}) for it`
+    : `${by.name} gave it to ${r.name}${also.length ? `, beside ${also.map((x) => `#${x.number}`).join(', ')}` : ''}`, at, by.name);
+  emit(r);
 }
 
 function directReport(by: Emp, id: unknown): Emp {
@@ -712,29 +847,35 @@ function registerOrgTools(): void {
   registerEmployeeTool('assign_task',
     'Give a task to a report: hires one from a role (or reuses your idle report with that role) in its own worktree, branched from yours. '
     + 'Returns at once with its id. Its final message arrives as your next turn when it finishes, so do not poll or wait. '
-    + 'Caps apply: over a cap it is queued, not refused. Merge its branch into yours when it reports.',
+    + 'Caps apply: over a cap it is queued, not refused. Merge its branch into yours when it reports. '
+    + 'With issue, it hands that issue (one you hold) to a new hire with a worktree of its own: the hire holds it from then on and you no longer do.',
     { type: 'object', properties: {
       role: { type: 'string', description: 'Role name, as in ~/.claude/agents or the project\'s .claude/agents' },
       task: { type: 'string' }, ...pickSchema,
-      lead: { type: 'boolean', description: 'Let this report hire reports of its own' },
+      lead: { type: 'boolean', description: 'Let this report hire reports of its own. Unset: the role decides.' },
+      issue: { type: 'number', description: 'Optional: an issue you hold, handed to this report.' },
     }, required: ['role', 'task'] },
     async (employeeId, a) => {
       const by = get(employeeId);
       if (typeof a?.role !== 'string' || typeof a?.task !== 'string' || !a.task.trim()) throw new Error('Give a role and a task');
       const pick = { model: typeof a.model === 'string' ? a.model : undefined, effort: typeof a.effort === 'string' ? a.effort : undefined };
-      const idle = [...emps.values()].find((r) => r.parentId === by.id && r.role === a.role && !!r.lead === !!a.lead && !r.pending.length && !turns.has(r.id)
-        && !r.held && (r.state === 'done' || r.state === 'idle'));
+      const lead = typeof a.lead === 'boolean' ? a.lead : undefined; // unset: the role's myide-lead decides
+      const issue = heldBy(by, a.issue);
+      const at = Date.now();
+      // An issue always gets a fresh hire, so it has a worktree of its own; a plain task may reuse an idle report.
+      const idle = issue ? undefined : [...emps.values()].find((r) => r.parentId === by.id && r.role === a.role && (lead === undefined || !!r.lead === lead)
+        && !r.pending.length && !turns.has(r.id) && !r.held && (r.state === 'done' || r.state === 'idle'));
       let id: string;
       if (idle) { send(idle.id, a.task.trim(), by, pick); id = idle.id; }
       else {
-        const o = { projectId: by.projectId, role: a.role, task: a.task.trim(), ...pick, lead: !!a.lead };
+        const o = { projectId: by.projectId, role: a.role, task: a.task.trim(), ...pick, lead, issue, forIssue: !!issue || undefined };
         const live = [...emps.values()].filter((r) => r.parentId === by.id).length;
         if (live >= caps().maxLive) {
           addApproval({ employeeId: by.id, tool: 'hire', input: o, kind: 'permission',
             text: `${by.name} already has ${live} reports and wants another ${a.role}: ${o.task.slice(0, 300)}` }, (allow) => {
             if (emps.get(by.id) !== by) return;
             if (!allow) return tell(by.id, `David declined the extra ${a.role} hire. Fire a finished report or do the task yourself.`);
-            hire(o, by).then((r) => tell(by.id, `David approved the extra hire: ${r.name} (id ${r.id}) is on it.`),
+            hire(o, by).then((r) => { if (emps.has(r.id)) handedOn(by, get(r.id), issue, Date.now(), true); tell(by.id, `David approved the extra hire: ${r.name} (id ${r.id}) is on it.`); },
               (err) => tell(by.id, `The approved hire failed: ${(err as Error).message}`));
           });
           return `You already have ${live} reports (the limit is ${caps().maxLive}), so this hire waits for David's approval. You hear back as a turn; fire finished reports to make room.`;
@@ -742,17 +883,23 @@ function registerOrgTools(): void {
         id = (await hire(o, by)).id;
       }
       const r = get(id);
+      handedOn(by, r, issue, at, !idle);
       const how = r.held ? `waiting for David to approve ${fmt(r.held)}, above the ceiling`
         : r.state === 'queued' ? 'queued: a cap is full (your max reports, the project, or the account); it starts when a slot frees'
         : 'started';
       return `${idle ? 'Gave the task to' : 'Hired'} ${r.name} (id ${r.id}, branch ${r.branch}, ${fmt(r)}): ${how}.`;
     }, isLead);
-  registerEmployeeTool('message', 'Send a direct report its next turn: a follow-up, a fix, or a new task.',
-    { type: 'object', properties: { employeeId: { type: 'string' }, text: { type: 'string' }, ...pickSchema }, required: ['employeeId', 'text'] },
+  registerEmployeeTool('message', 'Send a direct report its next turn: a follow-up, a fix, or a new task. '
+    + 'With issue, it also hands that issue (one you hold) to the report, beside what it holds: related issues share its branch and PR.',
+    { type: 'object', properties: { employeeId: { type: 'string' }, text: { type: 'string' }, ...pickSchema,
+      issue: { type: 'number', description: 'Optional: an issue you hold, handed to this report.' } }, required: ['employeeId', 'text'] },
     async (employeeId, a) => {
       const by = get(employeeId);
       const r = directReport(by, a?.employeeId);
+      const issue = heldBy(by, a?.issue);
+      const at = Date.now();
       send(r.id, String(a?.text ?? ''), by, { model: a?.model, effort: a?.effort });
+      handedOn(by, r, issue, at, false);
       return `Sent to ${r.name}; it runs as its next turn${r.state === 'queued' ? ' (queued for a slot)' : ''}.`;
     }, isLead);
   registerEmployeeTool('list_reports', 'Your direct reports: id, state, model, task, progress and last message.',
@@ -807,42 +954,7 @@ async function setProject(id: string, patch: ProjectPatch): Promise<void> {
 function transcript(id: string): { role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[] {
   const e = get(id);
   if (e.provider !== 'claude') return [{ role: 'tool', text: `Transcript not available for ${providers()[e.provider]?.label ?? e.provider} yet.` }];
-  if (!e.sessionId) return [];
-  const CLAUDE_PROJECTS = join(claudeConfigDir(e.accountId), 'projects'); // the account's own store
-  const name = `${e.sessionId}.jsonl`;
-  // Claude Code names the folder after the cwd with every non-alphanumeric character as '-'; scan if that guess misses.
-  let file = join(CLAUDE_PROJECTS, e.worktree.replace(/[^a-zA-Z0-9]/g, '-'), name);
-  if (!existsSync(file)) {
-    let dirs: string[] = [];
-    try { dirs = readdirSync(CLAUDE_PROJECTS); } catch { /* none yet */ }
-    const d = dirs.find((d) => existsSync(join(CLAUDE_PROJECTS, d, name)));
-    if (!d) return [];
-    file = join(CLAUDE_PROJECTS, d, name);
-  }
-  const out: { role: 'user' | 'assistant' | 'tool'; text: string; at?: string; images?: string[] }[] = [];
-  const short = (s: string) => (s.length > 500 ? s.slice(0, 500) + '…' : s);
-  for (const line of readFileSync(file, 'utf8').split('\n')) {
-    let d: any;
-    try { d = JSON.parse(line); } catch { continue; }
-    if ((d.type !== 'user' && d.type !== 'assistant') || d.isMeta || !d.message) continue;
-    const at = d.timestamp;
-    const c = d.message.content;
-    if (typeof c === 'string') { out.push({ role: d.type, text: c, at }); continue; }
-    const blocks = Array.isArray(c) ? c : [];
-    // Images David attached, kept with the message they went with (the CLI also adds an "[Image: source: ...]" note).
-    const images = blocks.filter((b: any) => b.type === 'image' && b.source?.type === 'base64').map((b: any) => `data:${b.source.media_type};base64,${b.source.data}`);
-    if (images.length) out.push({ role: d.type, text: '', at, images });
-    for (const b of blocks) {
-      if (b.type === 'text' && /^\[Image: source: /.test(b.text ?? '')) continue;
-      if (b.type === 'text' && b.text?.trim()) out.push({ role: d.type, text: b.text, at });
-      else if (b.type === 'tool_use') out.push({ role: 'tool', text: `${b.name} ${short(JSON.stringify(b.input ?? {}))}`, at });
-      else if (b.type === 'tool_result') {
-        const t = typeof b.content === 'string' ? b.content : (b.content ?? []).map((x: any) => x.text ?? '').join('\n');
-        if (t.trim()) out.push({ role: 'tool', text: `→ ${short(t)}`, at });
-      }
-    }
-  }
-  return out;
+  return e.sessionId ? tracks.sessionLines(e.projectId, e.accountId, e.worktree, e.sessionId) : [];
 }
 
 async function claudeTest(): Promise<{ ok: boolean; detail: string }> {
@@ -871,6 +983,7 @@ function onNewApproval(a: Approval): void {
   if (!e) return;
   if (isMac(e) && a.kind === 'plan') e.plan = { text: a.text ?? '', commands: planCommands(a.text ?? '') };
   if (e.state !== 'talking') e.state = 'needs-you'; // Talk keeps its state: the terminal is open on that session
+  tracks.note(e, `${e.name} needs you: ${(a.text ?? a.tool).slice(0, 200)}`);
   emit(e);
   notify(e, a.text ?? a.tool);
 }
@@ -906,6 +1019,7 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   lockDown();
   installHooks(join(__dirname, 'hooks', 'chain'), HOOKS);
   load();
+  backfill();
   onApproval(onNewApproval);
   onApprovalGone(approvalGone);
   registerOrgTools();
@@ -916,7 +1030,11 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   handle('employees:list', listEmployees);
   handle('employees:roles', (projectId: string) => roles(projectId).map(({ file, ...r }) => r));
   handle('employees:hire', hire);
-  handle('employees:send', (id: string, text: string, images?: unknown) => send(id, text, undefined, undefined, images));
+  handle('employees:send', (id: string, text: string, images?: unknown) => {
+    send(id, text, undefined, undefined, images);
+    get(id).closedOut = undefined; // David is talking to it: it stays until he fires it
+    tracks.said(get(id), text); // the issue dashboard shows it as David's, queued until its turn runs
+  });
   handle('employees:image', (id: string, path: string) => worktreeImage(get(id).worktree, String(path)));
   handle('employees:set-model', async (id: string, o: { model?: string; effort?: string; mode?: Mode; now?: boolean }) => {
     const e = get(id);
@@ -935,6 +1053,10 @@ export function registerEmployeesIpc(win: () => BrowserWindow | null): void {
   handle('employees:talk', talk);
   handle('employees:fire', fire);
   handle('employees:transcript', transcript);
+  // The issue dashboard: tracked issues, and one employee's part of an issue's conversation.
+  handle('tracks:list', (projectId?: string) => listProjects().filter((p) => !projectId || p.id === projectId)
+    .flatMap((p) => tracks.listTracks(p.id).map((t) => ({ ...t, projectId: p.id }))));
+  handle('tracks:thread', (projectId: string, n: number, id: string) => tracks.threadOf(projectId, Number(n), String(id), emps.get(String(id))?.sessionId));
   handle('approvals:list', () => pendingApprovals());
   handle('approvals:resolve', (id: string, allow: boolean, message?: string) => {
     const a = pendingApprovals().find((x) => x.id === id);

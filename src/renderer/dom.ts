@@ -8,6 +8,21 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Partial<
 /** An IPC error's message without Electron's "Error invoking remote method" prefix. */
 export const errText = (e: unknown): string => (e as Error).message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
 
+/** Puts `kids` in `parent` only if they differ, so a kept node (a card being typed in, an open fold) is never moved. */
+export function setKids(parent: Element, kids: Node[]): void {
+  if (kids.length !== parent.childNodes.length || kids.some((k, i) => parent.childNodes[i] !== k)) parent.replaceChildren(...kids);
+}
+
+/** Alt+Enter in `box` presses `ok`; Enter stays a new line. A box inside a form needs nothing: app.ts submits the form. */
+export function okKey(box: HTMLElement, ok: HTMLButtonElement): void {
+  ok.setAttribute('aria-keyshortcuts', 'Alt+Enter');
+  box.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter' || !ev.altKey || ev.isComposing) return;
+    ev.preventDefault();
+    if (!ok.disabled) ok.click();
+  });
+}
+
 /** A small rubber key (button). */
 export const key = (label: string, onclick: (() => void) | null = null, extra: Partial<HTMLButtonElement> = {}): HTMLButtonElement =>
   h('button', { type: 'button', className: 'key key--sm', textContent: label, onclick, ...extra });

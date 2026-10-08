@@ -425,6 +425,63 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .iss-one-thread { display: grid; gap: var(--sp-4); margin: 0; padding: 0; list-style: none; }
 .iss-one-comment { display: grid; gap: var(--sp-2); padding: var(--sp-4); background: var(--well); border-radius: var(--r-chip); }
 .iss-one textarea { resize: vertical; }
+/* The issue dashboard: conversation on the left, action items and timeline on the right once the panel is wide enough. */
+.iss-one { container-type: inline-size; }
+.iss-dash { display: grid; gap: var(--sp-4); align-items: start; }
+@container (min-width: 820px) { .iss-dash { grid-template-columns: minmax(0, 2fr) minmax(260px, 1fr); } }
+.iss-dash-main, .iss-dash-side { display: grid; gap: var(--sp-4); min-width: 0; }
+.iss-dash-side > [hidden], .iss-dash-main > [hidden] { display: none; }
+.iss-convo-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
+.iss-part-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3) var(--sp-4); min-width: 0; }
+.iss-part-name { font: 700 var(--fs-lg)/1.1 var(--font-legend); letter-spacing: 0.03em; color: var(--lcd-ink); }
+.iss-part-cue { flex: 1 1 100%; font-size: var(--fs-xs); color: var(--ink-3); overflow-wrap: anywhere; }
+.iss-parts { display: grid; gap: var(--sp-3); }
+.iss-part { padding: var(--sp-3) var(--sp-5); background: var(--chassis-face); border: 1px solid var(--chassis-edge); border-radius: var(--r-well); }
+.iss-part > summary { display: flex; align-items: center; gap: var(--sp-4); cursor: pointer; list-style: none; }
+.iss-part > summary::-webkit-details-marker { display: none; }
+.iss-part > summary::before { content: ""; flex: none; border: 4px solid transparent; border-left: 5px solid var(--ink-3); border-right: 0; transition: transform var(--t-fast) var(--ease-out); }
+.iss-part[open] > summary::before { transform: rotate(90deg); }
+.iss-part[open] > summary { margin-bottom: var(--sp-4); }
+.iss-part .chat-box { max-height: 40vh; }
+.iss-reply { display: grid; gap: var(--sp-3); }
+.iss-reply textarea { resize: vertical; }
+.chat-box { max-height: 60vh; overflow: auto; padding: var(--sp-3); background: var(--well); border-radius: var(--r-chip); }
+.chat { display: grid; gap: var(--sp-4); margin: 0; padding: 0; list-style: none; }
+.chat-line { display: grid; gap: var(--sp-2); min-width: 0; }
+.chat-head { display: flex; align-items: baseline; gap: var(--sp-4); }
+.chat-who { font: 700 var(--fs-xs)/1 var(--font-legend); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+.chat-at { font-size: var(--fs-2xs); color: var(--ink-off); }
+.chat-text { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5; color: var(--ink); }
+.chat-you, .chat-lead { justify-self: end; max-width: 85%; padding: var(--sp-3) var(--sp-4); border-radius: var(--r-key); background: color-mix(in srgb, var(--accent) 10%, var(--well-row)); border: 1px solid var(--accent-dim); }
+.chat-you .chat-who { color: var(--accent); }
+.chat-lead { background: var(--well-row); border-color: var(--line-strong); }
+.chat-agent .chat-who { color: var(--lcd-dim); }
+.chat-report { padding: var(--sp-3) var(--sp-4); border-left: 3px solid var(--st-done); background: var(--well-row); border-radius: var(--r-chip); }
+.chat-report .chat-text { max-height: 16em; overflow: auto; color: var(--ink-2); }
+.chat-assign summary, .chat-tool summary { cursor: pointer; }
+.chat-assign .chat-text { color: var(--ink-2); font-size: var(--fs-sm); }
+.chat-auto, .chat-myide { justify-self: center; font-size: var(--fs-xs); color: var(--ink-3); text-align: center; }
+.chat-tool { font-size: var(--fs-xs); color: var(--ink-3); }
+.chat-tool summary { color: var(--ink-off); }
+.chat-steps { display: grid; gap: 2px; margin: var(--sp-2) 0 0; padding: 0 0 0 var(--sp-5); list-style: none; font: 400 var(--fs-2xs)/1.45 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-3); }
+.chat-queued { display: grid; gap: var(--sp-3); margin-top: var(--sp-4); }
+.chat-queued:empty { display: none; }
+.chat-queued .chat-you { opacity: 0.7; border-style: dashed; }
+.iss-bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-4); }
+.iss-bar-progress { flex: 1 1 140px; height: 8px; accent-color: var(--st-done); }
+.iss-bar-progress[hidden] { display: none; }
+.iss-items { display: grid; gap: var(--sp-4); }
+.iss-member { display: grid; gap: var(--sp-2); }
+.iss-member-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
+.iss-member .cue { grid-template-columns: 8px 1fr auto; padding: 5px 8px; }
+.iss-timeline { display: grid; gap: var(--sp-2); margin: 0; padding: 0; list-style: none; max-height: 40vh; overflow: auto; font-size: var(--fs-sm); color: var(--ink-2); overflow-wrap: anywhere; }
+.iss-gh > summary { cursor: pointer; }
+.iss-gh[open] > summary { margin-bottom: var(--sp-4); }
+.iss-gh { gap: var(--sp-4); }
+/* The Issues panel's Assigned list. */
+.iss-assigned { display: grid; gap: var(--sp-3); }
+.iss-assigned[hidden] { display: none; }
+.iss-assigned-title { color: var(--lcd-dim); }
 .emp-reports { display: grid; gap: var(--sp-2); margin: 0; padding: 0; list-style: none; }
 .emp-report { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
 .emp-report-cue { flex: 1 1 100%; font-size: var(--fs-xs); color: var(--ink-3); overflow-wrap: anywhere; }

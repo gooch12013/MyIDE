@@ -19,13 +19,19 @@ import type { AssetRequest, Catalog } from '../main/assets';
 import type { Draft, Reply } from '../main/role-file';
 import type { Ctx } from '../main/wizard';
 import type { Todo } from '../main/todos';
+import type { Track } from '../main/tracks';
+import type { ChatLine, GhEvent } from '../main/thread';
 
 /** forge:issue's answer (forge.ts get_issue). `note` is set when the forge was down and this is the cached copy. */
 export type IssueDetail = {
   number: number; title: string; state: string; labels: string[]; assignees: string[]; author?: string; url: string; updated?: string;
   employee?: string; body?: string; comments?: { author: string; at: string; body: string }[];
   prs?: { number: number; url: string; state: string; title?: string }[]; note?: string;
+  /** What happened on the forge (GitHub only): closes, reopens, PRs that mention it and their merges. */
+  events?: GhEvent[];
 };
+export type TrackRow = Track & { projectId: string };
+export type { ChatLine };
 export type OrgState = {
   caps: { global: number; perProject: number; maxReports: number; maxDepth: number };
   projects: (ProjectOrg & { id: string; priority: number; paused: boolean; maxDepth: number })[];
@@ -127,6 +133,13 @@ const api = {
     onRemoved: (cb: (id: string) => void) => on('employees:removed', cb),
     /** A notification was clicked: show this employee. */
     onOpen: (cb: (id: string) => void) => on('employees:open', cb),
+  },
+  // Issues given to employees: who held each and when, what happened, and each employee's part of the conversation.
+  tracks: {
+    list: (projectId?: string): Promise<TrackRow[]> => ipcRenderer.invoke('tracks:list', projectId),
+    /** One employee's part of an issue, labelled by who said it; David's messages not run yet come last, queued. */
+    thread: (projectId: string, number: number, employeeId: string): Promise<ChatLine[]> => ipcRenderer.invoke('tracks:thread', projectId, number, employeeId),
+    onChange: (cb: (projectId: string) => void) => on('tracks:change', cb),
   },
   // Org: caps, per-project priority, pause and model defaults/ceiling.
   org: {

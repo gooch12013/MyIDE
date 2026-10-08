@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stripAttribution } from './attribution';
-import { assignIssue, listEmployees, tell } from './employees';
+import { assignIssue, issuesClosed, listEmployees, tell } from './employees';
 import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
 import { onIssuePost, registerEmployeeTool } from './mcp';
@@ -12,6 +12,7 @@ import { listProjects, readConfig, writeConfig, type Project } from './projects'
 import { detect, type Detected } from './remotes';
 import { spawnEnv } from './pty';
 import { handle, readJSON, STATE_DIR, writeJSON } from './store';
+import { ghTimeline } from './thread';
 
 // Forge issues: GitHub and Forgejo over REST with fetch. One cache file per project
 // (~/.myide/projects/<id>/issues.json) holds the last list, the URL that worked, linked PRs,
@@ -32,7 +33,8 @@ interface Cache {
   issues: Issue[]; prs: Record<string, PrLink>; outbox: Op[]; drafts: Draft[];
 }
 /** What forgeAction and startWriteBack need from an employee. */
-type Holder = { id: string; projectId: string; name: string; branch: string; issue?: IssueRef };
+type Holder = { id: string; projectId: string; name: string; branch: string; issue?: IssueRef; more?: IssueRef[] };
+const heldOf = (e: Holder): IssueRef[] => [e.issue, ...(e.more ?? [])].filter((i): i is IssueRef => !!i);
 type Sent = { msg: string; number?: number; url?: string };
 
 const TIMEOUT_MS = 5000;
@@ -234,6 +236,8 @@ export async function fetchIssues(id: string, force = false): Promise<void> {
       prs[n] = { ...pr, state: x.state, merged: !!(x.merged || x.merged_at) };
     }
     update(id, (c) => { Object.assign(c, { issues, fetchedAt: Date.now(), offline: false, error: undefined }); Object.assign(c.prs, prs); });
+    // Their holders let go; the dashboard's tracks note it.
+    issuesClosed(id, new Set(issues.filter((i) => i.state === 'closed').map((i) => i.number)), new Set(issues.filter((i) => i.state !== 'closed').map((i) => i.number)));
   } catch (e) {
     update(id, (c) => { c.offline = e instanceof Offline; c.error = (e as Error).message; });
   }
@@ -299,6 +303,7 @@ async function send(id: string, op: Op): Promise<Sent> {
     case 'close': // a PATCH, so a replay closes nothing twice; GitHub also records why
       await call(f, 'PATCH', `${R}/issues/${n}`, { state: 'closed', ...(f.provider === 'github' ? { state_reason: op.args.reason } : {}) }, id);
       update(id, (c) => { const i = c.issues.find((x) => x.number === n); if (i) i.state = 'closed'; });
+      if (n) issuesClosed(id, new Set([n]));
       return { msg: `Closed #${n}.` };
     case 'assign_self': {
       const me = await whoami(id, f);
@@ -414,7 +419,7 @@ async function checksOf(id: string, f: ForgeLink, sha: string): Promise<string |
 async function forgeRead(id: string, action: string, a: any): Promise<unknown> {
   const { f } = linked(id);
   const R = `/repos/${f.repo}`;
-  const holders = new Map(listEmployees(id).filter((e) => e.issue).map((e) => [e.issue!.number, e.name]));
+  const holders = new Map(listEmployees(id).flatMap((e) => heldOf(e).map((i) => [i.number, e.name] as const)));
   const prState = (p?: PrLink) => p && (p.merged ? 'merged' : p.state);
   if (action === 'list_issues') {
     await fetchIssues(id); // refreshes at most every 30 s; otherwise this is the cached list
@@ -476,8 +481,16 @@ async function forgeRead(id: string, action: string, a: any): Promise<unknown> {
   };
 }
 
+/** What happened on the forge, for the dashboard: closes, reopens, PRs that mention it and their merges.
+ *  ponytail: GitHub's first 100 events only; Forgejo's timeline has another shape and shows none yet. */
+async function timeline(id: string, n: number): Promise<ReturnType<typeof ghTimeline>> {
+  const { f } = linked(id);
+  if (f.provider !== 'github') return [];
+  return ghTimeline(await call(f, 'GET', `/repos/${f.repo}/issues/${n}/timeline?per_page=100`, undefined, id));
+}
+
 /** The employees' one path to a forge: reads for anyone on a linked project, writes to the issue they hold.
- *  Every body is stripped of attribution. There is no close action. */
+ *  Every body is stripped of attribution. close goes straight out (closeIssue). */
 export async function forgeAction(emp: Holder, action: string, args: any): Promise<unknown> {
   const a = args ?? {};
   if (READS.includes(action)) return forgeRead(emp.projectId, action, a);
@@ -492,8 +505,10 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
     return 'Drafted. Nothing was posted; it waits in NEEDS YOU until David files it.';
   }
   if (action === 'close') return closeIssue(emp, a);
-  const iss = emp.issue;
-  if (!iss) throw new Error('You hold no issue, so there is nothing to write back to.');
+  // The issue it names (one it holds), else its main one.
+  const mine = heldOf(emp);
+  const iss = a.number === undefined ? emp.issue : mine.find((i) => i.number === Number(a.number));
+  if (!iss) throw new Error(mine.length ? `You don't hold #${a.number}. You hold ${mine.map((i) => `#${i.number}`).join(', ')}.` : 'You hold no issue, so there is nothing to write back to.');
   if (action === 'comment') {
     const body = strip(a.body);
     if (!body) throw new Error('The comment is empty.');
@@ -503,8 +518,10 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
   if (action === 'open_pr') {
     const title = strip(a.title) || iss.title;
     let body = strip(a.body);
-    // "Refs #N" leaves the issue open, for projects that close issues by hand after the deploy.
-    if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?):? +#${iss.number}\\b`, 'i').test(body)) body = `${body}\n\nCloses #${iss.number}`.trim();
+    // Every issue it holds is named. "Refs #N" leaves the issue open, for projects that close issues by hand after the deploy.
+    // A body that already says Refs for one gets Refs for the rest, so a forgotten issue never closes on merge.
+    const word = /\brefs?:? +#\d+/i.test(body) ? 'Refs' : 'Closes';
+    for (const i of mine) if (!new RegExp(`\\b(close[sd]?|fix(e[sd])?|resolve[sd]?|refs?):? +#${i.number}\\b`, 'i').test(body)) body = `${body}\n\n${word} #${i.number}`.trim();
     return (await write(emp.projectId, 'open_pr', iss.number, { title, body, head: String(a.head || emp.branch), base: a.base ? String(a.base) : undefined }, emp.id)).msg;
   }
   throw new Error(`No forge action "${action}".`);
@@ -594,7 +611,8 @@ export async function assign(o: { projectId: string; number: number; title?: str
   const known = cache(o.projectId).issues.find((i) => i.number === o.number);
   const issue: IssueRef = { provider: f.provider, repo: f.repo, number: o.number, title: known?.title ?? o.title ?? '', url: known?.url ?? o.url ?? '' };
   const emp = await assignIssue({ projectId: o.projectId, issue, employeeId: o.employeeId, role: o.role, note: o.note });
-  try { await startWriteBack({ ...emp, issue: emp.issue ?? issue }); } catch (e) { return { employeeId: emp.id, warning: `Assigned, but the forge write-back failed: ${(e as Error).message}` }; }
+  // The issue just given, which a busy employee holds beside its main one.
+  try { await startWriteBack({ ...emp, issue }); } catch (e) { return { employeeId: emp.id, warning: `Assigned, but the forge write-back failed: ${(e as Error).message}` }; }
   return { employeeId: emp.id };
 }
 
@@ -667,8 +685,9 @@ export function registerForgeIpc(): void {
   registerEmployeeTool('forge',
     'The project\'s GitHub or Forgejo, through MyIDE. Reads: list_issues {state: open|closed|all, labels, assignee (a login or "none")}, '
     + 'get_issue {number} (body, comments, linked PRs), list_prs (open PRs, head branch, checks), pr_status {number} (mergeable, checks, reviews). '
-    + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body, or "Refs #N" to leave the issue open), set_labels. '
-    + 'close {number (default: the issue you hold), comment, reason: completed or not_planned}: posts the comment, then closes; only when David has told you to close it. '
+    + 'Writes, to an issue you hold (number picks one when you hold several; default your main one): comment, open_pr (put "Closes #N" or "Refs #N" for every issue you hold in the body; '
+    + 'Refs leaves the issue open), set_labels. '
+    + 'close {number (default: your main issue), comment, reason: completed or not_planned}: posts the comment, then closes; when David or your role says to close it. '
     + 'draft_issue {title, body, labels}: David files it.',
     { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'close', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
     async (employeeId, a) => {
@@ -734,7 +753,9 @@ export function registerForgeIpc(): void {
     writeJSON(viewFile(scope), view);
   });
   // The Issue panel: one issue with its comments and linked PRs, and David's own comment and close from it (as him, through the outbox).
-  handle('forge:issue', (projectId: string, number: number) => forgeRead(projectId, 'get_issue', { number }));
+  handle('forge:issue', async (projectId: string, number: number) => ({
+    ...(await forgeRead(projectId, 'get_issue', { number }) as object), events: await timeline(projectId, num(number, 'issue')).catch(() => []),
+  }));
   handle('forge:comment', (projectId: string, number: number, body: string) => {
     const b = strip(body);
     if (!b) throw new Error('The comment is empty.');

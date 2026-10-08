@@ -188,7 +188,7 @@ registerPanel('role-wizard', {
       h('div', { className: 'wz-compose' }, input,
         h('div', { className: 'wz-keys' }, micButton(input, say),
           key('Send', () => void send(input.value), { className: 'key key--sm key--lit' }), draftKey, key('Cancel', () => void close()))));
-    input.onkeydown = (ev) => { if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); void send(input.value); } };
+    input.onkeydown = (ev) => { if (ev.key === 'Enter' && (ev.metaKey || ev.ctrlKey || ev.altKey)) { ev.preventDefault(); void send(input.value); } };
 
     const startChat = () => {
       body.replaceChildren(chat);

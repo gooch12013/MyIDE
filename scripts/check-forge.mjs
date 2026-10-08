@@ -119,6 +119,7 @@ const ipc = new Map();
 const opened = [];
 const assigned = [];
 const told = [];
+const closedSeen = [];
 globalThis.__stub = {
   electron: {
     app: { whenReady: () => new Promise(() => {}), getPath: () => tmp },
@@ -129,6 +130,7 @@ globalThis.__stub = {
   employees: {
     assignIssue: async (o) => { assigned.push(o); return { id: 'e1', projectId: o.projectId, name: 'engineer-1', branch: 'myide/engineer-1', issue: o.issue }; },
     tell: (id, text) => told.push({ id, text }),
+    issuesClosed: (projectId, closed) => closedSeen.push([projectId, [...closed]]),
     // A lead with no issue, the engineer holding #1, and an employee of a project with no forge.
     listEmployees: (projectId) => [
       { id: 'lead1', projectId: 'p1', name: 'project-lead-1', branch: 'myide/project-lead-1', lead: true },
@@ -234,12 +236,14 @@ try {
   assert.equal(log[0].body.body, 'Fixed the teardown.', 'the close comment is stripped too');
   assert.deepEqual(log[1].body, { state: 'closed' }, 'Forgejo: no state_reason');
   assert.equal(cache().issues.find((i) => i.number === 1).state, 'closed');
+  assert.deepEqual(closedSeen.at(-1), ['p1', [1]], 'its holder hears it closed');
   assert.equal(await forge.forgeAction(emp, 'close', { comment: 'again' }), '#1 is already closed; nothing was posted.');
   assert.equal(log.length, 2, 'a second close sends nothing');
   await assert.rejects(forge.forgeAction({ ...emp, issue: undefined }, 'close', {}), /Name the issue/);
   log.length = 0;
   issues.get(1).state = 'open'; // reopened on the forge; the next poll sees it
   await call('forge:refresh', 'p1', true);
+  assert.deepEqual(closedSeen.at(-1), ['p1', []], 'each poll reports what is closed now');
   await assert.rejects(forge.forgeAction({ ...emp, issue: undefined }, 'comment', { body: 'x' }), /hold no issue/);
 
   // open_pr: stripped body gains "Closes #N"; the PR is linked and the next poll sees it merged.
@@ -254,6 +258,15 @@ try {
   assert.deepEqual(cache().prs['1'], { number: 51, url: 'http://forge/o/r/pulls/51', state: 'closed', merged: true });
   await forge.forgeAction(emp, 'open_pr', { title: 'Part one', body: 'Refs #1, more to come' });
   assert.equal(log.at(-1).body.body, 'Refs #1, more to come', 'Refs leaves the issue open: no Closes added');
+  // Several issues on one branch: the PR names every one; a write names one it holds, or goes to the main one.
+  const two = { ...emp, more: [{ provider: 'forgejo', repo: 'o/r', number: 2, title: 'Related', url: '' }] };
+  await forge.forgeAction(two, 'open_pr', { title: 'Both', body: 'Refs #1' });
+  assert.equal(log.at(-1).body.body, 'Refs #1\n\nRefs #2', 'Refs for one: Refs for the rest, so nothing closes on merge');
+  await forge.forgeAction(two, 'open_pr', { title: 'Both', body: 'Fixed both.' });
+  assert.equal(log.at(-1).body.body, 'Fixed both.\n\nCloses #1\n\nCloses #2');
+  await assert.rejects(forge.forgeAction(two, 'comment', { number: 7, body: 'x' }), /don't hold #7\. You hold #1, #2/);
+  log.length = 0;
+  assert.equal(await forge.forgeAction(two, 'comment', { body: 'main one' }), 'Commented on #1.');
 
   // Assign: A's assignIssue, then the start comment, assignee (the token owner) and "in progress" label.
   log.length = 0;

@@ -1,5 +1,5 @@
 import type { AssetRequest, Catalog, ModelInfo } from '../main/assets';
-import { ask, errText, h, key, seg } from './dom';
+import { ask, errText, h, key, okKey, seg } from './dom';
 import { led } from './employees';
 import { activeProject } from './projects';
 import { registerPanel } from './registry';
@@ -51,6 +51,7 @@ registerPanel('assets', {
       syncRef();
     };
     const writeKey = h('button', { type: 'button', className: 'key key--go', textContent: 'Write prompt', onclick: () => void write() });
+    okKey(short, writeKey); // Generate spends credits, so it stays a click
     const form = h('div', { className: 'as-col as-req' },
       notice,
       h('div', { className: 'seg' }, type.el),

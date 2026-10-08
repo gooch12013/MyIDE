@@ -1,4 +1,4 @@
-import { h, key, sheet } from './dom';
+import { h, key, okKey, setKids, sheet } from './dom';
 import { openHire } from './hire';
 import { openWizard } from './wizard';
 import { activeProject, allProjects, scopeOf } from './projects';
@@ -94,7 +94,9 @@ function needKeys(a: Approval, who: string, scope: HTMLElement, rows: number, do
   if (a.kind === 'question') {
     const answer = h('textarea', { className: 'input need-answer', rows, placeholder: 'Your answer' });
     answer.setAttribute('aria-label', `Answer for ${who}`);
-    return [answer, key('Answer', busy(() => api.approvals.resolve(a.id, true, answer.value.trim())), { className: 'key key--sm key--lit' })];
+    const ok = key('Answer', busy(() => api.approvals.resolve(a.id, true, answer.value.trim())), { className: 'key key--sm key--lit' });
+    okKey(answer, ok);
+    return [answer, ok];
   }
   return [
     key(a.kind === 'plan' ? 'Approve plan' : 'Approve', busy(() => api.approvals.resolve(a.id, true)), { className: 'key key--sm key--lit' }),
@@ -131,6 +133,45 @@ export function needCard(a: Approval, who: string, colour: string | undefined): 
     h('div', { className: 'need-keys' }, ...needKeys(a, who, card, 2)),
   );
   return card;
+}
+
+/** `ids` and everyone under them. */
+export function teamOf(ids: Iterable<string>, everyone: Employee[]): Set<string> {
+  const team = new Set(ids);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const x of everyone) if (x.parentId && team.has(x.parentId) && !team.has(x.id)) { team.add(x.id); grew = true; }
+  }
+  return team;
+}
+
+/** Everything waiting on David from a team (`team` picks its ids from everyone): NEEDS YOU cards and drafted issues,
+ *  answered in place. Cards are kept by id across redraws. draw() resolves with everyone, or undefined when a newer draw won. */
+export function needsBox(team: (everyone: Employee[]) => Set<string>): { el: HTMLElement; draw: () => Promise<Employee[] | undefined> } {
+  const el = h('section', { className: 'needs emp-needs' });
+  el.setAttribute('aria-label', 'Needs you');
+  el.hidden = true;
+  const cards = new Map<string, HTMLElement>();
+  let seq = 0;
+  const draw = async () => {
+    const n = ++seq;
+    const [pending, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
+    if (n !== seq) return undefined;
+    const ids = team(everyone);
+    const nameOf = (id: string) => everyone.find((x) => x.id === id)?.name ?? 'This employee';
+    const colourOf = (id: string) => allProjects().find((p) => p.id === everyone.find((x) => x.id === id)?.projectId)?.colour;
+    const live = new Set<string>();
+    const keep = (k: string, make: () => HTMLElement) => { const c = cards.get(k) ?? make(); cards.set(k, c); live.add(k); return c; };
+    const list = [
+      ...pending.filter((a) => ids.has(a.employeeId)).map((a) => keep(`a:${a.id}`, () => needCard(a, nameOf(a.employeeId), colourOf(a.employeeId)))),
+      ...forges.flatMap((f) => f.drafts.filter((d) => ids.has(d.employeeId)).map((d) => keep(`d:${d.id}`, () => draftCard(f, d)))),
+    ];
+    for (const k of cards.keys()) if (!live.has(k)) cards.delete(k);
+    setKids(el, list);
+    el.hidden = !list.length;
+    return everyone;
+  };
+  return { el, draw };
 }
 
 /** cue(), with a lead's roll-up of its reports and a held model in place of the count. */
