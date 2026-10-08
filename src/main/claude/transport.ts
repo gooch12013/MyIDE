@@ -57,7 +57,8 @@ export function runTurn(o: TurnOpts): Turn {
     };
     void spawnEnv().then((env) => {
       if (sigint) return finish('Interrupted before start');
-      env = { ...env, ...o.env, MCP_TOOL_TIMEOUT: String(MCP_TOOL_TIMEOUT_MS) }; // otherwise an approval is dropped after 60 s
+      env = { ...env, ...o.env, MCP_TOOL_TIMEOUT: String(MCP_TOOL_TIMEOUT_MS), // otherwise an approval is dropped after 60 s
+        CLAUDE_CODE_ENABLE_TODO_TOOLS: '1' }; // 2.1.294 dropped TaskCreate/TaskUpdate from -p turns unless this is set; the task count needs them
       child = spawn('claude', args, { cwd: o.cwd, env, stdio: [stdin ? 'pipe' : 'ignore', 'pipe', 'pipe'] }); // a piped stdin left open stalls the CLI
       if (stdin) { child.stdin!.on('error', () => {}); child.stdin!.end(stdin); }
       let stderr = '';

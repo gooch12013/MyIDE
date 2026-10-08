@@ -1,7 +1,7 @@
 // The user's own `claude`, checked once per launch against the version the spikes ran on.
 import { cliVersion, spawnEnv } from '../pty';
 
-const TESTED = '2.1.292';
+const TESTED = '2.1.294';
 let cached: ReturnType<typeof probe> | undefined;
 
 async function probe(): Promise<{ version: string | null; tested: boolean; testedVersion: string }> {
