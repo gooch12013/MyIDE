@@ -2,7 +2,7 @@
 // Usage: node scripts/check-org.mjs
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { aboveCeiling, autoPick, pickStarts, rollup, slowedCap } from '../src/main/org.ts';
+import { aboveCeiling, autoPick, GOAL_TRIES, goalStep, pickStarts, rollup, slowedCap } from '../src/main/org.ts';
 
 const table = JSON.parse(readFileSync(new URL('../build/providers.json', import.meta.url), 'utf8'));
 const lists = (p) => [table[p].models.map(([m]) => m), table[p].efforts.map(([e]) => e)];
@@ -88,4 +88,19 @@ assert.equal(above({ model: 'flash', effort: 'high' }, { model: 'flash' }, 'gemi
 assert.equal(above({ model: 'flash', effort: 'max' }, { model: 'flash', effort: 'low' }, 'gemini'), false);
 assert.equal(above({ model: 'pro' }, { model: 'flash' }, 'gemini'), true);
 assert.equal(above({ model: 'flash-lite' }, { model: 'flash' }, 'gemini'), false);
+// Goal mode: the last lines decide; Markdown marks are fine; busy reports mean wait; the tries run out.
+assert.deepEqual(goalStep('Merged and checked on prod.\n\nGOAL DONE', 0, false), { kind: 'done' });
+assert.deepEqual(goalStep('All shipped.\n**GOAL DONE**', 3, true), { kind: 'done' }, 'done wins over busy reports');
+assert.deepEqual(goalStep('Need the Asana admin token.\nGOAL BLOCKED: no service token', 0, false), { kind: 'blocked', why: 'no service token' });
+assert.deepEqual(goalStep('`GOAL BLOCKED`', 0, false), { kind: 'blocked', why: 'no reason given' });
+assert.deepEqual(goalStep('Engineer is building it.\nWAITING', 0, true), { kind: 'wait' });
+assert.deepEqual(goalStep('Engineer is building it.\nWAITING', 0, false), { kind: 'continue' }, 'nothing to wait on');
+assert.deepEqual(goalStep('Next I will run the gate.', GOAL_TRIES - 1, false), { kind: 'continue' });
+assert.deepEqual(goalStep('Next I will run the gate.', GOAL_TRIES, false), { kind: 'exhausted' });
+assert.deepEqual(goalStep('GOAL DONE was the plan, then the build broke.\nline\nline\nline', 0, false), { kind: 'continue' }, 'only the last lines count');
+assert.deepEqual(goalStep('Shipped.\n✅ GOAL DONE', 0, false), { kind: 'done' });
+assert.deepEqual(goalStep('Shipped.\nStatus: GOAL DONE.', 0, false), { kind: 'done' });
+assert.deepEqual(goalStep('Goal done? Not yet, CI is red.', 0, false), { kind: 'continue' }, 'lower case is not the marker');
+assert.deepEqual(goalStep('Next: GOAL DONE once CI passes', 0, false), { kind: 'continue' }, 'mid-sentence is not the marker');
+assert.deepEqual(goalStep('**GOAL BLOCKED:** no token', 0, false), { kind: 'blocked', why: 'no token' });
 console.log('check-org: ok');

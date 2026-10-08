@@ -95,3 +95,18 @@ export function rollup(all: Node[], id: string): { done: number; total: number; 
   if (root) walk(root);
   return { done, total, reports: Math.max(0, reports) };
 }
+
+/** Goal mode: automatic "keep going" turns per goal before it goes to David (or its lead). */
+export const GOAL_TRIES = 8;
+export type GoalStep = { kind: 'done' } | { kind: 'blocked'; why: string } | { kind: 'wait' } | { kind: 'continue' } | { kind: 'exhausted' };
+/** After a turn: GOAL DONE or GOAL BLOCKED (capitals, ending one of its last three lines, Markdown marks or a label like
+ *  "Status:" allowed) decide; otherwise a lead whose reports are still busy waits for them, and anyone else is sent on
+ *  until the tries run out. "Goal done? Not yet" is no marker, and neither is GOAL DONE in the middle of a sentence. */
+export function goalStep(text: string, tries: number, reportsBusy: boolean, cap = GOAL_TRIES): GoalStep {
+  const tail = text.trim().split('\n').slice(-3).join('\n');
+  if (/(^|[^A-Za-z])GOAL DONE[^A-Za-z\n]*$/m.test(tail)) return { kind: 'done' };
+  const b = /(^|[^A-Za-z])GOAL BLOCKED\b[*_`]*:?(.*)$/m.exec(tail);
+  if (b) return { kind: 'blocked', why: b[2].replace(/^[\s*_`:]+|[\s*_`]+$/g, '') || 'no reason given' };
+  if (reportsBusy) return { kind: 'wait' };
+  return tries < cap ? { kind: 'continue' } : { kind: 'exhausted' };
+}

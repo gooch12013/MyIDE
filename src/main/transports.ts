@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { account, DEFAULT_ACCOUNT, registerAccountsIpc, reportUsage, type Account } from './accounts';
+import { MCP_TOOL_TIMEOUT_MS } from './mcp';
 import { codexInfo, onAcpPermission, runCodexTurn, type AcpPermission } from './acp/codex';
 import { geminiInfo, KEY_SERVICE, runGeminiTurn } from './acp/gemini';
 import { getToken } from './keychain';
@@ -64,7 +65,7 @@ const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 const envPrefix = (name: string, value?: string) => (value ? `env ${name}=${shq(value)}` : `env -u ${name}`);
 
 /** The command a Talk terminal runs to open the employee's session in its CLI, on its account. */
-export function talkCommandFor(emp: Emp, base: { sessionId: string; model: string; effort?: string; settingsPath: string; promptFile: string; mac?: boolean }): string {
+export function talkCommandFor(emp: Emp, base: { sessionId: string; model: string; effort?: string; settingsPath: string; promptFile: string; mcpPath?: string; mac?: boolean }): string {
   const a = accountFor(emp);
   if (a.provider === 'codex') {
     // Only listed values reach the command line: a Claude model name means nothing to Codex, and the effort goes into a TOML string.
@@ -81,7 +82,9 @@ export function talkCommandFor(emp: Emp, base: { sessionId: string; model: strin
       'exec gemini --resume', shq(base.sessionId), ...(model ? ['--model', shq(model)] : [])].join(' ');
   }
   if (a.provider !== 'claude') throw new Error(`Talk is not available for ${a.provider} yet.`);
-  return ['exec', envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR), 'claude --resume', shq(base.sessionId), '--settings', shq(base.settingsPath),
+  // The same MyIDE tools and env as a background turn (claude/transport.ts), so a lead can still read and run its reports here.
+  return ['exec', envPrefix('CLAUDE_CONFIG_DIR', a.env.CLAUDE_CONFIG_DIR), `MCP_TOOL_TIMEOUT=${MCP_TOOL_TIMEOUT_MS}`, 'CLAUDE_CODE_ENABLE_TODO_TOOLS=1',
+    'claude --resume', shq(base.sessionId), '--settings', shq(base.settingsPath), ...(base.mcpPath ? ['--mcp-config', shq(base.mcpPath)] : []),
     '--model', shq(base.model), ...(base.effort ? ['--effort', shq(base.effort)] : []),
     // This Mac: Talk starts in plan mode too, and without David's user settings (their allow rules would run unplanned commands).
     ...(base.mac ? ['--permission-mode plan --setting-sources project,local'] : []),

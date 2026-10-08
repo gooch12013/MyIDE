@@ -14,7 +14,7 @@ import { providers, runTurnFor, talkCommandFor } from './transports';
 import { claudeInfo } from './claude/version';
 import { planCommands } from './mac';
 import { addApproval, clearGrants, employeeMcpConfig, grantCommands, hookUrl, onApproval, onApprovalGone, pendingApprovals, registerControlTool, registerEmployeeTool, resolveApproval, startMcp, type Approval } from './mcp';
-import { aboveCeiling, autoPick, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
+import { aboveCeiling, autoPick, GOAL_TRIES, goalStep, pickStarts, slowedCap, type AutoRule, type Mode, type Pick, type QItem, type Usage } from './org';
 import { listProjects, projectById, readConfig, writeConfig } from './projects';
 import { onPtyExit } from './pty';
 import { broadcast, handle, lockDown, readJSON, slug, STATE_DIR, writeJSON, writePrivate } from './store';
@@ -50,9 +50,16 @@ type Result = Extract<ClaudeEvent, { type: 'result' }>;
 // quiet: a scheduled run; it notifies only when it fails or needs David, never when it is done.
 type Pending = string | { text: string; images?: string[]; quiet?: boolean };
 // go: This Mac's next turn runs the approved plan (permission mode default, these commands granted once).
-interface Emp extends Employee { roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
+// goal: what the employee works toward until it says GOAL DONE (goal mode); goalTries: automatic continues spent on it.
+interface Emp extends Employee { goal?: string; goalTries?: number; roleFile?: string; tasks?: TaskState; pending: Pending[]; queuedAt?: number; paused?: boolean; ended?: EmployeeState; heldFor?: { ceiling: Pick; by: string }; wakeups?: number; go?: string[] }
 
 const HOOKS = join(STATE_DIR, 'hooks');
+const GOAL_END = 'End the last message of every turn with one of these lines on its own: GOAL DONE (the goal is met), GOAL BLOCKED: <why> (only David can unblock it), or WAITING (reports you lead are still working on it).';
+const GOAL_RULES = 'Goal mode: you have a goal, not a single step. Keep working until it is met. Don\'t stop to ask David unless your role names that stop: '
+  + 'pick the recommended option yourself and carry on. A lead hands its reports goals too: every assign_task says what done means. A message from David overrides or narrows the goal. '
+  + `${GOAL_END} A turn that ends without one of them is sent on automatically.`;
+const TALK_NOTE = 'This is Talk: David is typing to you live in a terminal, so answer him here rather than with ask_human. Your MyIDE tools work here too.';
+const TALK_LEAD_NOTE = 'While Talk is open, your reports\' results wait and reach you as a turn when it ends. list_reports shows their state and last message now.';
 const NO_ATTRIBUTION = 'No AI attribution anywhere: no Co-Authored-By trailer, no "Generated with Claude Code" line and no Claude-Session line in commits, pull requests, issues or comments. Everything goes out as the user.';
 const CONTINUE = 'Continue where you left off.';
 const DEFAULT_MODEL = 'sonnet';
@@ -228,7 +235,7 @@ function systemPrompt(e: Emp): string {
   try { body = readFileSync(e.roleFile!, 'utf8').replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '').trim(); } catch { /* role file gone */ }
   let voice = '';
   try { voice = readFileSync(join(STATE_DIR, 'voice.md'), 'utf8').trim(); } catch { /* optional */ }
-  return [body, isMac(e) ? MAC_RULES : '', NO_ATTRIBUTION, voice].filter(Boolean).join('\n\n');
+  return [body, isMac(e) ? MAC_RULES : '', NO_ATTRIBUTION, voice, e.goal ? `${GOAL_RULES}\n\nYour goal:\n${e.goal.slice(0, 4000)}` : ''].filter(Boolean).join('\n\n');
 }
 
 // ---- turns and the queue ----
@@ -257,7 +264,8 @@ function schedule(): void {
   if (!mcpReady || quitting) return; // every turn needs the MCP server's port
   const c = caps();
   const q = (e: Emp): QItem => ({ id: e.id, projectId: e.projectId, accountId: e.accountId, parentId: e.parentId, queuedAt: e.queuedAt });
-  const waiting = [...emps.values()].filter((e) => e.pending.length && !e.paused && !e.held && !turns.has(e.id) && e.state !== 'talking');
+  const talking = new Set(talkPtys.values()); // a Talk terminal is open on the session: no background turn alongside it
+  const waiting = [...emps.values()].filter((e) => e.pending.length && !e.paused && !e.held && !turns.has(e.id) && e.state !== 'talking' && !talking.has(e.id));
   const running = [...turns.keys()].map((id) => emps.get(id)).filter((e): e is Emp => !!e).map(q);
   const starts = pickStarts(waiting.map(q), running, {
     global: c.global, perProject: c.perProject, account: accountCap,
@@ -329,6 +337,11 @@ function start(e: Emp): void {
   turn.done.then((r) => finish(e, r), (err) => finish(e, { type: 'result', ok: false, interrupted: false, text: String(err), sessionId: e.sessionId ?? '' }));
 }
 
+/** Anyone under `id` (reports, their reports, and so on) still running, queued, held or waiting on David. */
+function teamBusy(id: string): boolean {
+  return [...emps.values()].some((x) => x.parentId === id && (turns.has(x.id) || x.pending.length > 0 || !!x.held || x.state === 'needs-you' || teamBusy(x.id)));
+}
+
 function finish(e: Emp, r: Result): void {
   turns.delete(e.id);
   if (goTurns.delete(e.id)) clearGrants(e.id); // a GO covers one turn; the next one plans again
@@ -352,14 +365,33 @@ function finish(e: Emp, r: Result): void {
     e.state = 'needs-you';
     broadcast('approvals:change', pendingApprovals()); // the renderer learns timedOut here
   }
+  // Goal mode: a turn that ends short of its goal is sent on (org.ts goalStep). A blocked or stuck goal goes to its lead
+  // through the report, or to David as an interrupted employee with the reason.
+  let waitingOnReports = false;
+  if (e.goal && e.state === 'done' && r.ok && !r.interrupted && !w && !e.paused) {
+    const step = goalStep(r.text ?? '', e.goalTries ?? 0, teamBusy(e.id));
+    if (step.kind === 'done') { e.goal = undefined; e.goalTries = 0; }
+    else if (step.kind === 'wait') waitingOnReports = true; // its reports wake it; nothing to report or notify yet
+    else if (step.kind === 'continue') {
+      e.goalTries = (e.goalTries ?? 0) + 1;
+      const text = `Keep going toward your goal (${e.goalTries} of ${GOAL_TRIES}). ${GOAL_END}`;
+      e.pending.push(quiet ? { text, quiet } : text); // a scheduled run stays quiet
+      e.queuedAt ??= Date.now();
+      e.state = 'queued';
+    } else if (!(e.parentId && emps.has(e.parentId))) { // with a live lead, the lead hears it in the report
+      e.state = 'interrupted';
+      e.error = step.kind === 'blocked' ? `Goal blocked: ${step.why}` : `Stopped after ${GOAL_TRIES} automatic continues short of its goal.`;
+    }
+  }
   emit(e);
   // Interrupts MyIDE asked for are not news; one that came from an error is. Nothing is news at quit.
   if (w === 'quit') return;
   const ended = e.state === 'done' || e.state === 'failed';
   // A turn that ran to its end reports back even if MyIDE asked to interrupt it just too late.
-  if (ended && !r.interrupted && reportBack(e)) {
-    // Its lead hears about it, not David. A contractor goes back to the pool once it has reported.
-    if (e.contractor && e.state === 'done') void releaseContractor(e);
+  if (waitingOnReports) { /* nothing yet */ }
+  else if (ended && !r.interrupted && reportBack(e)) {
+    // Its lead hears about it, not David. A contractor goes back to the pool once it has reported, unless its goal is still open (blocked).
+    if (e.contractor && e.state === 'done' && !e.goal) void releaseContractor(e);
   } else if ((ended || (e.state === 'interrupted' && !w)) && !(quiet && e.state === 'done')) notify(e);
   schedule();
 }
@@ -373,6 +405,7 @@ function reportBack(e: Emp): boolean {
   lead.pending.push(`Report ${e.name} (id ${e.id}, branch ${e.branch}${e.contractor ? ', contractor' : ''}) ${body}`);
   lead.queuedAt ??= Date.now();
   lead.wakeups = (lead.wakeups ?? 0) + 1;
+  lead.goalTries = 0; // a report finishing is progress toward the lead's goal
   if (lead.wakeups > MAX_WAKEUPS && !lead.paused) {
     lead.paused = true;
     lead.error = `Paused after ${MAX_WAKEUPS} report wake-ups without you. Send it a message to continue.`;
@@ -456,7 +489,8 @@ function send(id: string, text: string, by?: Emp, pick?: Partial<Pick>, images?:
   e.pending.push(paths.length || quiet ? { text, images: paths.length ? paths : undefined, quiet } : text);
   e.queuedAt ??= Date.now();
   e.paused = false;
-  if (!by) e.wakeups = 0; // David spoke to it
+  if (by) { e.goal = text.trim(); e.goalTries = 0; } // a lead's message is the report's new goal
+  else { e.wakeups = 0; e.goalTries = 0; } // David spoke to it
   save(e.projectId);
   schedule();
 }
@@ -561,7 +595,7 @@ async function hireNow(o: HireOpts, by?: Emp): Promise<Employee> {
   if (mac && provider !== 'claude') throw new Error('This Mac employees run on Claude only. Pick a Claude account.');
   const e: Emp = {
     id: randomUUID(), projectId: o.projectId, role: role.name, name, worktree, branch: mac ? '' : `myide/${name}`,
-    model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
+    model: DEFAULT_MODEL, state: 'idle', task: o.task.trim(), goal: o.task.trim(), updatedAt: Date.now(), roleFile: role.file, pending: [],
     depth, parentId: by?.id, lead: (o.lead ?? role.lead) || undefined, maxReports: (o.lead ?? role.lead) ? o.maxReports ?? role.maxReports : undefined, contractor: role.shared,
     mode: mode ?? (by ? 'manager' : 'pinned'), accountId, provider, issue: o.issue,
   };
@@ -592,17 +626,19 @@ function interrupt(id: string, reason: 'user' | 'model' | 'talk' | 'fire' | 'qui
 async function talk(id: string): Promise<{ cwd: string; command: string; ptyId: string }> {
   const e = get(id);
   if (!e.sessionId) throw new Error(`${e.name} has no session yet; wait for its first turn to start.`);
+  // Its files first: if any of them fails (the MCP server not up yet), the employee is left as it was, not stuck in 'talking'.
+  put(settingsFile(e), settingsFor(e));
+  put(mcpFile(e), employeeMcpConfig(e.id));
+  writePrivate(talkPromptFile(e), [systemPrompt(e), TALK_NOTE, e.lead ? TALK_LEAD_NOTE : ''].filter(Boolean).join('\n\n'));
   await interrupt(id, 'talk');
   e.state = 'talking';
   e.paused = false;
   e.wakeups = 0;
   emit(e);
-  put(settingsFile(e), settingsFor(e));
-  writePrivate(talkPromptFile(e), systemPrompt(e));
   const ptyId = `terminal-${randomUUID().slice(0, 8)}`;
   talkPtys.set(ptyId, e.id);
   // exec: when the CLI exits so does the PTY, which ends Talk.
-  const command = talkCommandFor(e, { sessionId: e.sessionId, model: e.model, effort: e.effort, settingsPath: settingsFile(e), promptFile: talkPromptFile(e), mac: isMac(e) });
+  const command = talkCommandFor(e, { sessionId: e.sessionId, model: e.model, effort: e.effort, settingsPath: settingsFile(e), promptFile: talkPromptFile(e), mcpPath: mcpFile(e), mac: isMac(e) });
   return { cwd: e.worktree, command, ptyId };
 }
 
@@ -649,6 +685,8 @@ export async function assignIssue(o: { projectId: string; issue: Employee['issue
   if (o.employeeId) {
     e = get(o.employeeId);
     e.issue = o.issue;
+    e.goal = issuePrompt(o.issue, o.note); // the issue is its new goal
+    e.goalTries = 0;
     send(e.id, issuePrompt(o.issue, o.note));
   } else {
     if (!o.role) throw new Error('Pick an employee or a role to hire');
@@ -832,7 +870,7 @@ function onNewApproval(a: Approval): void {
   const e = emps.get(a.employeeId);
   if (!e) return;
   if (isMac(e) && a.kind === 'plan') e.plan = { text: a.text ?? '', commands: planCommands(a.text ?? '') };
-  e.state = 'needs-you';
+  if (e.state !== 'talking') e.state = 'needs-you'; // Talk keeps its state: the terminal is open on that session
   emit(e);
   notify(e, a.text ?? a.tool);
 }
