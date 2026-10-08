@@ -48,6 +48,9 @@ const docs = new Map<string, Doc>();
 const dirty = (d: Doc): boolean => d.model.getAlternativeVersionId() !== d.saved;
 const base = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
 const rel = (d: Doc, path: string): string => (path.startsWith(d.root + '/') ? path.slice(d.root.length + 1) : path);
+/** Images and PDFs open to view, not edit: main.ts serves them from app://myide/view (project and worktree files only). */
+const VIEWABLE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf)$/i;
+const viewable = (p: string): boolean => VIEWABLE.test(p);
 
 async function load(path: string): Promise<Doc> {
   const have = docs.get(path);
@@ -190,7 +193,8 @@ registerPanel('editor', {
       if (current) void api.code.openIn(ide, current, editor.getPosition()?.lineNumber ?? 1);
     }, { title: `Open this file in ${ide} at the cursor line` }))));
     const body = h('div', { className: 'ed-body' });
-    el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), diskBar, body, status);
+    const viewer = h('div', { className: 'ed-view', hidden: true }); // an image or a PDF in place of the editor
+    el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), diskBar, body, viewer, status);
 
     const editor = monaco.editor.create(body, { ...EDITOR_OPTIONS, model: null });
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => void save());
@@ -216,17 +220,44 @@ registerPanel('editor', {
         return tab;
       }));
       const d = current ? docs.get(current) : undefined;
-      pathEl.textContent = d && current ? rel(d, current) : '';
+      pathEl.textContent = d && current ? rel(d, current) : current ?? '';
       wt.textContent = d?.branch ? `on ${d.branch}` : '';
       panel.setTitle(current ? `${d && dirty(d) ? '● ' : ''}${base(current)}` : 'Editor');
-      send.disabled = !current;
+      send.disabled = !current || viewable(current);
       diskBar.hidden = !d?.theirs;
     }
 
+    /** An image (fit to the panel; click for actual size) or a PDF (Chromium's viewer), read fresh from disk each time. */
+    function view(path: string): void {
+      const src = `/view?path=${encodeURIComponent(path)}&t=${Date.now()}`;
+      let shown: HTMLElement;
+      if (/\.pdf$/i.test(path)) shown = h('iframe', { className: 'ed-pdf', src, title: base(path) });
+      else {
+        const img = h('img', { className: 'ed-img', src, alt: base(path), title: 'Click for actual size' });
+        img.onload = () => say(`${base(path)}: ${img.naturalWidth} × ${img.naturalHeight} px. View only.`);
+        img.onerror = () => say(`Could not show ${base(path)}.`);
+        img.onclick = () => img.classList.toggle('is-actual');
+        shown = img;
+      }
+      viewer.replaceChildren(shown);
+      viewer.hidden = false;
+      body.hidden = true;
+      editor.setModel(null);
+      current = path;
+      open.add(path);
+      if (/\.pdf$/i.test(path)) say(`${base(path)}: view only.`);
+      drawTabs();
+      remember();
+    }
+
     async function show(path: string, line?: number): Promise<void> {
+      if (viewable(path)) return view(path);
       let d: Doc;
       try { d = await load(path); } catch (e) { say(`Could not open ${base(path)}: ${errText(e)}`); return; }
       open.add(path);
+      viewer.replaceChildren();
+      viewer.hidden = true;
+      body.hidden = false;
       if (current !== path) { editor.setModel(d.model); current = path; }
       if (line) {
         editor.revealLineInCenter(line);
@@ -252,7 +283,8 @@ registerPanel('editor', {
       if (current === path) {
         current = null;
         const next = [...open].pop();
-        if (next) await show(next); else editor.setModel(null);
+        if (next) await show(next);
+        else { editor.setModel(null); viewer.replaceChildren(); viewer.hidden = true; body.hidden = false; }
       }
       drawTabs();
       remember();
@@ -304,7 +336,10 @@ registerPanel('editor', {
     const saved = Array.isArray(params.files) ? (params.files as string[]) : [];
     const orphans = [...docs.keys()].filter((p) => dirty(docs.get(p)!));
     void (async () => {
-      for (const p of [...saved, ...orphans]) if (!open.has(p)) { try { await load(p); open.add(p); } catch { /* moved or deleted */ } }
+      for (const p of [...saved, ...orphans]) {
+        if (open.has(p)) continue;
+        try { if (viewable(p) ? await api.code.exists(p) : await load(p)) open.add(p); } catch { /* moved or deleted */ }
+      }
       const active = typeof params.active === 'string' && open.has(params.active) ? params.active : [...open].pop();
       if (active) await show(active); else drawTabs();
     })();

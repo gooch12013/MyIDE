@@ -693,6 +693,12 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .ed-wt, .rv-base { font-size: var(--fs-xs); color: var(--lcd-dim); }
 .ed-keys { display: flex; flex-wrap: wrap; gap: var(--sp-3); margin-left: auto; align-items: center; }
 .ed-body, .rv-diff { position: relative; flex: 1; min-height: 0; min-width: 0; }
+.ed-body[hidden], .ed-view[hidden] { display: none; }
+/* An image or PDF opened from the editor: view only. An image fits the panel; a click shows it at actual size. */
+.ed-view { flex: 1; min-height: 0; display: grid; place-items: center; overflow: auto; background: var(--well); }
+.ed-img { max-width: 100%; max-height: 100%; object-fit: contain; cursor: zoom-in; background: repeating-conic-gradient(#1b1f25 0 25%, #0e1014 0 50%) 0 0 / 16px 16px; }
+.ed-img.is-actual { max-width: none; max-height: none; cursor: zoom-out; align-self: start; justify-self: start; }
+.ed-pdf { width: 100%; height: 100%; border: 0; place-self: stretch; }
 .ed-status { flex: none; margin: 0; padding: 4px 10px; border-top: 1px solid var(--line); background: var(--well-row); font-size: var(--fs-xs); color: var(--ink-3); min-height: 24px; overflow-wrap: anywhere; }
 .rv-body { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(140px, 240px) minmax(0, 1fr); }
 .rv-files { list-style: none; margin: 0; padding: var(--sp-3); overflow: auto; border-right: 1px solid var(--line); }

@@ -13,7 +13,7 @@ import { STATE_DIR } from './store';
 import { registerEmployeesIpc, stopAllTurns } from './employees';
 import { registerAiIpc } from './transports';
 import { registerForgeIpc } from './forge';
-import { registerGitIpc } from './git';
+import { allowed, registerGitIpc } from './git';
 import { registerComponentsIpc } from './components';
 import { registerSpeechIpc, stop as stopSpeech } from './speech';
 import { registerButtonsIpc } from './buttons';
@@ -68,7 +68,8 @@ function createMainWindow(): void {
     title: 'MyIDE',
     backgroundColor: '#111317',
     titleBarStyle: 'hiddenInset',
-    webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    // plugins: Chromium's PDF viewer, for PDFs opened in the editor (app://myide/view below).
+    webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, plugins: true },
   });
   mainWindow.on('close', (e) => {
     if (quitting) return;
@@ -111,8 +112,27 @@ app.on('web-contents-created', (_e, wc) => {
   });
 });
 
+// What the editor views rather than edits: images and PDFs, served as /view?path=<absolute path> from inside a project
+// or a MyIDE worktree only (git.ts allowed, the same rule as the editor's reads).
+const VIEW: Record<string, string> = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif',
+  bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml', pdf: 'application/pdf',
+};
+async function view(url: URL): Promise<Response> {
+  const path = url.searchParams.get('path');
+  const type = VIEW[path?.split('.').pop()?.toLowerCase() ?? ''];
+  if (!type || !allowed(path)) return new Response('Not found', { status: 404 });
+  const r = await net.fetch(pathToFileURL(path).toString()).catch(() => null);
+  if (!r?.ok) return new Response('Not found', { status: 404 });
+  // An SVG runs no script, even if something loads it as a page.
+  const headers: Record<string, string> = { 'content-type': type, 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' };
+  if (type === 'image/svg+xml') headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+  return new Response(r.body, { headers });
+}
+
 app.whenReady().then(() => {
   protocol.handle('app', (req) => {
+    if (new URL(req.url).pathname === '/view') return view(new URL(req.url));
     const file = normalize(join(RENDERER, decodeURIComponent(new URL(req.url).pathname)));
     if (!file.startsWith(RENDERER + sep)) return new Response('Not found', { status: 404 });
     return net.fetch(pathToFileURL(file).toString());
