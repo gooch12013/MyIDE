@@ -3,7 +3,8 @@ import { attachBox, imagePaths, thumb, workImages } from './attach';
 import { errText, h, key } from './dom';
 import { linkify } from './editor';
 import { micButton, speakButton } from './speech';
-import { api, chip, cue, led, openEmployees, type Employee } from './employees';
+import { api, chip, cue, led, needCard, openEmployee, openEmployees, type Employee } from './employees';
+import { draftCard } from './issues';
 import { ceilingNote, fmtPick, modelPicker, modePicker } from './hire';
 import { allProjects } from './projects';
 import { registerPanel } from './registry';
@@ -139,8 +140,44 @@ registerPanel('employee', {
         h('button', { type: 'button', className: 'btn rm', textContent: 'Fire, remove worktree', onclick: doFire(true) }))));
 
     const box = (title: string, ...kids: Node[]) => h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: title }), ...kids);
-    el.append(head, statusBlock, lastBlock, grip, lastShots, h('div', { className: 'emp-grid' },
-      h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, micButton(msg, say), send), sent)),
+    // Everything waiting on David from this employee and, for a lead, from everyone under it: NEEDS YOU cards and
+    // drafted issues, answered here. Cards are kept by id across redraws. A lead also lists its reports.
+    const needs = h('section', { className: 'needs emp-needs' });
+    needs.setAttribute('aria-label', 'Needs you');
+    needs.hidden = true;
+    const reports = h('ul', { className: 'emp-reports' });
+    const reportsBox = h('section', { className: 'box' }, h('h2', { className: 'legend box-title', textContent: 'Reports' }), reports);
+    reportsBox.hidden = true;
+    const needCards = new Map<string, HTMLElement>();
+    let drawSeq = 0;
+    const drawNeeds = async () => {
+      const n = ++drawSeq;
+      const [pendingList, everyone, forges] = await Promise.all([api.approvals.list(), api.employees.list(), api.forge.issues().catch(() => [])]);
+      if (n !== drawSeq) return;
+      const team = new Set([id]);
+      for (let grew = true; grew;) {
+        grew = false;
+        for (const x of everyone) if (x.parentId && team.has(x.parentId) && !team.has(x.id)) { team.add(x.id); grew = true; }
+      }
+      const nameOf = (eid: string) => everyone.find((x) => x.id === eid)?.name ?? 'This employee';
+      const live = new Set<string>();
+      const keep = (k: string, make: () => HTMLElement) => { const c = needCards.get(k) ?? make(); needCards.set(k, c); live.add(k); return c; };
+      const cards = [
+        ...pendingList.filter((a) => team.has(a.employeeId)).map((a) => keep(`a:${a.id}`, () => needCard(a, nameOf(a.employeeId), undefined))),
+        ...forges.flatMap((f) => f.drafts.filter((d) => team.has(d.employeeId)).map((d) => keep(`d:${d.id}`, () => draftCard(f, d)))),
+      ];
+      for (const k of needCards.keys()) if (!live.has(k)) needCards.delete(k);
+      needs.replaceChildren(...cards);
+      needs.hidden = !cards.length;
+      const mine = everyone.filter((x) => x.parentId === id);
+      reports.replaceChildren(...mine.map((x) => h('li', { className: 'emp-report' }, led(x.state),
+        key(x.name, () => void openEmployee(x.id), { title: `Open ${x.name}: message, approve, fire` }), chip(x),
+        h('span', { className: 'emp-report-cue', textContent: cue(x).text }))));
+      reportsBox.hidden = !mine.length;
+    };
+    void drawNeeds();
+    el.append(head, needs, statusBlock, lastBlock, grip, lastShots, h('div', { className: 'emp-grid' },
+      h('div', { className: 'emp-col' }, box('Cue list', cues), box('Message', msg, attach.el, h('div', { className: 'pref-ctl' }, micButton(msg, say), send), sent), reportsBox),
       h('div', { className: 'emp-col' }, box('Model & effort', aiLine, mode.el, pick.el, pending, held, ceil), box('Worktree', tree), transcript)),
     status, fireSheet);
 
@@ -199,6 +236,10 @@ registerPanel('employee', {
     const offs = [
       api.employees.onChange((e) => { if (e.id === id) render(e); }),
       api.employees.onRemoved((gone) => { if (gone === id) panel.close(); }),
+      api.approvals.onChange(() => void drawNeeds()),
+      api.forge.onChange(() => void drawNeeds()),
+      api.employees.onChange((e) => { if (e.id === id || e.parentId === id) void drawNeeds(); }),
+      api.employees.onRemoved(() => void drawNeeds()),
     ];
     return { dispose() { offs.forEach((off) => off()); openEmployees.delete(id); } };
   },

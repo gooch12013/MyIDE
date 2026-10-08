@@ -7,7 +7,7 @@ import { stripAttribution } from './attribution';
 import { assignIssue, listEmployees, tell } from './employees';
 import { componentPath } from './components';
 import { getToken, removeToken, setToken } from './keychain';
-import { addApproval, onIssuePost, registerEmployeeTool } from './mcp';
+import { onIssuePost, registerEmployeeTool } from './mcp';
 import { listProjects, readConfig, writeConfig, type Project } from './projects';
 import { detect, type Detected } from './remotes';
 import { spawnEnv } from './pty';
@@ -486,7 +486,7 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
     changed(emp.projectId);
     return 'Drafted. Nothing was posted; it waits in NEEDS YOU until David files it.';
   }
-  if (action === 'close') return askToClose(emp, a);
+  if (action === 'close') return closeIssue(emp, a);
   const iss = emp.issue;
   if (!iss) throw new Error('You hold no issue, so there is nothing to write back to.');
   if (action === 'comment') {
@@ -505,25 +505,17 @@ export async function forgeAction(emp: Holder, action: string, args: any): Promi
   throw new Error(`No forge action "${action}".`);
 }
 
-/** close never happens on an employee's word. David sees the issue, the reason and the comment on a card; on Approve
- *  the comment is posted and then the issue closed (in that order, through the outbox), and the employee is told. */
-function askToClose(emp: Holder, a: any): string {
+/** close: David tells the employee to close an issue, so it goes straight out through the outbox, the comment first
+ *  (a reporter email quotes only a recent one), then the close. Any issue of the project; the held one by default. */
+async function closeIssue(emp: Holder, a: any): Promise<string> {
   const number = a.number === undefined ? emp.issue?.number : Number(a.number);
   if (!number || !Number.isInteger(number) || number < 1) throw new Error('Name the issue: close {number, comment, reason}.');
-  const reason = a.reason === 'not_planned' ? 'not_planned' : 'completed';
+  // Asked twice: the second would post the comment again to an issue already closed.
+  if (cache(emp.projectId).issues.find((i) => i.number === number)?.state === 'closed') return `#${number} is already closed; nothing was posted.`;
   const comment = strip(a.comment);
-  linked(emp.projectId);
-  addApproval({
-    employeeId: emp.id, tool: 'close_issue', input: { number, reason, comment }, kind: 'permission',
-    text: `Close #${number} as ${reason === 'completed' ? 'completed' : 'not planned'}${comment ? `, posting this comment first:\n\n${comment}` : ', with no comment.'}`,
-  }, (allow) => {
-    if (!allow) return tell(emp.id, `David did not approve closing #${number}, so it stays open.`);
-    (async () => {
-      if (comment) await write(emp.projectId, 'comment', number, { body: comment }, emp.id);
-      return write(emp.projectId, 'close', number, { reason }, emp.id);
-    })().then((r) => tell(emp.id, `David approved closing #${number}. ${r.msg}`), (e) => tell(emp.id, `Closing #${number} failed: ${(e as Error).message}`));
-  });
-  return `Asked David to approve closing #${number}. His answer arrives as your next turn, so don't wait or poll.`;
+  const said = comment ? (await write(emp.projectId, 'comment', number, { body: comment }, emp.id)).msg : '';
+  const closed = (await write(emp.projectId, 'close', number, { reason: a.reason === 'not_planned' ? 'not_planned' : 'completed' }, emp.id)).msg;
+  return [said, closed].filter(Boolean).join(' ');
 }
 
 /** On assignment: a start comment, the token owner as assignee and an "in progress" label. Throws once, after trying all three. */
@@ -671,7 +663,7 @@ export function registerForgeIpc(): void {
     'The project\'s GitHub or Forgejo, through MyIDE. Reads: list_issues {state: open|closed|all, labels, assignee (a login or "none")}, '
     + 'get_issue {number} (body, comments, linked PRs), list_prs (open PRs, head branch, checks), pr_status {number} (mergeable, checks, reviews). '
     + 'Writes, to the issue you hold: comment, open_pr (put "Closes #N" in the body, or "Refs #N" to leave the issue open), set_labels. '
-    + 'close {number (default: the issue you hold), comment, reason: completed or not_planned}: waits for David to approve; the comment is posted just before the close. '
+    + 'close {number (default: the issue you hold), comment, reason: completed or not_planned}: posts the comment, then closes; only when David has told you to close it. '
     + 'draft_issue {title, body, labels}: David files it.',
     { type: 'object', properties: { action: { type: 'string', enum: [...READS, 'comment', 'open_pr', 'set_labels', 'close', 'draft_issue'] }, args: { type: 'object' } }, required: ['action'] },
     async (employeeId, a) => {

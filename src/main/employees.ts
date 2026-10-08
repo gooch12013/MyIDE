@@ -345,8 +345,9 @@ function finish(e: Emp, r: Result): void {
   else if (r.ok) e.state = e.pending.length ? 'queued' : 'done';
   else { e.state = 'failed'; e.error = r.text || 'The turn failed.'; }
   if (e.state === 'queued' && e.paused) e.state = 'interrupted'; // its waiting turns wait for David (runaway pause)
-  // The CLI gave up waiting (approve answered deny), but David still has to answer it.
-  if (e.state !== 'talking' && pendingApprovals().some((a) => a.employeeId === e.id && a.timedOut)) {
+  // Something still waits on David: a call the CLI gave up waiting for, or a card made outside the turn (a hire
+  // over the cap, a model above the ceiling). The turn ending must not hide it behind 'done'.
+  if (e.state !== 'talking' && pendingApprovals().some((a) => a.employeeId === e.id)) {
     e.ended = e.state;
     e.state = 'needs-you';
     broadcast('approvals:change', pendingApprovals()); // the renderer learns timedOut here
@@ -635,7 +636,7 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
 const TRIAGE = 'How to read the issue: its title, every comment and its linked PRs together are the issue, and the title alone can be the whole spec. '
   + 'Verify the behaviour it names against the code. Never judge it, close it or call it stale or done by its body. '
   + 'If you find it already done or not planned, stop and say so with ask_human, citing file and line; David decides. '
-  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue). Write to the forge only through the forge tool (comment, open_pr, set_labels, draft_issue). Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). To close an issue yourself use forge close, which David approves first.';
+  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue). Write to the forge only through the forge tool (comment, open_pr, set_labels, draft_issue). Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). When David tells you to close an issue, use forge close.';
 
 function issuePrompt(i: Issue, note?: string): string {
   return [`Work on ${i.repo}#${i.number}: ${i.title}`, i.url, note ?? '', TRIAGE].filter(Boolean).join('\n\n');

@@ -416,6 +416,10 @@ html { font-size: calc(var(--ui-font-size, 14px) / 0.875); } /* body text is 0.8
 .emp-grip { height: 8px; margin: -4px 0 0; cursor: ns-resize; border-radius: 4px; background: linear-gradient(var(--chassis-edge), var(--chassis-edge)) center / 36px 2px no-repeat; touch-action: none; }
 .emp-grip:hover, .emp-grip:focus-visible { background-color: var(--well); outline: none; }
 .emp-said--last:has(.emp-last:empty) + .emp-grip { display: none; }
+.emp-needs { margin-bottom: var(--sp-4); }
+.emp-reports { display: grid; gap: var(--sp-2); margin: 0; padding: 0; list-style: none; }
+.emp-report { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); }
+.emp-report-cue { flex: 1 1 100%; font-size: var(--fs-xs); color: var(--ink-3); overflow-wrap: anywhere; }
 .emp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: var(--sp-4); align-items: start; }
 .emp-col { display: grid; gap: var(--sp-4); min-width: 0; }
 .box { display: grid; gap: var(--sp-3); padding: var(--sp-5); background: var(--chassis-face); border: 1px solid var(--chassis-edge); border-radius: var(--r-well); box-shadow: 0 2px 6px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.05); }
