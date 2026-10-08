@@ -49,7 +49,7 @@ const dirty = (d: Doc): boolean => d.model.getAlternativeVersionId() !== d.saved
 const base = (p: string): string => p.slice(p.lastIndexOf('/') + 1);
 const rel = (d: Doc, path: string): string => (path.startsWith(d.root + '/') ? path.slice(d.root.length + 1) : path);
 /** Images and PDFs open to view, not edit: main.ts serves them from app://myide/view (project and worktree files only). */
-const VIEWABLE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf)$/i;
+const VIEWABLE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|heic|heif|pdf)$/i;
 const viewable = (p: string): boolean => VIEWABLE.test(p);
 
 async function load(path: string): Promise<Doc> {

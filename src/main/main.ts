@@ -1,6 +1,10 @@
 import { app, BrowserWindow, net, protocol } from 'electron';
+import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import { join, normalize, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { killAllPtys, registerPtyIpc } from './pty';
 import { registerLayoutIpc, savedPanelIds } from './layouts';
 import { buildMenu, registerMenu } from './menu';
@@ -116,16 +120,34 @@ app.on('web-contents-created', (_e, wc) => {
 // or a MyIDE worktree only (git.ts allowed, the same rule as the editor's reads).
 const VIEW: Record<string, string> = {
   png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', avif: 'image/avif',
-  bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml', pdf: 'application/pdf',
+  bmp: 'image/bmp', ico: 'image/x-icon', svg: 'image/svg+xml', pdf: 'application/pdf', heic: 'image/heic', heif: 'image/heif',
 };
+// Chromium can't decode HEIC, so macOS's own sips turns it into a JPEG, kept in the temp folder until the file changes.
+const heicRuns = new Map<string, Promise<string>>();
+function heicJpeg(path: string): Promise<string> {
+  const st = statSync(path);
+  const out = join(app.getPath('temp'), 'myide-heic', `${createHash('sha256').update(`${path}\0${st.size}\0${st.mtimeMs}`).digest('hex')}.jpg`);
+  if (existsSync(out)) return Promise.resolve(out);
+  let run = heicRuns.get(out); // one conversion per file, however many ask at once
+  if (!run) {
+    mkdirSync(join(app.getPath('temp'), 'myide-heic'), { recursive: true, mode: 0o700 });
+    run = promisify(execFile)('/usr/bin/sips', ['-s', 'format', 'jpeg', path, '--out', `${out}.part.jpg`], { timeout: 60_000 })
+      .then(() => { renameSync(`${out}.part.jpg`, out); return out; })
+      .finally(() => heicRuns.delete(out));
+    heicRuns.set(out, run);
+  }
+  return run;
+}
 async function view(url: URL): Promise<Response> {
   const path = url.searchParams.get('path');
   const type = VIEW[path?.split('.').pop()?.toLowerCase() ?? ''];
   if (!type || !allowed(path)) return new Response('Not found', { status: 404 });
-  const r = await net.fetch(pathToFileURL(path).toString()).catch(() => null);
+  const heic = type === 'image/heic' || type === 'image/heif';
+  const file = heic ? await heicJpeg(path).catch(() => null) : path;
+  const r = file ? await net.fetch(pathToFileURL(file).toString()).catch(() => null) : null;
   if (!r?.ok) return new Response('Not found', { status: 404 });
   // An SVG runs no script, even if something loads it as a page.
-  const headers: Record<string, string> = { 'content-type': type, 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' };
+  const headers: Record<string, string> = { 'content-type': heic ? 'image/jpeg' : type, 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' };
   if (type === 'image/svg+xml') headers['content-security-policy'] = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
   return new Response(r.body, { headers });
 }
