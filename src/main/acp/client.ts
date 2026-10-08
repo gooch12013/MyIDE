@@ -54,7 +54,7 @@ const HARD_DENY = [
 ];
 /** Commands a Codex employee may never run, whatever David would answer: forge access goes through the forge tool,
  *  commits through the attribution hook. ponytail: regexes over the command text; a deliberately obfuscated command
- *  (eval, base64) gets past them, and the sandbox's network block is the backstop. */
+ *  (eval, base64) gets past them, and since the sandbox has network (for web fetches) nothing else stops it. */
 export const hardDenied = (command: string): boolean => HARD_DENY.some((r) => r.test(command));
 
 /** The command line a permission prompt is about: Codex sends it as rawInput.command (string or argv); Gemini sends

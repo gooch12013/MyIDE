@@ -44,20 +44,22 @@ export function geminiHome(dir: string): void {
 
 // Gemini CLI passes its whole env to shell commands unless redaction is on (packages/core/src/services/environmentSanitization.ts,
 // off by default): on, a name with KEY, TOKEN, AUTH... is dropped, GEMINI_API_KEY with it. SSH_AUTH_SOCK is kept for git over ssh.
+const WEB = ['google_web_search', 'web_fetch', 'run_shell_command(curl)', 'run_shell_command(wget)'];
 const REDACT = { enabled: true, blocked: ['GEMINI_API_KEY'], allowed: ['SSH_AUTH_SOCK'] };
 
 /** MyIDE's settings for a turn, passed as GEMINI_CLI_SYSTEM_SETTINGS_PATH, which wins over the user's and the workspace's.
  *  MyIDE's MCP server (ACP mcpServers has no timeout or trust field): trusted, so MyIDE's own tools never ask; a 15 min
  *  timeout, so a NEEDS YOU card can wait on David; `approve` hidden, it is Claude's permission hook. Folder trust is off
  *  (see geminiHome), so a repo's .gemini/settings.json is read: mcp.allowed and tools.allowed (replace-merged in
- *  settingsSchema.ts, so these win) keep it from adding an MCP server or auto-allowing a tool, and the env redaction keeps
+ *  settingsSchema.ts, so these win) keep it from adding an MCP server or auto-allowing any tool but web search and fetch
+ *  (David's call: every employee searches and fetches without asking), and the env redaction keeps
  *  the API key out of shell commands. Same file as the --mcp-config, plus ".gemini.json". */
 function systemSettings(mcpConfigPath: string): { file: string; servers: string[] } {
   const servers = JSON.parse(readFileSync(mcpConfigPath, 'utf8')).mcpServers ?? {};
   const mcpServers = Object.fromEntries(Object.entries(servers).map(([name, s]: [string, any]) =>
     [name, { httpUrl: String(s.url), timeout: MCP_TOOL_TIMEOUT_MS, trust: true, excludeTools: ['approve'] }]));
   const file = `${mcpConfigPath}.gemini.json`;
-  writePrivate(file, JSON.stringify({ mcpServers, mcp: { allowed: Object.keys(mcpServers) }, tools: { allowed: [] }, security: { environmentVariableRedaction: REDACT } }));
+  writePrivate(file, JSON.stringify({ mcpServers, mcp: { allowed: Object.keys(mcpServers) }, tools: { allowed: WEB }, security: { environmentVariableRedaction: REDACT } }));
   return { file, servers: Object.keys(mcpServers) };
 }
 

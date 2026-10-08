@@ -68,7 +68,9 @@ const codexLaunch: AcpLaunch = {
     if (!codex) throw new Error('Codex is not installed (no codex on your PATH).');
     const servers = mcpServers(o.mcpConfigPath);
     // workspace-write: on-request approvals reviewed by the user (David, via NEEDS YOU), not Codex's own auto review.
-    const adapterEnv = { ...env, CODEX_PATH: codex, INITIAL_AGENT_MODE: 'workspace-write', CODEX_CONFIG: JSON.stringify({ mcp_servers: servers }) };
+    // Live web search, and network inside the sandbox so curl and package installs fetch without asking (David's call).
+    const config = { mcp_servers: servers, web_search: 'live', sandbox_workspace_write: { network_access: true } };
+    const adapterEnv = { ...env, CODEX_PATH: codex, INITIAL_AGENT_MODE: 'workspace-write', CODEX_CONFIG: JSON.stringify(config) };
     const child: UtilityProcess = utilityProcess.fork(HOST, [ADAPTER], { env: adapterEnv, cwd: o.cwd, stdio: ['ignore', 'ignore', 'pipe'], serviceName: 'Codex ACP' });
     child.stderr?.on('data', (d) => io.stderr(String(d)));
     child.once('exit', (code) => io.exit(code));

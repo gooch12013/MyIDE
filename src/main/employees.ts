@@ -112,11 +112,12 @@ const MAC_RULES = 'You work on David\'s Mac itself (shell, files, settings, his 
 const SECRETS = ['.ssh/id_*', '.ssh/*key*', '.appstoreconnect/**', '.config/googleplay/**', '.codex/auth.json', '.gemini/**', '.claude.json',
   '.claude/.credentials*', '.aws/**', '.netrc', '.config/gh/hosts.yml', 'Library/Keychains/**'];
 function macSettings(e: Emp): object {
-  const base = employeeSettings() as { permissions: { deny: string[] } };
+  const base = employeeSettings() as { permissions: { allow: string[]; deny: string[] } };
   const post = (fail: string) => `curl -sf --max-time 60 -H 'Content-Type: application/json' --data-binary @- '${hookUrl(e.id)}' >/dev/null 2>&1 || ${fail}`;
   return {
     ...base,
-    permissions: { ...base.permissions, deny: [...base.permissions.deny,
+    // Web search and fetch run free; curl and wget can write files, so on This Mac they wait for the plan's GO like any command.
+    permissions: { ...base.permissions, allow: base.permissions.allow.filter((r) => !/^Bash\((curl|wget) /.test(r)), deny: [...base.permissions.deny,
       // The journal, the to-do logs, and the folder's own project settings (an allow rule written there would apply next turn).
       ...[join(STATE_DIR, 'journal/**'), join(STATE_DIR, 'todos/**'), join(MAC.path, '.claude/**')].flatMap((g) => ['Edit', 'Write'].map((t) => `${t}(/${g})`)),
       ...SECRETS.map((g) => `Read(/${join(homedir(), g)})`),
@@ -445,8 +446,9 @@ function employeeSettings(): object {
   return {
     attribution: { commit: '', pr: '' },
     permissions: {
-      // David's call: employees run the full gh and tea CLIs with no prompt. The forge tool stays for its outbox and the issue cue.
-      allow: ['Bash(gh *)', 'Bash(tea *)'],
+      // David's calls: employees run the full gh and tea CLIs, and search and fetch from the web, with no prompt.
+      // The forge tool stays for its outbox and the issue cue.
+      allow: ['Bash(gh *)', 'Bash(tea *)', 'WebSearch', 'WebFetch', 'Bash(curl *)', 'Bash(wget *)'],
       ask: [HF_SERVER],
       deny: [
         // The commit-msg hook strips attribution; skipping hooks would skip that.
