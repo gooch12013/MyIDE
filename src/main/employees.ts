@@ -395,11 +395,10 @@ function employeeSettings(): object {
   return {
     attribution: { commit: '', pr: '' },
     permissions: {
+      // David's call: employees run the full gh and tea CLIs with no prompt. The forge tool stays for its outbox and the issue cue.
+      allow: ['Bash(gh *)', 'Bash(tea *)'],
       ask: [HF_SERVER],
       deny: [
-        // Forge access goes through MyIDE's forge tool only.
-        'Bash(gh *)', 'Bash(env gh *)', 'Bash(command gh *)', 'Bash(*/gh *)', 'Bash(tea *)', 'Bash(curl *api.github.com*)',
-        'Bash(* gh *)', 'Bash(bash -c *gh *)', 'Bash(sh -c *gh *)', 'Bash(* tea *)', 'Bash(bash -c *tea *)', 'Bash(sh -c *tea *)',
         // The commit-msg hook strips attribution; skipping hooks would skip that.
         'Bash(git commit --no-verify*)', 'Bash(git commit *--no-verify*)', 'Bash(git commit *--no-v*)', 'Bash(git commit -n*)', 'Bash(git commit * -n*)',
         'Bash(git * --no-verify*)', 'Bash(git -c *)',
@@ -636,7 +635,7 @@ async function fire(id: string, o: { removeWorktree?: boolean }): Promise<void> 
 const TRIAGE = 'How to read the issue: its title, every comment and its linked PRs together are the issue, and the title alone can be the whole spec. '
   + 'Verify the behaviour it names against the code. Never judge it, close it or call it stale or done by its body. '
   + 'If you find it already done or not planned, stop and say so with ask_human, citing file and line; David decides. '
-  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue). Write to the forge only through the forge tool (comment, open_pr, set_labels, draft_issue). Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). When David tells you to close an issue, use forge close.';
+  + 'Read the issue, its comments and linked PRs with the forge tool (get_issue) or gh. Write with either: the forge tool (comment, open_pr, set_labels, close, draft_issue) or gh. Open the PR with "Closes #N" in its body (or "Refs #N" if your role says issues close by hand). Close an issue when David tells you to.';
 
 function issuePrompt(i: Issue, note?: string): string {
   return [`Work on ${i.repo}#${i.number}: ${i.title}`, i.url, note ?? '', TRIAGE].filter(Boolean).join('\n\n');
