@@ -20,6 +20,12 @@ import type { Draft, Reply } from '../main/role-file';
 import type { Ctx } from '../main/wizard';
 import type { Todo } from '../main/todos';
 
+/** forge:issue's answer (forge.ts get_issue). `note` is set when the forge was down and this is the cached copy. */
+export type IssueDetail = {
+  number: number; title: string; state: string; labels: string[]; assignees: string[]; author?: string; url: string; updated?: string;
+  employee?: string; body?: string; comments?: { author: string; at: string; body: string }[];
+  prs?: { number: number; url: string; state: string; title?: string }[]; note?: string;
+};
 export type OrgState = {
   caps: { global: number; perProject: number; maxReports: number; maxDepth: number };
   projects: (ProjectOrg & { id: string; priority: number; paused: boolean; maxDepth: number })[];
@@ -182,6 +188,11 @@ const api = {
     view: (scope: string): Promise<unknown> => ipcRenderer.invoke('forge:view', scope),
     setView: (scope: string, view: unknown): Promise<void> => ipcRenderer.invoke('forge:set-view', scope, view),
     onChange: (cb: (projectId: string) => void) => on('forge:change', cb),
+    /** One issue with its comments and linked PRs, read live; a cached copy without comments when the forge is down. */
+    issue: (projectId: string, number: number): Promise<IssueDetail> => ipcRenderer.invoke('forge:issue', projectId, number),
+    /** David's comment and close from the Issue panel, posted as him through the outbox. */
+    comment: (projectId: string, number: number, body: string): Promise<{ msg: string }> => ipcRenderer.invoke('forge:comment', projectId, number, body),
+    close: (projectId: string, number: number): Promise<{ msg: string }> => ipcRenderer.invoke('forge:close', projectId, number),
   },
   // Code: the editor's files (inside a project or a MyIDE worktree only), the git tree, review and merge.
   code: {

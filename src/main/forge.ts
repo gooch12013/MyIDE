@@ -448,7 +448,12 @@ async function forgeRead(id: string, action: string, a: any): Promise<unknown> {
     } catch (e) {
       const i = cache(id).issues.find((x) => x.number === n);
       if (!(e instanceof Offline) || !i) throw e;
-      return { ...i, employee: holders.get(n), pr: prState(mine), note: `Forge unreachable; cached copy without comments. ${e.message}` };
+      // The same shape as the live answer, so a reader never meets the cache's comment count or field names.
+      return {
+        number: i.number, title: i.title, state: i.state, labels: i.labels, assignees: i.assignees, author: i.author, url: i.url, updated: i.updatedAt,
+        employee: holders.get(n), body: i.body, comments: [], prs: mine ? [{ number: mine.number, url: mine.url, state: prState(mine) }] : [],
+        note: `Forge unreachable; cached copy without comments. ${e.message}`,
+      };
     }
   }
   if (action === 'list_prs') {
@@ -727,6 +732,18 @@ export function registerForgeIpc(): void {
   handle('forge:set-view', (scope: string, view: unknown) => {
     if (!view || typeof view !== 'object' || JSON.stringify(view).length > 200_000) throw new Error('Bad view');
     writeJSON(viewFile(scope), view);
+  });
+  // The Issue panel: one issue with its comments and linked PRs, and David's own comment and close from it (as him, through the outbox).
+  handle('forge:issue', (projectId: string, number: number) => forgeRead(projectId, 'get_issue', { number }));
+  handle('forge:comment', (projectId: string, number: number, body: string) => {
+    const b = strip(body);
+    if (!b) throw new Error('The comment is empty.');
+    return write(projectId, 'comment', num(number, 'issue'), { body: b });
+  });
+  handle('forge:close', (projectId: string, number: number) => {
+    const n = num(number, 'issue');
+    if (cache(projectId).issues.find((i) => i.number === n)?.state === 'closed') return { msg: `#${n} is already closed.` };
+    return write(projectId, 'close', n, { reason: 'completed' });
   });
   handle('forge:discard-draft', (projectId: string, id: string) => {
     update(projectId, (c) => { c.drafts = c.drafts.filter((x) => x.id !== id); });

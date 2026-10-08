@@ -4,11 +4,12 @@ import { attachBox } from './attach';
 import { ask, errText, h, key, sheet } from './dom';
 import { chip, cueOf, led, openEmployee, stateName, steps, type Employee } from './employees';
 import type { Project } from '../main/projects';
-import type { OrgState } from '../preload/preload';
+import type { IssueDetail, OrgState } from '../preload/preload';
 import { allProjects, scopeOf } from './projects';
 import { openPanel, registerPanel } from './registry';
+import type { DockviewPanelApi } from 'dockview-core';
 import { micButton } from './speech';
-import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, STATUSES, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
+import { arrange, DEFAULT_VIEW, fullOrder, grouped, GROUPS, move, SORTS, splitUrls, STATUSES, viewOf, type Group, type Row, type Sort, type View } from './issue-view';
 
 const api = window.myide;
 type Issue = ForgeSnapshot['issues'][number];
@@ -198,7 +199,7 @@ function issueRow(s: ForgeSnapshot, i: Issue, emps: Linked[], all: boolean, paus
   row.append(
     h('div', { className: 'iss-line' },
       h('span', { className: 'iss-ref', textContent: `#${i.number}` }),
-      h('button', { type: 'button', className: 'iss-title', textContent: i.title, title: `Open #${i.number} on ${FORGE[s.provider]}`, onclick: () => void api.terminal.openUrl(i.url) }),
+      h('button', { type: 'button', className: 'iss-title', textContent: i.title, title: `Open #${i.number}`, onclick: () => openIssue(s.projectId, i.number) }),
       h('span', { className: 'iss-age', textContent: [all && p ? p.name : '', i.state === 'closed' ? 'closed' : '', i.comments ? `${i.comments} comment${i.comments === 1 ? '' : 's'}` : '', age(i.updatedAt)].filter(Boolean).join(' · ') })),
     h('div', { className: 'iss-line iss-line--meta' },
       emp ? h('button', { type: 'button', className: 'iss-emp', textContent: emp.name, title: `Open ${emp.name}`, onclick: () => openEmployee(emp.id) })
@@ -593,3 +594,117 @@ export function forgesSection(say: (t: string) => void): Node[] {
   return [box];
 }
 
+
+// ---- one issue, in MyIDE ----
+
+/** Issue panels by "project#number": a second click on the same issue focuses the open one. */
+const openIssues = new Map<string, DockviewPanelApi>();
+export function openIssue(projectId: string, number: number): void {
+  const open = openIssues.get(`${projectId}#${number}`);
+  if (open) open.setActive();
+  else openPanel('issue', { projectId, number });
+}
+
+/** Plain text with its web links clickable (opened in the browser). Issue text is Markdown; it shows as written.
+ *  ponytail: no Markdown rendering or inline images; a renderer if reading raw Markdown gets in the way. */
+const withLinks = (text: string): (Node | string)[] => splitUrls(text).map((p) => (p.url
+  ? h('a', { href: p.url, textContent: p.url, onclick: (ev) => { ev.preventDefault(); void api.terminal.openUrl(p.url!); } })
+  : p.text ?? ''));
+const when = (iso?: string) => (iso ? new Date(iso).toLocaleString() : '');
+
+registerPanel('issue', {
+  title: 'Issue',
+  create(el, params, panel) {
+    el.classList.add('iss-one');
+    const projectId = typeof params.projectId === 'string' ? params.projectId : '';
+    const number = Number(params.number);
+    if (!projectId || !Number.isInteger(number) || number < 1) {
+      el.append(h('p', { className: 'files-note', textContent: 'Open an issue from the Issues panel.' }));
+      return {};
+    }
+    const k = `${projectId}#${number}`;
+    openIssues.set(k, panel);
+    panel.setTitle(`#${number}`);
+
+    const head = h('header', { className: 'iss-one-head' });
+    const body = h('div', { className: 'iss-one-text' });
+    const thread = h('ol', { className: 'iss-one-thread' });
+    const status = h('p', { className: 'pref-status' });
+    status.setAttribute('aria-live', 'polite');
+    const say = (t: string) => { status.textContent = t; };
+    const reply = h('textarea', { className: 'input', rows: 4, placeholder: 'Comment as you' });
+    reply.setAttribute('aria-label', `Comment on #${number}`);
+    const keys = h('div', { className: 'pref-ctl' });
+    let seen = ''; // the issue's updated time when last drawn: a forge change reloads only when it moved
+    let last: IssueDetail | undefined; // redrawn as is when only its employee changed
+    let loads = 0; // a slower, older load never overwrites a newer one
+    let busy = false; // one write at a time: a double click posts once
+
+    const draw = async (i: IssueDetail, n = loads) => {
+      seen = i.updated ?? '';
+      last = i;
+      panel.setTitle(`#${i.number} ${i.title}`.slice(0, 40));
+      const [snaps, emps] = await Promise.all([api.forge.issues(projectId), api.employees.list(projectId)]);
+      if (n !== loads) return;
+      const s = snaps[0];
+      const row = s?.issues.find((x) => x.number === number);
+      const emp = emps.find((e) => e.issue?.number === number);
+      const open = i.state === 'open';
+      head.replaceChildren(
+        h('h1', { className: 'iss-one-title' }, h('span', { className: 'iss-ref', textContent: `#${i.number}` }), ` ${i.title}`),
+        h('div', { className: 'iss-one-meta' }, led(open ? 'working' : 'done', open ? 'Open' : 'Closed'),
+          ...i.labels.map((l) => h('span', { className: 'iss-label', textContent: l })),
+          h('span', { className: 'iss-age', textContent: [i.author && `by ${i.author}`, i.assignees.length ? `assigned ${i.assignees.join(', ')}` : '', i.updated && `updated ${when(i.updated)}`].filter(Boolean).join(' · ') }),
+          emp ? h('button', { type: 'button', className: 'iss-emp', textContent: emp.name, title: `Open ${emp.name}`, onclick: () => void openEmployee(emp.id) })
+            : open && s && row ? key('Assign…', () => void openAssign(s, row)) : '',
+          ...(i.prs ?? []).map((pr) => h('a', { href: pr.url, className: 'iss-pr', textContent: `PR #${pr.number} ${pr.state}`, onclick: (ev) => { ev.preventDefault(); void api.terminal.openUrl(pr.url); } })),
+          key(`Open on ${s ? FORGE[s.provider] : 'the forge'}`, () => void api.terminal.openUrl(i.url))),
+        ...(i.note ? [h('p', { className: 'files-note', textContent: i.note })] : []));
+      body.replaceChildren(...withLinks(i.body?.trim() || '(No description.)'));
+      thread.replaceChildren(...(i.comments ?? []).map((c) => h('li', { className: 'iss-one-comment' },
+        h('div', { className: 'iss-age', textContent: `${c.author} · ${when(c.at)}` }), h('div', { className: 'iss-one-text' }, ...withLinks(c.body)))));
+      keys.replaceChildren(key('Comment', () => void post()), ...(open ? [key('Close issue', () => void closeIt())] : []));
+    };
+    const load = async () => {
+      const n = ++loads;
+      try {
+        const i = await api.forge.issue(projectId, number);
+        if (n === loads) await draw(i, n);
+      } catch (e) { if (n === loads) say(errText(e)); }
+    };
+    // The box is emptied before the write goes out (and refilled if it fails), so a second click finds nothing to send.
+    const post = async () => {
+      const text = reply.value.trim();
+      if (!text) return say('Write a comment first.');
+      if (busy) return;
+      busy = true;
+      reply.value = '';
+      try { say((await api.forge.comment(projectId, number, text)).msg); await load(); } catch (e) { reply.value = text; say(errText(e)); } finally { busy = false; }
+    };
+    const closeIt = async () => {
+      if (busy || !(await ask(`Close #${number}?`, 'It closes as completed. A comment in the box above is posted first.', 'Close issue'))) return;
+      busy = true;
+      const text = reply.value.trim();
+      reply.value = '';
+      try {
+        const said = text ? `${(await api.forge.comment(projectId, number, text)).msg} ` : '';
+        say(said + (await api.forge.close(projectId, number)).msg);
+        await load();
+      } catch (e) { reply.value = text; say(errText(e)); } finally { busy = false; }
+    };
+
+    el.append(head, body, h('h2', { className: 'legend box-title', textContent: 'Comments' }), thread, reply, keys, status);
+    void load();
+    const off = api.forge.onChange((pid) => {
+      if (pid !== projectId) return;
+      void api.forge.issues(projectId).then((snaps) => {
+        const u = snaps[0]?.issues.find((x) => x.number === number)?.updatedAt;
+        if (u && u !== seen) void load();
+      });
+    });
+    // Assigning (or firing) changes who holds the issue without moving its updated time: redraw from what is loaded.
+    const redraw = (pid?: string) => { if (last && (!pid || pid === projectId)) void draw(last); };
+    const offs = [off, api.employees.onChange((e) => redraw(e.projectId)), api.employees.onRemoved(() => redraw())];
+    return { dispose() { offs.forEach((f) => f()); openIssues.delete(k); } };
+  },
+});

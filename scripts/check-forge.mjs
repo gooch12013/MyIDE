@@ -471,6 +471,7 @@ try {
   const off = await tool('lead1', 'get_issue', { number: 1 });
   assert.equal(off.title, 'Sync teardown');
   assert.match(off.note, /cached copy/);
+  assert.deepEqual([off.comments, off.updated, off.pr], [[], '2026-10-07T00:00:00Z', undefined], 'the live shape: a comment list, updated, prs');
   down = false;
 
   console.log('forge ok');

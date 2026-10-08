@@ -1,7 +1,7 @@
 // Checks the Issues panel's filter, sort, group and custom order (src/renderer/issue-view.ts).
 // Usage: node scripts/check-issue-view.mjs
 import assert from 'node:assert/strict';
-import { arrange, DEFAULT_VIEW, fullOrder, grouped, matches, move, viewOf } from '../src/renderer/issue-view.ts';
+import { arrange, DEFAULT_VIEW, fullOrder, grouped, matches, move, splitUrls, viewOf } from '../src/renderer/issue-view.ts';
 
 const row = (n, o = {}) => ({
   key: String(n), number: n, title: `Issue ${n}`, body: '', labels: [], state: 'open', assignees: [],
@@ -66,5 +66,11 @@ assert.equal(keys(arrange(V({ emp: 'needs-you', sort: 'number', desc: false }), 
 assert.equal(keys(arrange(V({ emp: 'yes', sort: 'number', desc: false }), st)), '1,3,4,5');
 assert.equal(viewOf({ emp: 'paused', group: 'status' }).emp, 'paused');
 assert.equal(viewOf({ emp: 'bogus' }).emp, '');
+
+// splitUrls: http(s) links only, sentence punctuation and closing brackets left out of the link.
+assert.deepEqual(splitUrls('See https://github.com/o/r/issues/1. Or (https://x.io/a?b=1), not javascript:alert(1)'),
+  [{ text: 'See ' }, { url: 'https://github.com/o/r/issues/1' }, { text: '. Or (' }, { url: 'https://x.io/a?b=1' }, { text: '), not javascript:alert(1)' }]);
+assert.deepEqual(splitUrls('no links'), [{ text: 'no links' }]);
+assert.deepEqual(splitUrls(''), []);
 
 console.log('check-issue-view: ok');

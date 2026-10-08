@@ -100,3 +100,18 @@ export function grouped(v: View, rows: Row[]): { name: string; rows: Row[] }[] {
   const rank = (n: string) => (STATUSES as readonly string[]).indexOf(n) >>> 0; // 'none' last
   return v.group === 'status' ? gs.sort((a, b) => rank(a.name) - rank(b.name)) : gs;
 }
+
+/** Text split into plain runs and web links (http and https only), for the Issue panel. Trailing sentence
+ *  punctuation stays outside a link; a link ends at whitespace, a quote, a bracket or a closing parenthesis. */
+export function splitUrls(text: string): { text?: string; url?: string }[] {
+  const out: { text?: string; url?: string }[] = [];
+  let at = 0;
+  for (const m of text.matchAll(/https?:\/\/[^\s<>"')\]]+/g)) {
+    const url = m[0].replace(/[.,;:!?]+$/, '');
+    if (m.index! > at) out.push({ text: text.slice(at, m.index) });
+    out.push({ url });
+    at = m.index! + url.length;
+  }
+  if (at < text.length) out.push({ text: text.slice(at) });
+  return out;
+}
