@@ -2,6 +2,7 @@ import * as monaco from 'monaco-editor';
 import { ask, choose, errText, h, key, sheet } from './dom';
 import { led } from './employees';
 import { fileRefs, resolvePath } from './links';
+import { markdown } from './markdown';
 import { activeProject } from './projects';
 import { openPanel, registerPanel } from './registry';
 
@@ -51,6 +52,8 @@ const rel = (d: Doc, path: string): string => (path.startsWith(d.root + '/') ? p
 /** Images and PDFs open to view, not edit: main.ts serves them from app://myide/view (project and worktree files only). */
 const VIEWABLE = /\.(png|jpe?g|gif|webp|avif|bmp|ico|svg|heic|heif|pdf)$/i;
 const viewable = (p: string): boolean => VIEWABLE.test(p);
+/** Markdown files can also show rendered (the Preview key), as GitHub shows them. */
+const MARKDOWN = /\.(md|markdown)$/i;
 
 async function load(path: string): Promise<Doc> {
   const have = docs.get(path);
@@ -175,6 +178,7 @@ registerPanel('editor', {
     el.classList.add('ed');
     let current: string | null = null;
     const open = new Set<string>();
+    const previewing = new Set<string>(Array.isArray(params.preview) ? (params.preview as string[]) : []); // shown rendered
 
     const tabs = h('div', { className: 'ed-files', role: 'tablist' });
     tabs.setAttribute('aria-label', 'Open files');
@@ -188,12 +192,17 @@ registerPanel('editor', {
     status.setAttribute('aria-live', 'polite');
     const say = (t: string) => { status.textContent = t; };
     const send = key('Send selection', () => void sendSelection(), { title: 'Send the selected code to an employee (⌘⇧E)', disabled: true });
-    const ideKeys = h('span', { className: 'ed-keys' }, send);
+    const preview = key('Preview', () => {
+      if (!current) return;
+      if (!previewing.delete(current)) previewing.add(current);
+      void show(current);
+    }, { title: 'Show this Markdown file rendered, as GitHub shows it', hidden: true });
+    const ideKeys = h('span', { className: 'ed-keys' }, preview, send);
     void ides.then((list) => ideKeys.append(...list.map((ide) => key(`Open in ${ide}`, () => {
       if (current) void api.code.openIn(ide, current, editor.getPosition()?.lineNumber ?? 1);
     }, { title: `Open this file in ${ide} at the cursor line` }))));
     const body = h('div', { className: 'ed-body' });
-    const viewer = h('div', { className: 'ed-view', hidden: true }); // an image or a PDF in place of the editor
+    const viewer = h('div', { className: 'ed-view', hidden: true }); // an image, a PDF or rendered Markdown in place of the editor
     el.append(tabs, h('div', { className: 'ed-head' }, h('p', { className: 'ed-path' }, pathEl), wt, ideKeys), diskBar, body, viewer, status);
 
     const editor = monaco.editor.create(body, { ...EDITOR_OPTIONS, model: null });
@@ -205,7 +214,7 @@ registerPanel('editor', {
     });
     editor.onDidFocusEditorText(() => { instances.splice(instances.indexOf(self), 1); instances.unshift(self); });
 
-    function remember(): void { panel.updateParameters({ files: [...open], active: current }); }
+    function remember(): void { panel.updateParameters({ files: [...open], active: current, preview: [...previewing] }); }
 
     function drawTabs(): void {
       tabs.replaceChildren(...[...open].map((p) => {
@@ -223,7 +232,11 @@ registerPanel('editor', {
       pathEl.textContent = d && current ? rel(d, current) : current ?? '';
       wt.textContent = d?.branch ? `on ${d.branch}` : '';
       panel.setTitle(current ? `${d && dirty(d) ? '● ' : ''}${base(current)}` : 'Editor');
-      send.disabled = !current || viewable(current);
+      const rendered = !!current && MARKDOWN.test(current) && previewing.has(current);
+      preview.hidden = !current || !MARKDOWN.test(current);
+      preview.classList.toggle('key--lit', rendered);
+      preview.setAttribute('aria-pressed', String(rendered));
+      send.disabled = !current || viewable(current) || rendered;
       diskBar.hidden = !d?.theirs;
     }
 
@@ -255,17 +268,41 @@ registerPanel('editor', {
       let d: Doc;
       try { d = await load(path); } catch (e) { say(`Could not open ${base(path)}: ${errText(e)}`); return; }
       open.add(path);
+      if (line) previewing.delete(path); // a line to go to is in the source
+      const rendered = MARKDOWN.test(path) && previewing.has(path);
       viewer.replaceChildren();
-      viewer.hidden = true;
-      body.hidden = false;
+      viewer.hidden = !rendered;
+      body.hidden = rendered;
       if (current !== path) { editor.setModel(d.model); current = path; }
-      if (line) {
-        editor.revealLineInCenter(line);
-        editor.setPosition({ lineNumber: line, column: 1 });
+      if (rendered) void render();
+      else {
+        if (line) {
+          editor.revealLineInCenter(line);
+          editor.setPosition({ lineNumber: line, column: 1 });
+        }
+        editor.focus();
       }
-      editor.focus();
       drawTabs();
       remember();
+    }
+
+    /** Draws the current Markdown file rendered, again on every change to it; the latest draw wins. */
+    let draws = 0;
+    async function render(): Promise<void> {
+      const path = current;
+      const d = path ? docs.get(path) : undefined;
+      if (!path || !d) return;
+      const n = ++draws;
+      try {
+        const art = await markdown(d.model.getValue(), path, d.root, (p, line) => void follow(d, p, line));
+        if (n === draws && current === path && previewing.has(path)) viewer.replaceChildren(art);
+      } catch (e) { say(`Could not render ${base(path)}: ${errText(e)}`); }
+    }
+    /** A link in rendered Markdown to a file in the checkout; a Markdown file opens rendered too, as on GitHub. */
+    async function follow(from: Doc, path: string, line?: number): Promise<void> {
+      if (!(await api.code.exists(path))) { say(`${rel(from, path)} is not a file here.`); return; }
+      if (MARKDOWN.test(path)) previewing.add(path);
+      await show(path, line);
     }
 
     async function save(): Promise<void> {
@@ -279,6 +316,7 @@ registerPanel('editor', {
       const d = docs.get(path);
       if (d && dirty(d) && !(await ask(`Close ${base(path)} without saving?`, 'Your changes to this file will be lost.', 'Close without saving', true))) return;
       open.delete(path);
+      previewing.delete(path);
       if (d) { d.saved = d.model.getAlternativeVersionId(); release(path); } // its changes were dropped on purpose
       if (current === path) {
         current = null;
@@ -327,7 +365,7 @@ registerPanel('editor', {
       } catch (e) { say(`Could not send: ${errText(e)}`); }
     }
 
-    const changed = editor.onDidChangeModelContent(() => drawTabs());
+    const changed = editor.onDidChangeModelContent(() => { drawTabs(); if (current && previewing.has(current)) void render(); });
 
     const self: Instance = { open: show, has: (p) => open.has(p), redraw: drawTabs };
     instances.unshift(self);
